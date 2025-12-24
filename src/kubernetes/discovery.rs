@@ -13,7 +13,9 @@ use k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::{
 use kube::api::Api;
 use kube::discovery::{ApiCapabilities, ApiResource, Discovery, Scope};
 use kube::Client;
-use std::collections::HashMap;
+use schemars::schema::{InstanceType, Schema, SingleOrVec};
+use schemars::JsonSchema;
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 /// Column definition for schema
 #[derive(Debug, Clone)]
@@ -341,6 +343,239 @@ fn json_schema_type_to_sql(schema: &JSONSchemaProps) -> String {
     }
 }
 
+/// Generate columns from a type implementing JsonSchema
+fn columns_from_jsonschema<T: JsonSchema>() -> Vec<ColumnDef> {
+    let root_schema = schemars::schema_for!(T);
+    let mut columns = Vec::new();
+    let mut seen_names = HashSet::new();
+
+    // The root might be a reference, resolve it first
+    let resolved = if let Some(ref_path) = &root_schema.schema.reference {
+        let def_name = ref_path.strip_prefix("#/definitions/").unwrap_or(ref_path);
+        root_schema.definitions.get(def_name)
+    } else {
+        Some(&Schema::Object(root_schema.schema.clone()))
+    };
+
+    let Some(Schema::Object(schema)) = resolved else {
+        return columns;
+    };
+
+    // Get the root schema object
+    if let Some(object) = &schema.object {
+        // Process spec and status subschemas
+        let props = &object.properties;
+        if let Some(spec) = props.get("spec") {
+            extract_schemars_columns(&mut columns, &mut seen_names, spec, "spec", 2, &root_schema.definitions);
+        }
+        if let Some(status) = props.get("status") {
+            extract_schemars_columns(&mut columns, &mut seen_names, status, "status", 2, &root_schema.definitions);
+        }
+        // For ConfigMaps/Secrets, also look at "data" and "type"
+        if let Some(data) = props.get("data") {
+            extract_schemars_columns(&mut columns, &mut seen_names, data, "data", 1, &root_schema.definitions);
+        }
+    }
+
+    columns
+}
+
+/// Extract columns from a schemars Schema
+fn extract_schemars_columns(
+    columns: &mut Vec<ColumnDef>,
+    seen_names: &mut HashSet<String>,
+    schema: &Schema,
+    prefix: &str,
+    max_depth: usize,
+    definitions: &BTreeMap<String, Schema>,
+) {
+    if max_depth == 0 {
+        return;
+    }
+
+    // Resolve references first
+    let resolved = resolve_schema_ref(schema, definitions);
+
+    let Some(obj) = resolved.as_ref().and_then(|s| match s {
+        Schema::Object(o) => Some(o),
+        _ => None,
+    }) else {
+        return;
+    };
+
+    if let Some(object) = &obj.object {
+        let props = &object.properties;
+        for (name, prop) in props {
+            let json_path = format!("{}.{}", prefix, name);
+
+            // Skip reserved column names
+            if RESERVED_COLUMNS.contains(&name.as_str()) {
+                continue;
+            }
+
+            // Use prefixed name if there's a conflict
+            let column_name = if seen_names.contains(name) {
+                format!("{}_{}", prefix, name)
+            } else {
+                name.clone()
+            };
+            seen_names.insert(name.clone());
+
+            let data_type = schemars_type_to_sql(prop, definitions);
+            let description = get_schemars_description(prop, definitions);
+
+            // Add all properties as columns - simple types get their native type,
+            // complex types (objects, arrays) become jsonb
+            columns.push(ColumnDef {
+                name: column_name,
+                data_type,
+                json_path: Some(json_path),
+                description,
+            });
+        }
+    }
+}
+
+/// Resolve a schema reference if present
+/// Handles both direct $ref and allOf/anyOf/oneOf with a single $ref item
+fn resolve_schema_ref<'a>(
+    schema: &'a Schema,
+    definitions: &'a BTreeMap<String, Schema>,
+) -> Option<&'a Schema> {
+    match schema {
+        Schema::Object(obj) => {
+            // Direct reference
+            if let Some(ref_path) = &obj.reference {
+                let def_name = ref_path.strip_prefix("#/definitions/")?;
+                return definitions.get(def_name);
+            }
+
+            // Check for allOf with a single reference (common pattern in k8s schemas)
+            if let Some(subschemas) = &obj.subschemas {
+                if let Some(all_of) = &subschemas.all_of {
+                    if all_of.len() == 1 {
+                        if let Schema::Object(inner) = &all_of[0] {
+                            if let Some(ref_path) = &inner.reference {
+                                let def_name = ref_path.strip_prefix("#/definitions/")?;
+                                return definitions.get(def_name);
+                            }
+                        }
+                    }
+                }
+                // Also check anyOf and oneOf
+                if let Some(any_of) = &subschemas.any_of {
+                    if any_of.len() == 1 {
+                        if let Schema::Object(inner) = &any_of[0] {
+                            if let Some(ref_path) = &inner.reference {
+                                let def_name = ref_path.strip_prefix("#/definitions/")?;
+                                return definitions.get(def_name);
+                            }
+                        }
+                    }
+                }
+            }
+
+            Some(schema)
+        }
+        _ => Some(schema),
+    }
+}
+
+/// Convert schemars type to SQL type
+fn schemars_type_to_sql(schema: &Schema, definitions: &BTreeMap<String, Schema>) -> String {
+    let resolved = resolve_schema_ref(schema, definitions);
+    let Some(obj) = resolved.and_then(|s| match s {
+        Schema::Object(o) => Some(o),
+        _ => None,
+    }) else {
+        return "text".to_string();
+    };
+
+    match &obj.instance_type {
+        Some(SingleOrVec::Single(t)) => match **t {
+            InstanceType::String => {
+                if let Some(format) = &obj.format {
+                    match format.as_str() {
+                        "date-time" => "timestamp".to_string(),
+                        "date" => "date".to_string(),
+                        _ => "text".to_string(),
+                    }
+                } else {
+                    "text".to_string()
+                }
+            }
+            InstanceType::Integer => "integer".to_string(),
+            InstanceType::Number => "numeric".to_string(),
+            InstanceType::Boolean => "boolean".to_string(),
+            InstanceType::Array => "jsonb".to_string(),
+            InstanceType::Object => "jsonb".to_string(),
+            _ => "text".to_string(),
+        },
+        _ => "text".to_string(),
+    }
+}
+
+/// Get description from schemars schema
+fn get_schemars_description(
+    schema: &Schema,
+    definitions: &BTreeMap<String, Schema>,
+) -> String {
+    let resolved = resolve_schema_ref(schema, definitions);
+    resolved
+        .and_then(|s| match s {
+            Schema::Object(o) => o.metadata.as_ref().and_then(|m| m.description.clone()),
+            _ => None,
+        })
+        .unwrap_or_default()
+}
+
+/// Get columns for a core resource type using JsonSchema
+pub fn get_core_type_columns(table_name: &str) -> Vec<ColumnDef> {
+    use k8s_openapi::api::apps::v1::{DaemonSet, Deployment, ReplicaSet, StatefulSet};
+    use k8s_openapi::api::batch::v1::{CronJob, Job};
+    use k8s_openapi::api::core::v1::{
+        ConfigMap, Endpoints, Event, LimitRange, Namespace, Node, PersistentVolume,
+        PersistentVolumeClaim, Pod, ResourceQuota, Secret, Service, ServiceAccount,
+    };
+    use k8s_openapi::api::networking::v1::{Ingress, NetworkPolicy};
+    use k8s_openapi::api::policy::v1::PodDisruptionBudget;
+    use k8s_openapi::api::autoscaling::v2::HorizontalPodAutoscaler;
+    use k8s_openapi::api::storage::v1::StorageClass;
+    use k8s_openapi::api::rbac::v1::{ClusterRole, ClusterRoleBinding, Role, RoleBinding};
+
+    match table_name {
+        "pods" => columns_from_jsonschema::<Pod>(),
+        "services" => columns_from_jsonschema::<Service>(),
+        "deployments" => columns_from_jsonschema::<Deployment>(),
+        "configmaps" => columns_from_jsonschema::<ConfigMap>(),
+        "secrets" => columns_from_jsonschema::<Secret>(),
+        "nodes" => columns_from_jsonschema::<Node>(),
+        "namespaces" => columns_from_jsonschema::<Namespace>(),
+        "ingresses" => columns_from_jsonschema::<Ingress>(),
+        "jobs" => columns_from_jsonschema::<Job>(),
+        "cronjobs" => columns_from_jsonschema::<CronJob>(),
+        "statefulsets" => columns_from_jsonschema::<StatefulSet>(),
+        "daemonsets" => columns_from_jsonschema::<DaemonSet>(),
+        "replicasets" => columns_from_jsonschema::<ReplicaSet>(),
+        "persistentvolumeclaims" => columns_from_jsonschema::<PersistentVolumeClaim>(),
+        "persistentvolumes" => columns_from_jsonschema::<PersistentVolume>(),
+        "events" => columns_from_jsonschema::<Event>(),
+        "serviceaccounts" => columns_from_jsonschema::<ServiceAccount>(),
+        "endpoints" => columns_from_jsonschema::<Endpoints>(),
+        "resourcequotas" => columns_from_jsonschema::<ResourceQuota>(),
+        "limitranges" => columns_from_jsonschema::<LimitRange>(),
+        "horizontalpodautoscalers" => columns_from_jsonschema::<HorizontalPodAutoscaler>(),
+        "poddisruptionbudgets" => columns_from_jsonschema::<PodDisruptionBudget>(),
+        "networkpolicies" => columns_from_jsonschema::<NetworkPolicy>(),
+        "storageclasses" => columns_from_jsonschema::<StorageClass>(),
+        "roles" => columns_from_jsonschema::<Role>(),
+        "rolebindings" => columns_from_jsonschema::<RoleBinding>(),
+        "clusterroles" => columns_from_jsonschema::<ClusterRole>(),
+        "clusterrolebindings" => columns_from_jsonschema::<ClusterRoleBinding>(),
+        _ => vec![],
+    }
+}
+
 /// Generate a PostgreSQL-style schema for a discovered resource
 /// Core resources get detailed schemas, CRDs get generic metadata + JSON blobs
 pub fn generate_schema(info: &ResourceInfo) -> Vec<ColumnDef> {
@@ -397,9 +632,9 @@ pub fn generate_schema(info: &ResourceInfo) -> Vec<ColumnDef> {
     // For non-namespaced resources, still include namespace column but it will be null
     // This keeps schema consistent
 
-    // For core resources, add type-specific columns first
+    // For core resources, generate columns from JsonSchema
     if info.is_core {
-        let extra = get_core_resource_columns(&info.table_name);
+        let extra = get_core_type_columns(&info.table_name);
         columns.extend(extra);
     } else if let Some(crd_cols) = &info.crd_columns {
         // For CRDs, add columns extracted from the schema
@@ -449,267 +684,4 @@ pub fn generate_schema(info: &ResourceInfo) -> Vec<ColumnDef> {
     }
 
     columns
-}
-
-/// Get additional columns for core resources
-fn get_core_resource_columns(table_name: &str) -> Vec<ColumnDef> {
-    match table_name {
-        "pods" => vec![
-            ColumnDef {
-                name: "phase".to_string(),
-                data_type: "text".to_string(),
-                json_path: Some("status.phase".to_string()),
-                description: "Pod phase (Pending, Running, Succeeded, Failed, Unknown)".to_string(),
-            },
-            ColumnDef {
-                name: "node".to_string(),
-                data_type: "text".to_string(),
-                json_path: Some("spec.nodeName".to_string()),
-                description: "Node the pod is scheduled on".to_string(),
-            },
-            ColumnDef {
-                name: "ip".to_string(),
-                data_type: "text".to_string(),
-                json_path: Some("status.podIP".to_string()),
-                description: "Pod IP address".to_string(),
-            },
-            ColumnDef {
-                name: "restarts".to_string(),
-                data_type: "integer".to_string(),
-                json_path: Some("status.containerStatuses[0].restartCount".to_string()),
-                description: "Container restart count".to_string(),
-            },
-        ],
-        "deployments" => vec![
-            ColumnDef {
-                name: "replicas".to_string(),
-                data_type: "integer".to_string(),
-                json_path: Some("spec.replicas".to_string()),
-                description: "Desired replicas".to_string(),
-            },
-            ColumnDef {
-                name: "ready".to_string(),
-                data_type: "integer".to_string(),
-                json_path: Some("status.readyReplicas".to_string()),
-                description: "Ready replicas".to_string(),
-            },
-            ColumnDef {
-                name: "available".to_string(),
-                data_type: "integer".to_string(),
-                json_path: Some("status.availableReplicas".to_string()),
-                description: "Available replicas".to_string(),
-            },
-        ],
-        "services" => vec![
-            ColumnDef {
-                name: "type".to_string(),
-                data_type: "text".to_string(),
-                json_path: Some("spec.type".to_string()),
-                description: "Service type (ClusterIP, NodePort, LoadBalancer)".to_string(),
-            },
-            ColumnDef {
-                name: "cluster_ip".to_string(),
-                data_type: "text".to_string(),
-                json_path: Some("spec.clusterIP".to_string()),
-                description: "Cluster IP address".to_string(),
-            },
-            ColumnDef {
-                name: "external_ip".to_string(),
-                data_type: "text".to_string(),
-                json_path: Some("status.loadBalancer.ingress[0].ip".to_string()),
-                description: "External IP (for LoadBalancer)".to_string(),
-            },
-            ColumnDef {
-                name: "ports".to_string(),
-                data_type: "jsonb".to_string(),
-                json_path: Some("spec.ports".to_string()),
-                description: "Service ports".to_string(),
-            },
-        ],
-        "nodes" => vec![
-            ColumnDef {
-                name: "ready".to_string(),
-                data_type: "boolean".to_string(),
-                json_path: Some("status.conditions".to_string()), // Special handling needed
-                description: "Node ready status".to_string(),
-            },
-            ColumnDef {
-                name: "version".to_string(),
-                data_type: "text".to_string(),
-                json_path: Some("status.nodeInfo.kubeletVersion".to_string()),
-                description: "Kubelet version".to_string(),
-            },
-            ColumnDef {
-                name: "os".to_string(),
-                data_type: "text".to_string(),
-                json_path: Some("status.nodeInfo.osImage".to_string()),
-                description: "OS image".to_string(),
-            },
-            ColumnDef {
-                name: "arch".to_string(),
-                data_type: "text".to_string(),
-                json_path: Some("status.nodeInfo.architecture".to_string()),
-                description: "CPU architecture".to_string(),
-            },
-        ],
-        "statefulsets" | "daemonsets" | "replicasets" => vec![
-            ColumnDef {
-                name: "replicas".to_string(),
-                data_type: "integer".to_string(),
-                json_path: Some("spec.replicas".to_string()),
-                description: "Desired replicas".to_string(),
-            },
-            ColumnDef {
-                name: "ready".to_string(),
-                data_type: "integer".to_string(),
-                json_path: Some("status.readyReplicas".to_string()),
-                description: "Ready replicas".to_string(),
-            },
-        ],
-        "jobs" => vec![
-            ColumnDef {
-                name: "completions".to_string(),
-                data_type: "integer".to_string(),
-                json_path: Some("spec.completions".to_string()),
-                description: "Desired completions".to_string(),
-            },
-            ColumnDef {
-                name: "succeeded".to_string(),
-                data_type: "integer".to_string(),
-                json_path: Some("status.succeeded".to_string()),
-                description: "Succeeded pods".to_string(),
-            },
-            ColumnDef {
-                name: "failed".to_string(),
-                data_type: "integer".to_string(),
-                json_path: Some("status.failed".to_string()),
-                description: "Failed pods".to_string(),
-            },
-        ],
-        "cronjobs" => vec![
-            ColumnDef {
-                name: "schedule".to_string(),
-                data_type: "text".to_string(),
-                json_path: Some("spec.schedule".to_string()),
-                description: "Cron schedule".to_string(),
-            },
-            ColumnDef {
-                name: "suspend".to_string(),
-                data_type: "boolean".to_string(),
-                json_path: Some("spec.suspend".to_string()),
-                description: "Whether cronjob is suspended".to_string(),
-            },
-            ColumnDef {
-                name: "last_schedule".to_string(),
-                data_type: "timestamp".to_string(),
-                json_path: Some("status.lastScheduleTime".to_string()),
-                description: "Last schedule time".to_string(),
-            },
-        ],
-        "persistentvolumeclaims" => vec![
-            ColumnDef {
-                name: "phase".to_string(),
-                data_type: "text".to_string(),
-                json_path: Some("status.phase".to_string()),
-                description: "PVC phase (Pending, Bound, Lost)".to_string(),
-            },
-            ColumnDef {
-                name: "storage_class".to_string(),
-                data_type: "text".to_string(),
-                json_path: Some("spec.storageClassName".to_string()),
-                description: "Storage class name".to_string(),
-            },
-            ColumnDef {
-                name: "capacity".to_string(),
-                data_type: "text".to_string(),
-                json_path: Some("status.capacity.storage".to_string()),
-                description: "Actual capacity".to_string(),
-            },
-            ColumnDef {
-                name: "volume".to_string(),
-                data_type: "text".to_string(),
-                json_path: Some("spec.volumeName".to_string()),
-                description: "Bound volume name".to_string(),
-            },
-        ],
-        "persistentvolumes" => vec![
-            ColumnDef {
-                name: "phase".to_string(),
-                data_type: "text".to_string(),
-                json_path: Some("status.phase".to_string()),
-                description: "PV phase".to_string(),
-            },
-            ColumnDef {
-                name: "storage_class".to_string(),
-                data_type: "text".to_string(),
-                json_path: Some("spec.storageClassName".to_string()),
-                description: "Storage class name".to_string(),
-            },
-            ColumnDef {
-                name: "capacity".to_string(),
-                data_type: "text".to_string(),
-                json_path: Some("spec.capacity.storage".to_string()),
-                description: "Storage capacity".to_string(),
-            },
-            ColumnDef {
-                name: "claim".to_string(),
-                data_type: "text".to_string(),
-                json_path: Some("spec.claimRef.name".to_string()),
-                description: "Bound claim name".to_string(),
-            },
-        ],
-        "ingresses" => vec![
-            ColumnDef {
-                name: "class".to_string(),
-                data_type: "text".to_string(),
-                json_path: Some("spec.ingressClassName".to_string()),
-                description: "Ingress class".to_string(),
-            },
-            ColumnDef {
-                name: "hosts".to_string(),
-                data_type: "jsonb".to_string(),
-                json_path: Some("spec.rules".to_string()),
-                description: "Ingress rules/hosts".to_string(),
-            },
-            ColumnDef {
-                name: "address".to_string(),
-                data_type: "text".to_string(),
-                json_path: Some("status.loadBalancer.ingress[0].ip".to_string()),
-                description: "Load balancer address".to_string(),
-            },
-        ],
-        "events" => vec![
-            ColumnDef {
-                name: "type".to_string(),
-                data_type: "text".to_string(),
-                json_path: Some("type".to_string()),
-                description: "Event type (Normal, Warning)".to_string(),
-            },
-            ColumnDef {
-                name: "reason".to_string(),
-                data_type: "text".to_string(),
-                json_path: Some("reason".to_string()),
-                description: "Event reason".to_string(),
-            },
-            ColumnDef {
-                name: "message".to_string(),
-                data_type: "text".to_string(),
-                json_path: Some("message".to_string()),
-                description: "Event message".to_string(),
-            },
-            ColumnDef {
-                name: "count".to_string(),
-                data_type: "integer".to_string(),
-                json_path: Some("count".to_string()),
-                description: "Event count".to_string(),
-            },
-            ColumnDef {
-                name: "source".to_string(),
-                data_type: "text".to_string(),
-                json_path: Some("source.component".to_string()),
-                description: "Event source component".to_string(),
-            },
-        ],
-        _ => vec![],
-    }
 }
