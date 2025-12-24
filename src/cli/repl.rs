@@ -18,7 +18,7 @@ use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
 use crate::datafusion_integration::K8sSessionContext;
-use crate::kubernetes::{discovery, K8sClientPool};
+use crate::kubernetes::K8sClientPool;
 use crate::output::QueryResult;
 
 // SQL keywords for completion
@@ -47,29 +47,45 @@ pub struct CompletionCache {
 }
 
 impl CompletionCache {
-    /// Populate cache from the K8sClientPool
-    pub async fn populate(pool: &K8sClientPool) -> Result<Self> {
+    /// Populate cache from DataFusion session and K8sClientPool
+    pub async fn populate(session: &K8sSessionContext, pool: &K8sClientPool) -> Result<Self> {
         let mut cache = CompletionCache::default();
 
         // Get contexts from kubeconfig
         cache.contexts = pool.list_contexts()?;
 
-        // Get resource registry for tables and columns
-        let registry = pool.get_registry(None).await?;
-
-        for info in registry.list_tables() {
-            // Add table name
-            cache.tables.push(info.table_name.clone());
-
-            // Add aliases
-            for alias in &info.aliases {
-                cache.aliases.insert(alias.clone(), info.table_name.clone());
+        // Get tables from DataFusion's information_schema
+        if let Ok(result) = session
+            .execute_sql_to_strings(
+                "SELECT table_name FROM information_schema.tables WHERE table_schema = 'default'",
+            )
+            .await
+        {
+            for row in &result.rows {
+                if let Some(table_name) = row.first() {
+                    cache.tables.push(table_name.clone());
+                }
             }
+        }
 
-            // Generate column names from schema
-            let schema = discovery::generate_schema(info);
-            let col_names: Vec<String> = schema.iter().map(|c| c.name.clone()).collect();
-            cache.columns.insert(info.table_name.clone(), col_names);
+        // Get columns from DataFusion's information_schema
+        if let Ok(result) = session
+            .execute_sql_to_strings(
+                "SELECT table_name, column_name FROM information_schema.columns WHERE table_schema = 'default'",
+            )
+            .await
+        {
+            for row in &result.rows {
+                if row.len() >= 2 {
+                    let table_name = &row[0];
+                    let column_name = &row[1];
+                    cache
+                        .columns
+                        .entry(table_name.clone())
+                        .or_default()
+                        .push(column_name.clone());
+                }
+            }
         }
 
         // Fetch namespaces from cluster
@@ -536,8 +552,10 @@ fn format_expanded(result: &QueryResult) -> String {
 }
 
 pub async fn run_repl(mut session: K8sSessionContext, pool: Arc<K8sClientPool>) -> Result<()> {
-    // Populate completion cache from cluster
-    let cache = CompletionCache::populate(&pool).await.unwrap_or_default();
+    // Populate completion cache from DataFusion session
+    let cache = CompletionCache::populate(&session, &pool)
+        .await
+        .unwrap_or_default();
     let cache = Arc::new(RwLock::new(cache));
 
     let helper = SqlHelper {
@@ -610,8 +628,8 @@ pub async fn run_repl(mut session: K8sSessionContext, pool: Arc<K8sClientPool>) 
                         if let Err(e) = session.refresh_tables().await {
                             println!("{} {}", style("Warning:").yellow(), style(e).yellow());
                         }
-                        // Refresh completion cache
-                        if let Ok(new_cache) = CompletionCache::populate(&pool).await {
+                        // Refresh completion cache from updated session
+                        if let Ok(new_cache) = CompletionCache::populate(&session, &pool).await {
                             if let Ok(mut cache_guard) = cache.write() {
                                 *cache_guard = new_cache;
                             }
