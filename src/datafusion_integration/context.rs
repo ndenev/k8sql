@@ -32,7 +32,10 @@ impl K8sSessionContext {
         let config = SessionConfig::new()
             .with_information_schema(true)
             .with_default_catalog_and_schema(&cluster_name, "default");
-        let ctx = SessionContext::new_with_config(config);
+        let mut ctx = SessionContext::new_with_config(config);
+
+        // Register JSON functions for querying spec/status fields
+        datafusion_functions_json::register_all(&mut ctx)?;
 
         // Get the resource registry and register each resource as a table
         let registry = pool.get_registry(None).await?;
@@ -112,7 +115,11 @@ impl K8sSessionContext {
         let config = SessionConfig::new()
             .with_information_schema(true)
             .with_default_catalog_and_schema(&cluster_name, "default");
-        let new_ctx = SessionContext::new_with_config(config);
+        let mut new_ctx = SessionContext::new_with_config(config);
+
+        // Register JSON functions
+        datafusion_functions_json::register_all(&mut new_ctx)?;
+
         let registry = self.pool.get_registry(None).await?;
 
         for info in registry.list_tables() {

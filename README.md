@@ -48,23 +48,37 @@ SELECT * FROM pods WHERE _cluster = '*'
 
 The `'*'` wildcard is a special value that expands to all available kubectl contexts, executing parallel queries across all clusters.
 
-### JSON Path Access
+### Querying Nested JSON Fields
 
-Access nested fields using dot notation:
+Kubernetes resources are exposed with `spec` and `status` as JSON columns. Use DataFusion's JSON functions to query nested fields:
 
 ```sql
--- Access nested status fields
-SELECT name, status.phase, status.podIP FROM pods
+-- Extract string values with json_get_str(column, key1, key2, ...)
+SELECT name, json_get_str(status, 'phase') as phase FROM pods
 
--- Access spec fields
-SELECT name, spec.replicas, status.readyReplicas FROM deployments
+-- Access nested fields by chaining keys
+SELECT name, json_get_str(spec, 'nodeName') as node FROM pods
 
--- Access container information
-SELECT name, spec.containers FROM pods
+-- Access array elements by index (0-based)
+SELECT name, json_get_str(spec, 'containers', 0, 'image') as image FROM pods
 
--- Access node information
-SELECT name, status.nodeInfo.kubeletVersion FROM nodes
+-- Access deeply nested fields
+SELECT name, json_get_str(status, 'nodeInfo', 'kubeletVersion') as version FROM nodes
+
+-- Get integer values
+SELECT name, json_get_int(spec, 'replicas') as replicas FROM deployments
+
+-- Get the full JSON object
+SELECT name, json_get_json(spec, 'containers') as containers FROM pods
 ```
+
+**Available JSON functions:**
+- `json_get_str(json, key, ...)` - Extract as string
+- `json_get_int(json, key, ...)` - Extract as integer
+- `json_get_float(json, key, ...)` - Extract as float
+- `json_get_bool(json, key, ...)` - Extract as boolean
+- `json_get_json(json, key, ...)` - Extract nested JSON as string
+- `json_contains(json, key, ...)` - Check if key exists
 
 ### Label Queries
 
@@ -106,12 +120,14 @@ SELECT * FROM pods WHERE namespace = 'kube-system'
 SELECT * FROM pods WHERE namespace LIKE 'kube%'
 SELECT * FROM pods WHERE name LIKE '%nginx%'
 
--- Status filtering
-SELECT name, namespace FROM pods WHERE phase = 'Running'
-SELECT name, namespace FROM pods WHERE phase != 'Running'
+-- Filter on JSON fields
+SELECT name, namespace FROM pods
+WHERE json_get_str(status, 'phase') = 'Running'
 
--- Numeric comparisons
-SELECT name, replicas, ready FROM deployments WHERE replicas > 1
+-- Numeric comparisons on JSON
+SELECT name, json_get_int(spec, 'replicas') as replicas
+FROM deployments
+WHERE json_get_int(spec, 'replicas') > 1
 ```
 
 ### Cross-Cluster Queries
@@ -134,24 +150,67 @@ SELECT _cluster, COUNT(*) FROM deployments WHERE _cluster = '*' GROUP BY _cluste
 ### Resource-Specific Examples
 
 ```sql
--- Pods with restart counts
-SELECT name, namespace, phase, restarts, node FROM pods
+-- Pods with status info
+SELECT name, namespace,
+       json_get_str(status, 'phase') as phase,
+       json_get_str(spec, 'nodeName') as node
+FROM pods
 
 -- Deployments with replica status
-SELECT name, namespace, replicas, ready, available FROM deployments
+SELECT name, namespace,
+       json_get_int(spec, 'replicas') as desired,
+       json_get_int(status, 'readyReplicas') as ready,
+       json_get_int(status, 'availableReplicas') as available
+FROM deployments
+
+-- Find pods running a specific image
+SELECT name, namespace, json_get_str(spec, 'containers', 0, 'image') as image
+FROM pods
+WHERE json_get_str(spec, 'containers', 0, 'image') LIKE '%nginx%'
 
 -- Services with their types
-SELECT name, namespace, type, cluster_ip FROM services
-
--- PVCs with storage info
-SELECT name, namespace, phase, storage_class, capacity FROM persistentvolumeclaims
+SELECT name, namespace,
+       json_get_str(spec, 'type') as type,
+       json_get_str(spec, 'clusterIP') as cluster_ip
+FROM services
 
 -- Nodes with version info
-SELECT name, version, os, arch FROM nodes
+SELECT name,
+       json_get_str(status, 'nodeInfo', 'kubeletVersion') as version,
+       json_get_str(status, 'nodeInfo', 'osImage') as os
+FROM nodes
 
--- Recent events
-SELECT name, namespace, type, reason, message, count FROM events ORDER BY created DESC LIMIT 20
+-- Recent events (events have dedicated columns)
+SELECT name, namespace, type, reason, message, count
+FROM events
+ORDER BY created DESC LIMIT 20
+
+-- CRDs work the same way
+SELECT name, json_get_str(spec, 'secretName') as secret
+FROM certificates
 ```
+
+## Table Schema
+
+All Kubernetes resources are exposed with a consistent schema:
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `_cluster` | text | Kubernetes context/cluster name |
+| `name` | text | Resource name |
+| `namespace` | text | Namespace (null for cluster-scoped resources) |
+| `uid` | text | Unique identifier |
+| `created` | timestamp | Creation timestamp |
+| `labels` | json | Resource labels as JSON object |
+| `annotations` | json | Resource annotations as JSON object |
+| `spec` | json | Resource specification (desired state) |
+| `status` | json | Resource status (current state) |
+
+Special cases:
+- **ConfigMaps/Secrets**: Have `data` column instead of spec/status
+- **Events**: Have dedicated columns for `type`, `reason`, `message`, `count`, etc.
+
+Use `DESCRIBE <table>` to see the exact schema for any resource.
 
 ## Supported Resources
 
@@ -186,10 +245,12 @@ k8sql optimizes queries by pushing predicates to the Kubernetes API when possibl
 |-----------|--------------|
 | `namespace = 'x'` | Uses `Api::namespaced()` |
 | `labels.app = 'nginx'` | K8s label selector |
-| `status.phase = 'Running'` | K8s field selector |
 | `namespace LIKE '%'` | Queries all, filters client-side |
 | `_cluster = 'prod'` | Only queries that cluster |
 | `_cluster = '*'` | Queries all clusters |
+| `json_get_str(...)` | Client-side JSON parsing |
+
+Note: JSON field filtering (e.g., `WHERE json_get_str(status, 'phase') = 'Running'`) is performed client-side after fetching resources.
 
 ## REPL Commands
 
