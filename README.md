@@ -50,7 +50,22 @@ The `'*'` wildcard is a special value that expands to all available kubectl cont
 
 ### Querying Nested JSON Fields
 
-Kubernetes resources are exposed with `spec` and `status` as JSON columns. Use DataFusion's JSON functions to query nested fields:
+Kubernetes resources are exposed with `spec` and `status` as JSON columns. Query nested fields using either **PostgreSQL-style operators** or **function syntax**:
+
+#### PostgreSQL-Style Operators
+
+```sql
+-- Extract as text with ->>
+SELECT name, status->>'phase' as phase FROM pods
+
+-- Chain operators for nested access
+SELECT name, status->'nodeInfo'->>'kubeletVersion' as version FROM nodes
+
+-- Filter on JSON fields
+SELECT name FROM pods WHERE status->>'phase' = 'Running'
+```
+
+#### Function Syntax
 
 ```sql
 -- Extract string values with json_get_str(column, key1, key2, ...)
@@ -68,17 +83,24 @@ SELECT name, json_get_str(status, 'nodeInfo', 'kubeletVersion') as version FROM 
 -- Get integer values
 SELECT name, json_get_int(spec, 'replicas') as replicas FROM deployments
 
--- Get the full JSON object
+-- Get the full JSON object as string
 SELECT name, json_get_json(spec, 'containers') as containers FROM pods
 ```
 
-**Available JSON functions:**
-- `json_get_str(json, key, ...)` - Extract as string
-- `json_get_int(json, key, ...)` - Extract as integer
-- `json_get_float(json, key, ...)` - Extract as float
-- `json_get_bool(json, key, ...)` - Extract as boolean
-- `json_get_json(json, key, ...)` - Extract nested JSON as string
-- `json_contains(json, key, ...)` - Check if key exists
+#### Available JSON Functions and Operators
+
+| Operator/Function | Description |
+|-------------------|-------------|
+| `->` | Get JSON value (returns union type) |
+| `->>` | Get value as text string |
+| `json_get_str(json, key, ...)` | Extract as string |
+| `json_get_int(json, key, ...)` | Extract as integer |
+| `json_get_float(json, key, ...)` | Extract as float |
+| `json_get_bool(json, key, ...)` | Extract as boolean |
+| `json_get_json(json, key, ...)` | Extract nested JSON as string |
+| `json_contains(json, key, ...)` | Check if key exists |
+
+The function syntax supports chaining multiple keys and array indices in a single call, making it convenient for deeply nested access.
 
 ### Label Queries
 
