@@ -1,5 +1,6 @@
 use anyhow::Result;
 use futures::future::join_all;
+use std::sync::Arc;
 
 use crate::kubernetes::K8sClientPool;
 use crate::output::QueryResult;
@@ -7,12 +8,12 @@ use super::ast::*;
 use super::planner::{ClusterScope, NamespaceScope, QueryPlan, QueryPlanner};
 
 pub struct QueryExecutor {
-    pool: K8sClientPool,
+    pool: Arc<K8sClientPool>,
     planner: QueryPlanner,
 }
 
 impl QueryExecutor {
-    pub fn new(pool: K8sClientPool) -> Self {
+    pub fn new(pool: Arc<K8sClientPool>) -> Self {
         Self {
             pool,
             planner: QueryPlanner::new(),

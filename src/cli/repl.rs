@@ -13,30 +13,95 @@ use rustyline::history::DefaultHistory;
 use rustyline::validate::{ValidationContext, ValidationResult, Validator};
 use rustyline::{Context, Editor, Helper};
 use std::borrow::Cow;
+use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
+use crate::kubernetes::{discovery, K8sClientPool};
 use crate::output::QueryResult;
 use crate::sql::{QueryExecutor, SqlParser};
 
-// SQL keywords and table names for completion
-const TABLES: &[&str] = &[
-    "pods", "services", "deployments", "configmaps", "secrets",
-    "nodes", "namespaces", "ingresses", "jobs", "cronjobs",
-    "statefulsets", "daemonsets", "pvcs", "pvs",
-];
-
+// SQL keywords for completion
 const KEYWORDS: &[&str] = &[
     "SELECT", "FROM", "WHERE", "ORDER", "BY", "LIMIT", "AND", "OR",
     "SHOW", "TABLES", "DATABASES", "DESCRIBE", "USE", "ASC", "DESC",
     "IN", "LIKE", "NOT", "NULL", "TRUE", "FALSE",
 ];
 
-const COLUMNS: &[&str] = &[
-    "_cluster", "name", "namespace", "status", "age", "labels",
-    "status.phase", "spec.replicas", "spec.nodeName",
-];
+// Common operators for WHERE clauses
+const OPERATORS: &[&str] = &["=", "!=", "<>", "<", ">", "<=", ">=", "LIKE", "IN", "NOT"];
 
-struct SqlHelper;
+/// Cached completion data populated from Kubernetes cluster
+#[derive(Default)]
+pub struct CompletionCache {
+    /// All discovered table names
+    pub tables: Vec<String>,
+    /// Table aliases (e.g., "pod" -> "pods")
+    pub aliases: HashMap<String, String>,
+    /// Columns per table (table_name -> column names)
+    pub columns: HashMap<String, Vec<String>>,
+    /// Available namespaces in the cluster
+    pub namespaces: Vec<String>,
+    /// Available kubectl contexts (clusters)
+    pub contexts: Vec<String>,
+}
+
+impl CompletionCache {
+    /// Populate cache from the K8sClientPool
+    pub async fn populate(pool: &K8sClientPool) -> Result<Self> {
+        let mut cache = CompletionCache::default();
+
+        // Get contexts from kubeconfig
+        cache.contexts = pool.list_contexts()?;
+
+        // Get resource registry for tables and columns
+        let registry = pool.get_registry(None).await?;
+
+        for info in registry.list_tables() {
+            // Add table name
+            cache.tables.push(info.table_name.clone());
+
+            // Add aliases
+            for alias in &info.aliases {
+                cache.aliases.insert(alias.clone(), info.table_name.clone());
+            }
+
+            // Generate column names from schema
+            let schema = discovery::generate_schema(info);
+            let col_names: Vec<String> = schema.iter().map(|c| c.name.clone()).collect();
+            cache.columns.insert(info.table_name.clone(), col_names);
+        }
+
+        // Fetch namespaces from cluster
+        if let Ok(Some(ns_info)) = pool.get_resource_info("namespaces", None).await {
+            let client = pool.get_client(None).await?;
+            let ar = &ns_info.api_resource;
+            let api: kube::Api<kube::api::DynamicObject> = kube::Api::all_with(client, ar);
+            if let Ok(ns_list) = api.list(&kube::api::ListParams::default()).await {
+                cache.namespaces = ns_list
+                    .items
+                    .iter()
+                    .filter_map(|ns| ns.metadata.name.clone())
+                    .collect();
+                cache.namespaces.sort();
+            }
+        }
+
+        cache.tables.sort();
+        Ok(cache)
+    }
+
+    /// Get columns for a table (resolves aliases)
+    fn get_columns(&self, table: &str) -> Option<&Vec<String>> {
+        let table_lower = table.to_lowercase();
+        let table_name = self.aliases.get(&table_lower).unwrap_or(&table_lower);
+        self.columns.get(table_name)
+    }
+}
+
+struct SqlHelper {
+    cache: Arc<RwLock<CompletionCache>>,
+}
 
 impl Helper for SqlHelper {}
 
@@ -54,6 +119,117 @@ impl Validator for SqlHelper {
     }
 }
 
+/// Detect completion context from the line before cursor
+#[derive(Debug, PartialEq)]
+enum CompletionContext {
+    /// After FROM or DESCRIBE - complete with table names
+    TableName,
+    /// After USE - complete with context/cluster names
+    ContextName,
+    /// After WHERE, AND, OR, or column = - complete with column names
+    ColumnName { table: Option<String> },
+    /// After namespace = or namespace IN ( - complete with namespace values
+    NamespaceValue,
+    /// After _cluster = or _cluster IN ( - complete with context values
+    ClusterValue,
+    /// After a column name - complete with operators (planned feature)
+    #[allow(dead_code)]
+    Operator,
+    /// Default - complete with keywords, tables, columns
+    General,
+}
+
+impl SqlHelper {
+    /// Analyze the line to determine completion context
+    fn detect_context(&self, line: &str) -> CompletionContext {
+        let line_upper = line.to_uppercase();
+        let line_lower = line.to_lowercase();
+
+        // Check for value completion contexts (after = or IN ()
+        // Look for patterns like "namespace = '" or "namespace IN ('"
+        if line_lower.ends_with("namespace = '")
+            || line_lower.ends_with("namespace ='")
+            || line_lower.ends_with("namespace in ('")
+            || line_lower.ends_with("namespace in('")
+            || (line_lower.contains("namespace in (") && line_lower.ends_with("'"))
+        {
+            return CompletionContext::NamespaceValue;
+        }
+
+        if line_lower.ends_with("_cluster = '")
+            || line_lower.ends_with("_cluster ='")
+            || line_lower.ends_with("_cluster in ('")
+            || line_lower.ends_with("_cluster in('")
+            || (line_lower.contains("_cluster in (") && line_lower.ends_with("'"))
+        {
+            return CompletionContext::ClusterValue;
+        }
+
+        // Check for USE context
+        if line_upper.trim().starts_with("USE ") || line_upper.trim() == "USE" {
+            return CompletionContext::ContextName;
+        }
+
+        // Extract table name from query for column completion
+        let table = self.extract_table_name(&line_lower);
+
+        // Check for FROM or DESCRIBE context
+        let words: Vec<&str> = line_upper.split_whitespace().collect();
+        if let Some(last_word) = words.last() {
+            if *last_word == "FROM" || *last_word == "DESCRIBE" {
+                return CompletionContext::TableName;
+            }
+        }
+
+        // Check if we're in WHERE clause and just typed a column name
+        if line_upper.contains("WHERE") || line_upper.contains(" AND ") || line_upper.contains(" OR ") {
+            // If the last token looks like a column name (no operator after it)
+            let trimmed = line.trim();
+            if !trimmed.is_empty() {
+                let last_char = trimmed.chars().last().unwrap();
+                // If last char is alphanumeric or underscore, might need operator
+                if last_char.is_alphanumeric() || last_char == '_' {
+                    // Check if there's a space before the current word
+                    let parts: Vec<&str> = trimmed.rsplitn(2, char::is_whitespace).collect();
+                    if parts.len() == 2 {
+                        let last_token = parts[0].to_uppercase();
+                        // If last token is not an operator or keyword, suggest operators
+                        if !OPERATORS.iter().any(|op| last_token == *op)
+                            && !["AND", "OR", "WHERE"].contains(&last_token.as_str())
+                        {
+                            // Could be column name, suggest operators next
+                            // But only if we're definitely after WHERE
+                        }
+                    }
+                }
+            }
+            return CompletionContext::ColumnName { table };
+        }
+
+        // Check for SELECT context (after SELECT, before FROM)
+        if line_upper.contains("SELECT") && !line_upper.contains("FROM") {
+            return CompletionContext::ColumnName { table };
+        }
+
+        CompletionContext::General
+    }
+
+    /// Extract table name from a query
+    fn extract_table_name(&self, line: &str) -> Option<String> {
+        // Look for "FROM table_name" pattern
+        let from_idx = line.find("from ")?;
+        let after_from = &line[from_idx + 5..];
+        let table = after_from
+            .split(|c: char| c.is_whitespace() || c == ';')
+            .next()?;
+        if table.is_empty() {
+            None
+        } else {
+            Some(table.to_string())
+        }
+    }
+}
+
 impl Completer for SqlHelper {
     type Candidate = Pair;
 
@@ -65,50 +241,166 @@ impl Completer for SqlHelper {
     ) -> rustyline::Result<(usize, Vec<Pair>)> {
         let line_to_cursor = &line[..pos];
 
+        // Detect completion context
+        let context = self.detect_context(line_to_cursor);
+
         // Find the start of the current word
         let word_start = line_to_cursor
-            .rfind(|c: char| c.is_whitespace() || c == ',' || c == '(' || c == '=')
+            .rfind(|c: char| c.is_whitespace() || c == ',' || c == '(' || c == '=' || c == '\'')
             .map(|i| i + 1)
             .unwrap_or(0);
 
         let prefix = &line_to_cursor[word_start..];
-        if prefix.is_empty() {
-            return Ok((pos, vec![]));
-        }
-
         let prefix_lower = prefix.to_lowercase();
         let prefix_upper = prefix.to_uppercase();
 
         let mut matches: Vec<Pair> = Vec::new();
 
-        // Match keywords (case-insensitive, output uppercase)
-        for &kw in KEYWORDS {
-            if kw.starts_with(&prefix_upper) {
-                matches.push(Pair {
-                    display: kw.to_string(),
-                    replacement: kw.to_string(),
-                });
+        // Get cache (read lock)
+        let cache = self.cache.read().unwrap();
+
+        match context {
+            CompletionContext::TableName => {
+                // Complete with table names and aliases
+                for table in &cache.tables {
+                    if table.starts_with(&prefix_lower) {
+                        matches.push(Pair {
+                            display: table.clone(),
+                            replacement: table.clone(),
+                        });
+                    }
+                }
+                for (alias, _table) in &cache.aliases {
+                    if alias.starts_with(&prefix_lower) && !cache.tables.contains(alias) {
+                        matches.push(Pair {
+                            display: alias.clone(),
+                            replacement: alias.clone(),
+                        });
+                    }
+                }
+            }
+
+            CompletionContext::ContextName => {
+                // Complete with kubectl contexts
+                for ctx in &cache.contexts {
+                    if ctx.to_lowercase().starts_with(&prefix_lower) {
+                        matches.push(Pair {
+                            display: ctx.clone(),
+                            replacement: ctx.clone(),
+                        });
+                    }
+                }
+            }
+
+            CompletionContext::NamespaceValue => {
+                // Complete with actual namespace names
+                for ns in &cache.namespaces {
+                    if ns.starts_with(&prefix_lower) {
+                        matches.push(Pair {
+                            display: ns.clone(),
+                            replacement: ns.clone(),
+                        });
+                    }
+                }
+            }
+
+            CompletionContext::ClusterValue => {
+                // Complete with context names (same as ContextName but for WHERE clause)
+                for ctx in &cache.contexts {
+                    if ctx.to_lowercase().starts_with(&prefix_lower) {
+                        matches.push(Pair {
+                            display: ctx.clone(),
+                            replacement: ctx.clone(),
+                        });
+                    }
+                }
+                // Add '*' for all clusters
+                if "*".starts_with(&prefix_lower) || prefix.is_empty() {
+                    matches.push(Pair {
+                        display: "*".to_string(),
+                        replacement: "*".to_string(),
+                    });
+                }
+            }
+
+            CompletionContext::ColumnName { table } => {
+                // If we know the table, use its columns; otherwise use general columns
+                let cols = table
+                    .as_ref()
+                    .and_then(|t| cache.get_columns(t))
+                    .or_else(|| cache.columns.get("pods")); // Default to pods columns
+
+                if let Some(columns) = cols {
+                    for col in columns {
+                        if col.starts_with(&prefix_lower) {
+                            matches.push(Pair {
+                                display: col.clone(),
+                                replacement: col.clone(),
+                            });
+                        }
+                    }
+                }
+
+                // Also suggest common JSON path prefixes
+                for path in &["metadata.", "spec.", "status.", "labels."] {
+                    if path.starts_with(&prefix_lower) {
+                        matches.push(Pair {
+                            display: path.to_string(),
+                            replacement: path.to_string(),
+                        });
+                    }
+                }
+            }
+
+            CompletionContext::Operator => {
+                for &op in OPERATORS {
+                    if op.starts_with(&prefix_upper) || op.starts_with(&prefix_lower) {
+                        matches.push(Pair {
+                            display: op.to_string(),
+                            replacement: op.to_string(),
+                        });
+                    }
+                }
+            }
+
+            CompletionContext::General => {
+                // Keywords (uppercase)
+                for &kw in KEYWORDS {
+                    if kw.starts_with(&prefix_upper) {
+                        matches.push(Pair {
+                            display: kw.to_string(),
+                            replacement: kw.to_string(),
+                        });
+                    }
+                }
+
+                // Tables (lowercase)
+                for table in &cache.tables {
+                    if table.starts_with(&prefix_lower) {
+                        matches.push(Pair {
+                            display: table.clone(),
+                            replacement: table.clone(),
+                        });
+                    }
+                }
+
+                // Default column set (from pods as common case)
+                if let Some(columns) = cache.columns.get("pods") {
+                    for col in columns {
+                        if col.starts_with(&prefix_lower) {
+                            matches.push(Pair {
+                                display: col.clone(),
+                                replacement: col.clone(),
+                            });
+                        }
+                    }
+                }
             }
         }
 
-        // Match tables (lowercase)
-        for &table in TABLES {
-            if table.starts_with(&prefix_lower) {
-                matches.push(Pair {
-                    display: table.to_string(),
-                    replacement: table.to_string(),
-                });
-            }
-        }
-
-        // Match columns (lowercase)
-        for &col in COLUMNS {
-            if col.starts_with(&prefix_lower) {
-                matches.push(Pair {
-                    display: col.to_string(),
-                    replacement: col.to_string(),
-                });
-            }
+        // If no prefix yet, don't show completions (avoid noise)
+        if prefix.is_empty() && matches.len() > 20 {
+            return Ok((pos, vec![]));
         }
 
         Ok((word_start, matches))
@@ -220,10 +512,16 @@ fn print_help() {
     println!();
 }
 
-pub async fn run_repl(executor: QueryExecutor) -> Result<()> {
+pub async fn run_repl(executor: QueryExecutor, pool: Arc<K8sClientPool>) -> Result<()> {
     let parser = SqlParser::new();
 
-    let helper = SqlHelper;
+    // Populate completion cache from cluster
+    let cache = CompletionCache::populate(&pool).await.unwrap_or_default();
+    let cache = Arc::new(RwLock::new(cache));
+
+    let helper = SqlHelper {
+        cache: Arc::clone(&cache),
+    };
     let config = rustyline::Config::builder()
         .auto_add_history(true)
         .max_history_size(1000)?
@@ -266,6 +564,9 @@ pub async fn run_repl(executor: QueryExecutor) -> Result<()> {
                     continue;
                 }
 
+                // Check if this is a USE command (for cache refresh after success)
+                let is_use_command = lower.starts_with("use ");
+
                 // Execute query with spinner
                 let spinner = create_spinner("Executing query...");
                 let start = Instant::now();
@@ -291,6 +592,15 @@ pub async fn run_repl(executor: QueryExecutor) -> Result<()> {
                                         ))
                                         .dim()
                                     );
+                                }
+
+                                // Refresh completion cache after successful USE command
+                                if is_use_command {
+                                    if let Ok(new_cache) = CompletionCache::populate(&pool).await {
+                                        if let Ok(mut cache_guard) = cache.write() {
+                                            *cache_guard = new_cache;
+                                        }
+                                    }
                                 }
                             }
                             Err(e) => {

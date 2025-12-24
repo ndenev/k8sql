@@ -9,6 +9,7 @@ mod sql;
 
 use anyhow::Result;
 use clap::Parser;
+use std::sync::Arc;
 
 use cli::{Args, Command};
 use daemon::PgWireServer;
@@ -61,7 +62,7 @@ async fn main() -> Result<()> {
 }
 
 async fn run_batch(args: &Args) -> Result<()> {
-    let pool = K8sClientPool::new(args.context.as_deref(), &args.namespace).await?;
+    let pool = Arc::new(K8sClientPool::new(args.context.as_deref(), &args.namespace).await?);
     let parser = SqlParser::new();
     let executor = QueryExecutor::new(pool);
 
@@ -100,8 +101,8 @@ async fn run_batch(args: &Args) -> Result<()> {
 }
 
 async fn run_interactive(args: &Args) -> Result<()> {
-    let pool = K8sClientPool::new(args.context.as_deref(), &args.namespace).await?;
-    let executor = QueryExecutor::new(pool);
+    let pool = Arc::new(K8sClientPool::new(args.context.as_deref(), &args.namespace).await?);
+    let executor = QueryExecutor::new(Arc::clone(&pool));
 
-    cli::repl::run_repl(executor).await
+    cli::repl::run_repl(executor, pool).await
 }
