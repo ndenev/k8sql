@@ -18,6 +18,7 @@ use super::preprocess::preprocess_sql;
 use super::provider::K8sTableProvider;
 
 /// A wrapper around DataFusion's SessionContext configured for K8s queries
+#[derive(Clone)]
 pub struct K8sSessionContext {
     ctx: SessionContext,
     pool: Arc<K8sClientPool>,

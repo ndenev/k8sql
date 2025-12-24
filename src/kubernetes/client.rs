@@ -9,6 +9,7 @@ use tokio::sync::RwLock;
 use tracing::{debug, warn};
 
 use super::discovery::{ResourceInfo, ResourceRegistry, discover_resources};
+use crate::progress::ProgressHandle;
 use crate::sql::ApiFilters;
 
 /// How long to cache discovered resources before auto-refresh
@@ -25,6 +26,10 @@ const MAX_RETRIES: u32 = 3;
 
 /// Base delay for exponential backoff (doubles each retry)
 const RETRY_BASE_DELAY: Duration = Duration::from_millis(100);
+
+/// Page size for paginated list requests
+/// Smaller pages reduce memory pressure and allow faster initial response
+const PAGE_SIZE: u32 = 500;
 
 /// Cached registry with timestamp
 struct CachedRegistry {
@@ -52,6 +57,8 @@ pub struct K8sClientPool {
     clients: Arc<RwLock<HashMap<String, Client>>>,
     registries: Arc<RwLock<HashMap<String, CachedRegistry>>>,
     current_context: Arc<RwLock<String>>,
+    /// Progress reporter for query status updates
+    progress: ProgressHandle,
 }
 
 impl K8sClientPool {
@@ -76,6 +83,7 @@ impl K8sClientPool {
             clients: Arc::new(RwLock::new(HashMap::new())),
             registries: Arc::new(RwLock::new(HashMap::new())),
             current_context: Arc::new(RwLock::new(context_name.clone())),
+            progress: crate::progress::create_progress_handle(),
         };
 
         // Pre-connect to the default context and discover resources
@@ -200,6 +208,11 @@ impl K8sClientPool {
         Ok(self.current_context.read().await.clone())
     }
 
+    /// Get the progress reporter handle for subscribing to updates
+    pub fn progress(&self) -> &ProgressHandle {
+        &self.progress
+    }
+
     pub async fn switch_context(&self, context: &str) -> Result<()> {
         // Verify context exists
         if !self.kubeconfig.contexts.iter().any(|c| c.name == context) {
@@ -286,22 +299,85 @@ impl K8sClientPool {
         Ok(values)
     }
 
-    /// List resources with retry logic and exponential backoff
+    /// List resources with pagination and retry logic
+    /// Uses continue tokens to fetch all pages efficiently
     async fn list_with_retry(
+        &self,
+        api: &Api<DynamicObject>,
+        base_params: &ListParams,
+        table: &str,
+        context: Option<&str>,
+    ) -> Result<kube::api::ObjectList<DynamicObject>> {
+        let ctx_name = context.unwrap_or("default");
+        let mut all_items: Vec<DynamicObject> = Vec::new();
+        let mut continue_token: Option<String> = None;
+        let mut page_count = 0u32;
+
+        loop {
+            // Build params for this page
+            let mut params = base_params.clone().limit(PAGE_SIZE);
+            if let Some(ref token) = continue_token {
+                params = params.continue_token(token);
+            }
+
+            // Fetch with retry
+            let list = self
+                .list_page_with_retry(api, &params, table, ctx_name)
+                .await?;
+
+            let items_count = list.items.len();
+            all_items.extend(list.items);
+            page_count += 1;
+
+            // Check for more pages
+            match list.metadata.continue_ {
+                Some(token) if !token.is_empty() => {
+                    debug!(
+                        table = %table,
+                        context = %ctx_name,
+                        page = page_count,
+                        items_this_page = items_count,
+                        total_so_far = all_items.len(),
+                        "Fetched page, continuing"
+                    );
+                    continue_token = Some(token);
+                }
+                _ => break,
+            }
+        }
+
+        if page_count > 1 {
+            debug!(
+                table = %table,
+                context = %ctx_name,
+                pages = page_count,
+                total_items = all_items.len(),
+                "Pagination complete"
+            );
+        }
+
+        // Construct a combined result
+        Ok(kube::api::ObjectList {
+            metadata: kube::api::ListMeta::default(),
+            items: all_items,
+            types: Default::default(),
+        })
+    }
+
+    /// Fetch a single page with retry logic
+    async fn list_page_with_retry(
         &self,
         api: &Api<DynamicObject>,
         params: &ListParams,
         table: &str,
-        context: Option<&str>,
+        ctx_name: &str,
     ) -> Result<kube::api::ObjectList<DynamicObject>> {
         let mut last_error = None;
-        let ctx_name = context.unwrap_or("default");
 
         for attempt in 0..MAX_RETRIES {
             match api.list(params).await {
                 Ok(list) => return Ok(list),
                 Err(e) => {
-                    // Check if this is a retryable error
                     if Self::is_retryable_error(&e) {
                         let delay = RETRY_BASE_DELAY * 2u32.pow(attempt);
                         warn!(
@@ -316,7 +392,6 @@ impl K8sClientPool {
                         tokio::time::sleep(delay).await;
                         last_error = Some(e);
                     } else {
-                        // Non-retryable error, fail immediately
                         debug!(
                             table = %table,
                             context = %ctx_name,

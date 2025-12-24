@@ -21,8 +21,8 @@ use tokio::sync::RwLock;
 use tracing::{debug, info};
 
 /// Maximum number of clusters to query concurrently
-/// Prevents overwhelming the network or hitting rate limits
-const MAX_CONCURRENT_CLUSTERS: usize = 5;
+/// Higher values improve performance but increase local resource usage (connections, memory)
+const MAX_CONCURRENT_CLUSTERS: usize = 15;
 
 use crate::kubernetes::K8sClientPool;
 use crate::kubernetes::discovery::{ResourceInfo, generate_schema};
@@ -311,6 +311,9 @@ impl TableProvider for K8sTableProvider {
 
         let fetch_start = Instant::now();
 
+        // Report query start
+        pool.progress().start_query(&table_name, num_clusters);
+
         // Execute cluster queries with concurrency limit to avoid overwhelming APIs
         let results: Vec<_> = stream::iter(clusters.iter().cloned())
             .map(|cluster| {
@@ -331,13 +334,16 @@ impl TableProvider for K8sTableProvider {
                         .await
                         .unwrap_or_default();
                     let elapsed = start.elapsed();
+                    let row_count = resources.len();
                     debug!(
                         cluster = %cluster,
                         table = %table_name,
-                        rows = resources.len(),
+                        rows = row_count,
                         elapsed_ms = elapsed.as_millis(),
                         "Fetched from cluster"
                     );
+                    // Report cluster completion
+                    pool.progress().cluster_complete(&cluster, row_count, elapsed.as_millis() as u64);
                     (cluster, resources)
                 }
             })
@@ -375,6 +381,9 @@ impl TableProvider for K8sTableProvider {
             let empty_batch = datafusion::arrow::array::RecordBatch::new_empty(exec_schema.clone());
             partitions.push(vec![empty_batch]);
         }
+
+        // Report query completion
+        pool.progress().query_complete(total_rows, fetch_elapsed.as_millis() as u64);
 
         info!(
             table = %self.resource_info.table_name,

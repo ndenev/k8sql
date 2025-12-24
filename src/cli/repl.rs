@@ -16,10 +16,12 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
+use tokio::sync::broadcast;
 
 use crate::datafusion_integration::K8sSessionContext;
 use crate::kubernetes::K8sClientPool;
 use crate::output::QueryResult;
+use crate::progress::ProgressUpdate;
 
 // SQL keywords for completion
 const KEYWORDS: &[&str] = &[
@@ -748,15 +750,68 @@ pub async fn run_repl(mut session: K8sSessionContext, pool: Arc<K8sClientPool>) 
                     continue;
                 }
 
-                // Execute query with spinner using DataFusion
+                // Execute query with spinner and progress updates
                 let spinner = create_spinner("Executing query...");
                 let start = Instant::now();
 
-                match session.execute_sql_to_strings(input).await {
-                    Ok(result) => {
-                        spinner.finish_and_clear();
-                        let elapsed = start.elapsed();
+                // Subscribe to progress updates
+                let mut progress_rx = pool.progress().subscribe();
 
+                // Clone session for the spawned task
+                let session_clone = session.clone();
+                let input_owned = input.to_string();
+
+                // Spawn query execution
+                let mut query_handle = tokio::spawn(async move {
+                    session_clone.execute_sql_to_strings(&input_owned).await
+                });
+
+                // Listen for progress updates while query runs
+                let result = loop {
+                    tokio::select! {
+                        // Check for progress updates
+                        progress = progress_rx.recv() => {
+                            match progress {
+                                Ok(ProgressUpdate::StartingQuery { table, cluster_count }) => {
+                                    if cluster_count > 1 {
+                                        spinner.set_message(format!(
+                                            "Querying {} across {} clusters...",
+                                            table, cluster_count
+                                        ));
+                                    } else {
+                                        spinner.set_message(format!("Querying {}...", table));
+                                    }
+                                }
+                                Ok(ProgressUpdate::ClusterComplete { cluster, rows, elapsed_ms: _ }) => {
+                                    let (done, total) = pool.progress().progress();
+                                    spinner.set_message(format!(
+                                        "[{}/{}] {} ({} rows)",
+                                        done, total, cluster, rows
+                                    ));
+                                }
+                                Ok(ProgressUpdate::QueryComplete { total_rows, elapsed_ms: _ }) => {
+                                    spinner.set_message(format!("Processing {} rows...", total_rows));
+                                }
+                                Err(broadcast::error::RecvError::Closed) => {
+                                    // Channel closed, wait for query
+                                }
+                                Err(broadcast::error::RecvError::Lagged(_)) => {
+                                    // Missed some updates, continue
+                                }
+                            }
+                        }
+                        // Query completed
+                        query_result = &mut query_handle => {
+                            break query_result;
+                        }
+                    }
+                };
+
+                spinner.finish_and_clear();
+                let elapsed = start.elapsed();
+
+                match result {
+                    Ok(Ok(result)) => {
                         if result.rows.is_empty() {
                             println!("{}", style("(0 rows)").dim());
                         } else {
@@ -777,9 +832,11 @@ pub async fn run_repl(mut session: K8sSessionContext, pool: Arc<K8sClientPool>) 
                             );
                         }
                     }
-                    Err(e) => {
-                        spinner.finish_and_clear();
+                    Ok(Err(e)) => {
                         println!("{} {}", style("Error:").red().bold(), style(e).red());
+                    }
+                    Err(e) => {
+                        println!("{} {}", style("Error:").red().bold(), style(format!("Query task panicked: {}", e)).red());
                     }
                 }
                 println!();
