@@ -92,10 +92,10 @@ impl K8sClientPool {
         // Check if already discovered and not expired
         if !force {
             let registries = self.registries.read().await;
-            if let Some(cached) = registries.get(context) {
-                if !cached.is_expired() {
-                    return Ok(());
-                }
+            if let Some(cached) = registries.get(context)
+                && !cached.is_expired()
+            {
+                return Ok(());
             }
         }
 

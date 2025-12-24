@@ -232,10 +232,10 @@ impl SqlHelper {
 
         // Check for FROM or DESCRIBE context
         let words: Vec<&str> = line_upper.split_whitespace().collect();
-        if let Some(last_word) = words.last() {
-            if *last_word == "FROM" || *last_word == "DESCRIBE" {
-                return CompletionContext::TableName;
-            }
+        if let Some(last_word) = words.last()
+            && (*last_word == "FROM" || *last_word == "DESCRIBE")
+        {
+            return CompletionContext::TableName;
         }
 
         // Check if we're in WHERE clause and just typed a column name
@@ -330,7 +330,7 @@ impl Completer for SqlHelper {
                         });
                     }
                 }
-                for (alias, _table) in &cache.aliases {
+                for alias in cache.aliases.keys() {
                     if alias.starts_with(&prefix_lower) && !cache.tables.contains(alias) {
                         matches.push(Pair {
                             display: alias.clone(),
@@ -524,7 +524,7 @@ fn format_table(result: &QueryResult) -> String {
 
     // Data rows
     for row in &result.rows {
-        let cells: Vec<Cell> = row.iter().map(|val| Cell::new(val)).collect();
+        let cells: Vec<Cell> = row.iter().map(Cell::new).collect();
         table.add_row(cells);
     }
 
@@ -697,10 +697,10 @@ pub async fn run_repl(mut session: K8sSessionContext, pool: Arc<K8sClientPool>) 
                             println!("{} {}", style("Warning:").yellow(), style(e).yellow());
                         }
                         // Refresh completion cache from updated session
-                        if let Ok(new_cache) = CompletionCache::populate(&session, &pool).await {
-                            if let Ok(mut cache_guard) = cache.write() {
-                                *cache_guard = new_cache;
-                            }
+                        if let Ok(new_cache) = CompletionCache::populate(&session, &pool).await
+                            && let Ok(mut cache_guard) = cache.write()
+                        {
+                            *cache_guard = new_cache;
                         }
                     }
                     println!();

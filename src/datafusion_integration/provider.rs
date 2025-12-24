@@ -64,18 +64,14 @@ impl K8sTableProvider {
     /// Extract namespace filter from DataFusion expressions if possible
     fn extract_namespace_filter(&self, filters: &[Expr]) -> Option<String> {
         for filter in filters {
-            if let Expr::BinaryExpr(binary) = filter {
-                if let (Expr::Column(col), Expr::Literal(lit, _)) =
+            if let Expr::BinaryExpr(binary) = filter
+                && let (Expr::Column(col), Expr::Literal(lit, _)) =
                     (binary.left.as_ref(), binary.right.as_ref())
-                {
-                    if col.name == "namespace"
-                        && matches!(binary.op, datafusion::logical_expr::Operator::Eq)
-                    {
-                        if let datafusion::common::ScalarValue::Utf8(Some(ns)) = lit {
-                            return Some(ns.clone());
-                        }
-                    }
-                }
+                && col.name == "namespace"
+                && matches!(binary.op, datafusion::logical_expr::Operator::Eq)
+                && let datafusion::common::ScalarValue::Utf8(Some(ns)) = lit
+            {
+                return Some(ns.clone());
             }
         }
         None
@@ -84,18 +80,14 @@ impl K8sTableProvider {
     /// Extract _cluster filter from DataFusion expressions
     fn extract_cluster_filter(&self, filters: &[Expr]) -> Option<String> {
         for filter in filters {
-            if let Expr::BinaryExpr(binary) = filter {
-                if let (Expr::Column(col), Expr::Literal(lit, _)) =
+            if let Expr::BinaryExpr(binary) = filter
+                && let (Expr::Column(col), Expr::Literal(lit, _)) =
                     (binary.left.as_ref(), binary.right.as_ref())
-                {
-                    if col.name == "_cluster"
-                        && matches!(binary.op, datafusion::logical_expr::Operator::Eq)
-                    {
-                        if let datafusion::common::ScalarValue::Utf8(Some(cluster)) = lit {
-                            return Some(cluster.clone());
-                        }
-                    }
-                }
+                && col.name == "_cluster"
+                && matches!(binary.op, datafusion::logical_expr::Operator::Eq)
+                && let datafusion::common::ScalarValue::Utf8(Some(cluster)) = lit
+            {
+                return Some(cluster.clone());
             }
         }
         None
@@ -164,45 +156,37 @@ impl K8sTableProvider {
             debug!(func_name = %func_name, args_len = func.args.len(), "Found ScalarFunction on left side");
 
             // Handle get_field for native map access (labels['key'])
-            if func_name == "get_field" && func.args.len() >= 2 {
-                if let Expr::Column(col) = &func.args[0] {
-                    if col.name == "labels" {
-                        // Second arg should be the label key as a literal
-                        if let Expr::Literal(key_lit, _) = &func.args[1] {
-                            if let datafusion::common::ScalarValue::Utf8(Some(key)) = key_lit {
-                                // Right side should be the value literal
-                                if let Expr::Literal(val_lit, _) = binary.right.as_ref() {
-                                    if let datafusion::common::ScalarValue::Utf8(Some(value)) =
-                                        val_lit
-                                    {
-                                        debug!(key = %key, value = %value, "Extracted label selector via get_field");
-                                        return Some(format!("{}{}{}", key, op, value));
-                                    }
-                                }
-                            }
-                        }
+            if func_name == "get_field"
+                && func.args.len() >= 2
+                && let Expr::Column(col) = &func.args[0]
+                && col.name == "labels"
+            {
+                // Second arg should be the label key as a literal
+                if let Expr::Literal(key_lit, _) = &func.args[1]
+                    && let datafusion::common::ScalarValue::Utf8(Some(key)) = key_lit
+                {
+                    // Right side should be the value literal
+                    if let Expr::Literal(val_lit, _) = binary.right.as_ref()
+                        && let datafusion::common::ScalarValue::Utf8(Some(value)) = val_lit
+                    {
+                        debug!(key = %key, value = %value, "Extracted label selector via get_field");
+                        return Some(format!("{}{}{}", key, op, value));
                     }
                 }
             }
 
             // Legacy: handle json_get_str for backward compatibility
-            if func_name == "json_get_str" && func.args.len() >= 2 {
-                if let Expr::Column(col) = &func.args[0] {
-                    if col.name == "labels" {
-                        if let Expr::Literal(key_lit, _) = &func.args[1] {
-                            if let datafusion::common::ScalarValue::Utf8(Some(key)) = key_lit {
-                                if let Expr::Literal(val_lit, _) = binary.right.as_ref() {
-                                    if let datafusion::common::ScalarValue::Utf8(Some(value)) =
-                                        val_lit
-                                    {
-                                        debug!(key = %key, value = %value, "Extracted label selector via json_get_str");
-                                        return Some(format!("{}{}{}", key, op, value));
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
+            if func_name == "json_get_str"
+                && func.args.len() >= 2
+                && let Expr::Column(col) = &func.args[0]
+                && col.name == "labels"
+                && let Expr::Literal(key_lit, _) = &func.args[1]
+                && let datafusion::common::ScalarValue::Utf8(Some(key)) = key_lit
+                && let Expr::Literal(val_lit, _) = binary.right.as_ref()
+                && let datafusion::common::ScalarValue::Utf8(Some(value)) = val_lit
+            {
+                debug!(key = %key, value = %value, "Extracted label selector via json_get_str");
+                return Some(format!("{}{}{}", key, op, value));
             }
         }
         None
@@ -246,22 +230,20 @@ impl TableProvider for K8sTableProvider {
             .map(|f| {
                 if let Expr::BinaryExpr(binary) = f {
                     // Check for column-based filters (namespace, _cluster)
-                    if let Expr::Column(col) = binary.left.as_ref() {
-                        if col.name == "namespace" || col.name == "_cluster" {
-                            return TableProviderFilterPushDown::Exact;
-                        }
+                    if let Expr::Column(col) = binary.left.as_ref()
+                        && (col.name == "namespace" || col.name == "_cluster")
+                    {
+                        return TableProviderFilterPushDown::Exact;
                     }
                     // Check for labels['key'] pattern (native map access via get_field or json_get_str)
                     if let Expr::ScalarFunction(func) = binary.left.as_ref() {
                         let func_name = func.name();
                         if (func_name == "get_field" || func_name == "json_get_str")
                             && !func.args.is_empty()
+                            && let Expr::Column(col) = &func.args[0]
+                            && col.name == "labels"
                         {
-                            if let Expr::Column(col) = &func.args[0] {
-                                if col.name == "labels" {
-                                    return TableProviderFilterPushDown::Exact;
-                                }
-                            }
+                            return TableProviderFilterPushDown::Exact;
                         }
                     }
                 }
