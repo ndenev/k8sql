@@ -508,8 +508,31 @@ fn print_help() {
     println!("  {} - SHOW TABLES", cmd_style.apply_to("\\dt"));
     println!("  {} - SHOW DATABASES", cmd_style.apply_to("\\l"));
     println!("  {} - DESCRIBE <table>", cmd_style.apply_to("\\d <table>"));
+    println!("  {} - Toggle expanded display", cmd_style.apply_to("\\x"));
     println!("  {} - Quit", cmd_style.apply_to("\\q"));
     println!();
+}
+
+fn format_expanded(result: &QueryResult) -> String {
+    let mut output = String::new();
+    let max_col_width = result.columns.iter().map(|c| c.len()).max().unwrap_or(0);
+
+    for (row_idx, row) in result.rows.iter().enumerate() {
+        output.push_str(&format!(
+            "{}\n",
+            style(format!("-[ RECORD {} ]-", row_idx + 1)).yellow()
+        ));
+        for (col_idx, value) in row.iter().enumerate() {
+            let col_name = &result.columns[col_idx];
+            output.push_str(&format!(
+                "{:>width$} | {}\n",
+                style(col_name).cyan(),
+                value,
+                width = max_col_width
+            ));
+        }
+    }
+    output
 }
 
 pub async fn run_repl(executor: QueryExecutor, pool: Arc<K8sClientPool>) -> Result<()> {
@@ -538,6 +561,9 @@ pub async fn run_repl(executor: QueryExecutor, pool: Arc<K8sClientPool>) -> Resu
 
     print_welcome();
 
+    // Display mode: false = table, true = expanded
+    let mut expanded = false;
+
     loop {
         let prompt = format!("{}> ", style("k8sql").green().bold());
 
@@ -563,6 +589,14 @@ pub async fn run_repl(executor: QueryExecutor, pool: Arc<K8sClientPool>) -> Resu
                     print!("\x1B[2J\x1B[1;1H"); // Clear screen
                     continue;
                 }
+                if lower == "\\x" {
+                    expanded = !expanded;
+                    println!(
+                        "Expanded display is {}.",
+                        if expanded { "on" } else { "off" }
+                    );
+                    continue;
+                }
 
                 // Check if this is a USE command (for cache refresh after success)
                 let is_use_command = lower.starts_with("use ");
@@ -581,7 +615,11 @@ pub async fn run_repl(executor: QueryExecutor, pool: Arc<K8sClientPool>) -> Resu
                                 if result.rows.is_empty() {
                                     println!("{}", style("(0 rows)").dim());
                                 } else {
-                                    println!("{}", format_table(&result));
+                                    if expanded {
+                                        print!("{}", format_expanded(&result));
+                                    } else {
+                                        println!("{}", format_table(&result));
+                                    }
                                     println!(
                                         "{}",
                                         style(format!(
