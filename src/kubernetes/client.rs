@@ -1,30 +1,48 @@
 use anyhow::{anyhow, Result};
-use k8s_openapi::api::apps::v1::{DaemonSet, Deployment, StatefulSet};
-use k8s_openapi::api::batch::v1::{CronJob, Job};
-use k8s_openapi::api::core::v1::{
-    ConfigMap, Namespace, Node, PersistentVolume, PersistentVolumeClaim, Pod, Secret, Service,
-};
-use k8s_openapi::api::networking::v1::Ingress;
+use kube::api::DynamicObject;
 use kube::config::{KubeConfigOptions, Kubeconfig};
 use kube::{api::ListParams, Api, Client, Config};
-use serde::de::DeserializeOwned;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 
+use super::discovery::{discover_resources, ResourceInfo, ResourceRegistry};
 use crate::sql::ApiFilters;
 
+/// How long to cache discovered resources before auto-refresh
+const REGISTRY_TTL: Duration = Duration::from_secs(300); // 5 minutes
+
+/// Cached registry with timestamp
+struct CachedRegistry {
+    registry: ResourceRegistry,
+    discovered_at: Instant,
+}
+
+impl CachedRegistry {
+    fn new(registry: ResourceRegistry) -> Self {
+        Self {
+            registry,
+            discovered_at: Instant::now(),
+        }
+    }
+
+    fn is_expired(&self) -> bool {
+        self.discovered_at.elapsed() > REGISTRY_TTL
+    }
+}
+
 /// Connection pool for multiple Kubernetes clusters
-/// Caches clients by context name for efficient cross-cluster queries
+/// Caches clients and resource registries by context name
 pub struct K8sClientPool {
     kubeconfig: Kubeconfig,
     clients: Arc<RwLock<HashMap<String, Client>>>,
+    registries: Arc<RwLock<HashMap<String, CachedRegistry>>>,
     current_context: Arc<RwLock<String>>,
-    default_namespace: Arc<RwLock<String>>,
 }
 
 impl K8sClientPool {
-    pub async fn new(context: Option<&str>, namespace: &str) -> Result<Self> {
+    pub async fn new(context: Option<&str>, _namespace: &str) -> Result<Self> {
         let kubeconfig = Kubeconfig::read()?;
 
         let context_name = context
@@ -40,14 +58,63 @@ impl K8sClientPool {
         let pool = Self {
             kubeconfig,
             clients: Arc::new(RwLock::new(HashMap::new())),
+            registries: Arc::new(RwLock::new(HashMap::new())),
             current_context: Arc::new(RwLock::new(context_name.clone())),
-            default_namespace: Arc::new(RwLock::new(namespace.to_string())),
         };
 
-        // Pre-connect to the default context
+        // Pre-connect to the default context and discover resources
         pool.get_or_create_client(&context_name).await?;
+        pool.discover_resources_for_context(&context_name, false).await?;
 
         Ok(pool)
+    }
+
+    /// Discover all available resources for a context
+    /// If force is true, always rediscover even if cached
+    async fn discover_resources_for_context(&self, context: &str, force: bool) -> Result<()> {
+        // Check if already discovered and not expired
+        if !force {
+            let registries = self.registries.read().await;
+            if let Some(cached) = registries.get(context) {
+                if !cached.is_expired() {
+                    return Ok(());
+                }
+            }
+        }
+
+        let client = self.get_or_create_client(context).await?;
+        let registry = discover_resources(&client).await?;
+
+        {
+            let mut registries = self.registries.write().await;
+            registries.insert(context.to_string(), CachedRegistry::new(registry));
+        }
+
+        Ok(())
+    }
+
+    /// Get the resource registry for the current context
+    /// Automatically refreshes if TTL expired
+    pub async fn get_registry(&self, context: Option<&str>) -> Result<ResourceRegistry> {
+        let ctx = match context {
+            Some(c) => c.to_string(),
+            None => self.current_context.read().await.clone(),
+        };
+
+        // Ensure we have discovered resources for this context (respects TTL)
+        self.discover_resources_for_context(&ctx, false).await?;
+
+        let registries = self.registries.read().await;
+        registries
+            .get(&ctx)
+            .map(|c| c.registry.clone())
+            .ok_or_else(|| anyhow!("No resource registry for context '{}'", ctx))
+    }
+
+    /// Get resource info for a table name
+    pub async fn get_resource_info(&self, table: &str, context: Option<&str>) -> Result<Option<ResourceInfo>> {
+        let registry = self.get_registry(context).await?;
+        Ok(registry.get(table).cloned())
     }
 
     /// Get or create a client for the given context
@@ -117,16 +184,17 @@ impl K8sClientPool {
         // Ensure we have a client for this context
         self.get_or_create_client(context).await?;
 
+        // Force rediscovery of resources (makes USE a way to refresh)
+        self.discover_resources_for_context(context, true).await?;
+
         // Switch current context
         *self.current_context.write().await = context.to_string();
 
         Ok(())
     }
 
-    pub async fn default_namespace(&self) -> String {
-        self.default_namespace.read().await.clone()
-    }
-
+    /// Fetch resources using dynamic discovery
+    /// Works for all resource types: core, extensions, and CRDs
     pub async fn fetch_resources(
         &self,
         table: &str,
@@ -134,45 +202,38 @@ impl K8sClientPool {
         context: Option<&str>,
         api_filters: &ApiFilters,
     ) -> Result<Vec<serde_json::Value>> {
-        let client = self.get_client(context).await?;
+        // Look up resource info from discovery
+        let resource_info = self
+            .get_resource_info(table, context)
+            .await?
+            .ok_or_else(|| anyhow!("Unknown table: '{}'. Run SHOW TABLES to see available resources.", table))?;
 
-        // Build ListParams with any pushed-down filters
+        let client = self.get_client(context).await?;
+        let ar = &resource_info.api_resource;
         let list_params = self.build_list_params(api_filters);
 
-        match table.to_lowercase().as_str() {
-            // Namespaced resources - query specific namespace or all if None
-            "pods" | "pod" => self.list_maybe_namespaced::<Pod>(&client, namespace, &list_params).await,
-            "services" | "service" | "svc" => self.list_maybe_namespaced::<Service>(&client, namespace, &list_params).await,
-            "deployments" | "deployment" | "deploy" => {
-                self.list_maybe_namespaced::<Deployment>(&client, namespace, &list_params).await
+        // Create API handle based on resource scope
+        let api: Api<DynamicObject> = if resource_info.is_namespaced() {
+            match namespace {
+                Some(ns) => Api::namespaced_with(client, ns, ar),
+                None => Api::all_with(client, ar),
             }
-            "configmaps" | "configmap" | "cm" => {
-                self.list_maybe_namespaced::<ConfigMap>(&client, namespace, &list_params).await
-            }
-            "secrets" | "secret" => self.list_maybe_namespaced::<Secret>(&client, namespace, &list_params).await,
-            "ingresses" | "ingress" | "ing" => self.list_maybe_namespaced::<Ingress>(&client, namespace, &list_params).await,
-            "jobs" | "job" => self.list_maybe_namespaced::<Job>(&client, namespace, &list_params).await,
-            "cronjobs" | "cronjob" | "cj" => self.list_maybe_namespaced::<CronJob>(&client, namespace, &list_params).await,
-            "statefulsets" | "statefulset" | "sts" => {
-                self.list_maybe_namespaced::<StatefulSet>(&client, namespace, &list_params).await
-            }
-            "daemonsets" | "daemonset" | "ds" => {
-                self.list_maybe_namespaced::<DaemonSet>(&client, namespace, &list_params).await
-            }
-            "persistentvolumeclaims" | "persistentvolumeclaim" | "pvc" | "pvcs" => {
-                self.list_maybe_namespaced::<PersistentVolumeClaim>(&client, namespace, &list_params).await
-            }
-            // Cluster-scoped resources
-            "nodes" | "node" => self.list_cluster::<Node>(&client, &list_params).await,
-            "namespaces" | "namespace" | "ns" => self.list_cluster::<Namespace>(&client, &list_params).await,
-            "persistentvolumes" | "persistentvolume" | "pv" | "pvs" => {
-                self.list_cluster::<PersistentVolume>(&client, &list_params).await
-            }
-            _ => Err(anyhow!("Unknown table: {}", table)),
-        }
+        } else {
+            Api::all_with(client, ar)
+        };
+
+        // Fetch and convert to JSON values
+        let list = api.list(&list_params).await?;
+        let values: Vec<serde_json::Value> = list
+            .items
+            .into_iter()
+            .map(|item| serde_json::to_value(item).unwrap_or(serde_json::Value::Null))
+            .collect();
+
+        Ok(values)
     }
 
-    /// Build ListParams from API filters
+    /// Build ListParams from API filters (label selectors, field selectors)
     fn build_list_params(&self, filters: &ApiFilters) -> ListParams {
         let mut params = ListParams::default();
 
@@ -185,59 +246,5 @@ impl K8sClientPool {
         }
 
         params
-    }
-
-    /// List namespaced resources - if namespace is Some, query that namespace only;
-    /// if None, query all namespaces
-    async fn list_maybe_namespaced<T>(
-        &self,
-        client: &Client,
-        namespace: Option<&str>,
-        list_params: &ListParams,
-    ) -> Result<Vec<serde_json::Value>>
-    where
-        T: kube::Resource<Scope = k8s_openapi::NamespaceResourceScope>
-            + Clone
-            + DeserializeOwned
-            + std::fmt::Debug
-            + serde::Serialize,
-        <T as kube::Resource>::DynamicType: Default,
-    {
-        let api: Api<T> = match namespace {
-            Some(ns) => Api::namespaced(client.clone(), ns),
-            None => Api::all(client.clone()),
-        };
-        let list = api.list(list_params).await?;
-        let values: Vec<serde_json::Value> = list
-            .items
-            .into_iter()
-            .map(|item| serde_json::to_value(item).unwrap_or(serde_json::Value::Null))
-            .collect();
-
-        Ok(values)
-    }
-
-    async fn list_cluster<T>(
-        &self,
-        client: &Client,
-        list_params: &ListParams,
-    ) -> Result<Vec<serde_json::Value>>
-    where
-        T: kube::Resource<Scope = k8s_openapi::ClusterResourceScope>
-            + Clone
-            + DeserializeOwned
-            + std::fmt::Debug
-            + serde::Serialize,
-        <T as kube::Resource>::DynamicType: Default,
-    {
-        let api: Api<T> = Api::all(client.clone());
-        let list = api.list(list_params).await?;
-        let values: Vec<serde_json::Value> = list
-            .items
-            .into_iter()
-            .map(|item| serde_json::to_value(item).unwrap_or(serde_json::Value::Null))
-            .collect();
-
-        Ok(values)
     }
 }

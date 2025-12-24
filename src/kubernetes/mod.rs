@@ -1,4 +1,5 @@
 mod client;
-pub mod resources;
+pub mod discovery;
 
 pub use client::K8sClientPool;
+pub use discovery::ColumnDef;

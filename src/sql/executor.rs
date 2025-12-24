@@ -98,8 +98,16 @@ impl QueryExecutor {
             ordered
         };
 
+        // Get schema columns for projection
+        let resource_info = self
+            .pool
+            .get_resource_info(&plan.table, None)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("Unknown table: '{}'", plan.table))?;
+        let schema_columns = crate::kubernetes::discovery::generate_schema(&resource_info);
+
         // Project columns (including _cluster)
-        let (columns, rows) = self.project_columns_with_cluster(&query.columns, &plan.table, limited)?;
+        let (columns, rows) = self.project_columns_with_cluster(&query.columns, &schema_columns, limited)?;
 
         Ok(QueryResult { columns, rows })
     }
@@ -286,15 +294,13 @@ impl QueryExecutor {
     fn project_columns_with_cluster(
         &self,
         columns: &[ColumnRef],
-        table: &str,
+        schema_columns: &[crate::kubernetes::ColumnDef],
         resources: Vec<(String, serde_json::Value)>,
     ) -> Result<(Vec<String>, Vec<Vec<String>>)> {
-        let schema = crate::kubernetes::resources::get_table_schema(table);
-
         // Determine which columns to show
         let display_columns: Vec<(String, String)> = if columns.iter().any(|c| matches!(c, ColumnRef::Star)) {
             // SELECT * includes all columns from schema (which now includes _cluster)
-            schema.columns.into_iter().map(|c| (c.name.clone(), c.name)).collect()
+            schema_columns.iter().map(|c| (c.name.clone(), c.name.clone())).collect()
         } else {
             columns
                 .iter()
@@ -430,10 +436,32 @@ impl QueryExecutor {
     async fn execute_show(&self, show: ShowQuery) -> Result<QueryResult> {
         match show {
             ShowQuery::Tables => {
-                let tables = crate::kubernetes::resources::list_tables();
+                // Use discovered resources from the current context
+                let registry = self.pool.get_registry(None).await?;
+                let tables = registry.list_tables();
+
                 Ok(QueryResult {
-                    columns: vec!["table_name".to_string(), "resource".to_string()],
-                    rows: tables.into_iter().map(|(name, resource)| vec![name, resource]).collect(),
+                    columns: vec![
+                        "table_name".to_string(),
+                        "kind".to_string(),
+                        "api_version".to_string(),
+                        "scope".to_string(),
+                    ],
+                    rows: tables
+                        .into_iter()
+                        .map(|info| {
+                            vec![
+                                info.table_name.clone(),
+                                info.api_resource.kind.clone(),
+                                info.api_version(),
+                                if info.is_namespaced() {
+                                    "Namespace".to_string()
+                                } else {
+                                    "Cluster".to_string()
+                                },
+                            ]
+                        })
+                        .collect(),
                 })
             }
             ShowQuery::Databases => {
@@ -462,15 +490,37 @@ impl QueryExecutor {
     }
 
     async fn execute_describe(&self, desc: DescribeQuery) -> Result<QueryResult> {
-        // Note: DESCRIBE currently ignores cluster context since schemas are the same
-        // across clusters. In the future, we could verify the cluster is reachable.
-        let schema = crate::kubernetes::resources::get_table_schema(&desc.table_ref.table);
+        // Get resource info from discovery
+        let resource_info = self
+            .pool
+            .get_resource_info(&desc.table_ref.table, None)
+            .await?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Unknown table: '{}'. Run SHOW TABLES to see available resources.",
+                    desc.table_ref.table
+                )
+            })?;
+
+        let columns = crate::kubernetes::discovery::generate_schema(&resource_info);
+
         Ok(QueryResult {
-            columns: vec!["column".to_string(), "type".to_string(), "description".to_string()],
-            rows: schema
-                .columns
+            columns: vec![
+                "column".to_string(),
+                "type".to_string(),
+                "json_path".to_string(),
+                "description".to_string(),
+            ],
+            rows: columns
                 .into_iter()
-                .map(|c| vec![c.name, c.data_type, c.description])
+                .map(|c| {
+                    vec![
+                        c.name,
+                        c.data_type,
+                        c.json_path.unwrap_or_else(|| "-".to_string()),
+                        c.description,
+                    ]
+                })
                 .collect(),
         })
     }
