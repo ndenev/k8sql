@@ -9,6 +9,7 @@ use datafusion::arrow::array::RecordBatch;
 use datafusion::arrow::util::pretty::pretty_format_batches;
 use datafusion::error::Result as DFResult;
 use datafusion::execution::context::SessionContext;
+use datafusion::prelude::SessionConfig;
 
 use crate::kubernetes::K8sClientPool;
 use crate::output::QueryResult;
@@ -24,7 +25,9 @@ pub struct K8sSessionContext {
 impl K8sSessionContext {
     /// Create a new K8sSessionContext with all discovered K8s resources registered as tables
     pub async fn new(pool: Arc<K8sClientPool>) -> anyhow::Result<Self> {
-        let ctx = SessionContext::new();
+        // Enable information_schema for SHOW TABLES support
+        let config = SessionConfig::new().with_information_schema(true);
+        let ctx = SessionContext::new_with_config(config);
 
         // Get the resource registry and register each resource as a table
         let registry = pool.get_registry(None).await?;
@@ -94,7 +97,8 @@ impl K8sSessionContext {
     /// Refresh the registered tables (call after context switch)
     pub async fn refresh_tables(&mut self) -> anyhow::Result<()> {
         // Create a new context and re-register all tables
-        let new_ctx = SessionContext::new();
+        let config = SessionConfig::new().with_information_schema(true);
+        let new_ctx = SessionContext::new_with_config(config);
         let registry = self.pool.get_registry(None).await?;
 
         for info in registry.list_tables() {
