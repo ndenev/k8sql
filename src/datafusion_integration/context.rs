@@ -25,8 +25,13 @@ pub struct K8sSessionContext {
 impl K8sSessionContext {
     /// Create a new K8sSessionContext with all discovered K8s resources registered as tables
     pub async fn new(pool: Arc<K8sClientPool>) -> anyhow::Result<Self> {
-        // Enable information_schema for SHOW TABLES support
-        let config = SessionConfig::new().with_information_schema(true);
+        // Get the current Kubernetes context name for the catalog
+        let cluster_name = pool.current_context().await.unwrap_or_else(|_| "k8s".to_string());
+
+        // Enable information_schema and use cluster name as catalog
+        let config = SessionConfig::new()
+            .with_information_schema(true)
+            .with_default_catalog_and_schema(&cluster_name, "default");
         let ctx = SessionContext::new_with_config(config);
 
         // Get the resource registry and register each resource as a table
@@ -96,8 +101,17 @@ impl K8sSessionContext {
 
     /// Refresh the registered tables (call after context switch)
     pub async fn refresh_tables(&mut self) -> anyhow::Result<()> {
+        // Get the current Kubernetes context name for the catalog
+        let cluster_name = self
+            .pool
+            .current_context()
+            .await
+            .unwrap_or_else(|_| "k8s".to_string());
+
         // Create a new context and re-register all tables
-        let config = SessionConfig::new().with_information_schema(true);
+        let config = SessionConfig::new()
+            .with_information_schema(true)
+            .with_default_catalog_and_schema(&cluster_name, "default");
         let new_ctx = SessionContext::new_with_config(config);
         let registry = self.pool.get_registry(None).await?;
 
