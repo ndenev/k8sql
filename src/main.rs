@@ -80,6 +80,28 @@ async fn run_batch(args: &Args) -> Result<()> {
     };
 
     for query_str in queries {
+        // Handle SHOW DATABASES specially
+        let normalized = query_str.trim().to_uppercase();
+        let normalized = normalized.trim_end_matches(';');
+        if normalized == "SHOW DATABASES" {
+            let contexts = pool.list_contexts().unwrap_or_default();
+            let current = pool.current_context().await.unwrap_or_default();
+            let result = output::QueryResult {
+                columns: vec!["database".to_string(), "current".to_string()],
+                rows: contexts
+                    .iter()
+                    .map(|ctx| {
+                        vec![
+                            ctx.clone(),
+                            if *ctx == current { "*".to_string() } else { String::new() },
+                        ]
+                    })
+                    .collect(),
+            };
+            println!("{}", result.format(&args.output, args.no_headers));
+            continue;
+        }
+
         match session.execute_sql_to_strings(&query_str).await {
             Ok(result) => {
                 println!("{}", result.format(&args.output, args.no_headers));

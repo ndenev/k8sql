@@ -9,5 +9,7 @@
 mod provider;
 mod convert;
 mod context;
+mod hooks;
 
 pub use context::K8sSessionContext;
+pub use hooks::ShowDatabasesHook;

@@ -4,9 +4,9 @@
 use std::sync::Arc;
 
 use datafusion_postgres::auth::AuthManager;
-use datafusion_postgres::{serve, ServerOptions};
+use datafusion_postgres::{serve_with_hooks, QueryHook, ServerOptions};
 
-use crate::datafusion_integration::K8sSessionContext;
+use crate::datafusion_integration::{K8sSessionContext, ShowDatabasesHook};
 use crate::kubernetes::K8sClientPool;
 
 /// PostgreSQL wire protocol server for k8sql
@@ -31,6 +31,11 @@ impl PgWireServer {
         // Create default auth manager (accepts "postgres" user with empty password)
         let auth_manager = Arc::new(AuthManager::new());
 
+        // Create custom hooks for k8sql-specific commands
+        let hooks: Vec<Arc<dyn QueryHook>> = vec![
+            Arc::new(ShowDatabasesHook::new(Arc::clone(&pool))),
+        ];
+
         let server_options = ServerOptions::new()
             .with_host(self.bind_address.clone())
             .with_port(self.port);
@@ -46,8 +51,8 @@ impl PgWireServer {
             self.bind_address, self.port
         );
 
-        // Use datafusion-postgres to serve queries
-        serve(ctx, &server_options, auth_manager)
+        // Use datafusion-postgres to serve queries with our custom hooks
+        serve_with_hooks(ctx, &server_options, auth_manager, hooks)
             .await
             .map_err(|e| anyhow::anyhow!("{}", e))
     }

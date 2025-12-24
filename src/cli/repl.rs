@@ -639,6 +639,35 @@ pub async fn run_repl(mut session: K8sSessionContext, pool: Arc<K8sClientPool>) 
                     continue;
                 }
 
+                // Handle SHOW DATABASES specially (list Kubernetes contexts)
+                if lower.trim().trim_end_matches(';') == "show databases" {
+                    let contexts = pool.list_contexts().unwrap_or_default();
+                    let current = pool.current_context().await.unwrap_or_default();
+                    let result = QueryResult {
+                        columns: vec!["database".to_string(), "current".to_string()],
+                        rows: contexts
+                            .iter()
+                            .map(|ctx| {
+                                vec![
+                                    ctx.clone(),
+                                    if ctx == &current { "*".to_string() } else { String::new() },
+                                ]
+                            })
+                            .collect(),
+                    };
+                    if expanded {
+                        print!("{}", format_expanded(&result));
+                    } else {
+                        println!("{}", format_table(&result));
+                    }
+                    println!(
+                        "{}",
+                        style(format!("{} row{}", result.rows.len(), if result.rows.len() == 1 { "" } else { "s" })).dim()
+                    );
+                    println!();
+                    continue;
+                }
+
                 // Execute query with spinner using DataFusion
                 let spinner = create_spinner("Executing query...");
                 let start = Instant::now();
