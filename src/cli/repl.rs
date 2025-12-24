@@ -67,10 +67,13 @@ pub struct CompletionCache {
 impl CompletionCache {
     /// Populate cache from DataFusion session and K8sClientPool
     pub async fn populate(session: &K8sSessionContext, pool: &K8sClientPool) -> Result<Self> {
-        let mut cache = CompletionCache::default();
-
         // Get contexts from kubeconfig
-        cache.contexts = pool.list_contexts()?;
+        let contexts = pool.list_contexts()?;
+
+        let mut cache = CompletionCache {
+            contexts,
+            ..Default::default()
+        };
 
         // Get tables from DataFusion's information_schema
         if let Ok(result) = session
