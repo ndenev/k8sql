@@ -11,12 +11,12 @@ use datafusion::common::{ParamValues, ToDFSchema};
 use datafusion::logical_expr::LogicalPlan;
 use datafusion::prelude::SessionContext;
 use datafusion::sql::sqlparser::ast::Statement;
+use datafusion_postgres::QueryHook;
 use datafusion_postgres::pgwire::api::results::{
     DataRowEncoder, FieldFormat, FieldInfo, QueryResponse, Response,
 };
 use datafusion_postgres::pgwire::api::{ClientInfo, Type};
 use datafusion_postgres::pgwire::error::{PgWireError, PgWireResult};
-use datafusion_postgres::QueryHook;
 
 use crate::kubernetes::K8sClientPool;
 
@@ -35,8 +35,20 @@ impl ShowDatabasesHook {
         let current = futures::executor::block_on(self.pool.current_context()).unwrap_or_default();
 
         let fields = vec![
-            FieldInfo::new("database".to_string(), None, None, Type::VARCHAR, FieldFormat::Text),
-            FieldInfo::new("current".to_string(), None, None, Type::VARCHAR, FieldFormat::Text),
+            FieldInfo::new(
+                "database".to_string(),
+                None,
+                None,
+                Type::VARCHAR,
+                FieldFormat::Text,
+            ),
+            FieldInfo::new(
+                "current".to_string(),
+                None,
+                None,
+                Type::VARCHAR,
+                FieldFormat::Text,
+            ),
         ];
         let fields = Arc::new(fields);
 

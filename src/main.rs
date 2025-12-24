@@ -93,7 +93,11 @@ async fn run_batch(args: &Args) -> Result<()> {
                     .map(|ctx| {
                         vec![
                             ctx.clone(),
-                            if *ctx == current { "*".to_string() } else { String::new() },
+                            if *ctx == current {
+                                "*".to_string()
+                            } else {
+                                String::new()
+                            },
                         ]
                     })
                     .collect(),

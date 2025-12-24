@@ -2,8 +2,8 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
 use anyhow::Result;
-use comfy_table::{presets::UTF8_FULL_CONDENSED, Cell, Color, ContentArrangement, Table};
-use console::{style, Style};
+use comfy_table::{Cell, Color, ContentArrangement, Table, presets::UTF8_FULL_CONDENSED};
+use console::{Style, style};
 use indicatif::{ProgressBar, ProgressStyle};
 use rustyline::completion::{Completer, Pair};
 use rustyline::error::ReadlineError;
@@ -23,9 +23,27 @@ use crate::output::QueryResult;
 
 // SQL keywords for completion
 const KEYWORDS: &[&str] = &[
-    "SELECT", "FROM", "WHERE", "ORDER", "BY", "LIMIT", "AND", "OR",
-    "SHOW", "TABLES", "DATABASES", "DESCRIBE", "USE", "ASC", "DESC",
-    "IN", "LIKE", "NOT", "NULL", "TRUE", "FALSE",
+    "SELECT",
+    "FROM",
+    "WHERE",
+    "ORDER",
+    "BY",
+    "LIMIT",
+    "AND",
+    "OR",
+    "SHOW",
+    "TABLES",
+    "DATABASES",
+    "DESCRIBE",
+    "USE",
+    "ASC",
+    "DESC",
+    "IN",
+    "LIKE",
+    "NOT",
+    "NULL",
+    "TRUE",
+    "FALSE",
 ];
 
 // Common operators for WHERE clauses
@@ -221,7 +239,10 @@ impl SqlHelper {
         }
 
         // Check if we're in WHERE clause and just typed a column name
-        if line_upper.contains("WHERE") || line_upper.contains(" AND ") || line_upper.contains(" OR ") {
+        if line_upper.contains("WHERE")
+            || line_upper.contains(" AND ")
+            || line_upper.contains(" OR ")
+        {
             // If the last token looks like a column name (no operator after it)
             let trimmed = line.trim();
             if !trimmed.is_empty() {
@@ -462,7 +483,11 @@ impl Highlighter for SqlHelper {
         Cow::Owned(result)
     }
 
-    fn highlight_prompt<'b, 's: 'b, 'p: 'b>(&'s self, prompt: &'p str, _default: bool) -> Cow<'b, str> {
+    fn highlight_prompt<'b, 's: 'b, 'p: 'b>(
+        &'s self,
+        prompt: &'p str,
+        _default: bool,
+    ) -> Cow<'b, str> {
         Cow::Owned(format!("\x1b[1;32m{}\x1b[0m", prompt))
     }
 
@@ -529,16 +554,40 @@ fn print_help() {
     let cmd_style = Style::new().yellow();
 
     println!("{}", help_style.apply_to("Commands:"));
-    println!("  {}  - List available tables (Kubernetes resources)", cmd_style.apply_to("SHOW TABLES"));
-    println!("  {}  - List available clusters (kubectl contexts)", cmd_style.apply_to("SHOW DATABASES"));
-    println!("  {}  - Show table schema", cmd_style.apply_to("DESCRIBE <table>"));
-    println!("  {}  - Switch to a different cluster", cmd_style.apply_to("USE <cluster>"));
+    println!(
+        "  {}  - List available tables (Kubernetes resources)",
+        cmd_style.apply_to("SHOW TABLES")
+    );
+    println!(
+        "  {}  - List available clusters (kubectl contexts)",
+        cmd_style.apply_to("SHOW DATABASES")
+    );
+    println!(
+        "  {}  - Show table schema",
+        cmd_style.apply_to("DESCRIBE <table>")
+    );
+    println!(
+        "  {}  - Switch to a different cluster",
+        cmd_style.apply_to("USE <cluster>")
+    );
     println!();
     println!("{}", help_style.apply_to("Examples:"));
-    println!("  {} - All pods in current namespace", cmd_style.apply_to("SELECT * FROM pods"));
-    println!("  {} - Filter by namespace", cmd_style.apply_to("SELECT name, status FROM pods WHERE namespace = 'kube-system'"));
-    println!("  {} - Query specific cluster", cmd_style.apply_to("SELECT * FROM pods WHERE _cluster = 'prod'"));
-    println!("  {} - Query all clusters", cmd_style.apply_to("SELECT * FROM pods WHERE _cluster = '*'"));
+    println!(
+        "  {} - All pods in current namespace",
+        cmd_style.apply_to("SELECT * FROM pods")
+    );
+    println!(
+        "  {} - Filter by namespace",
+        cmd_style.apply_to("SELECT name, status FROM pods WHERE namespace = 'kube-system'")
+    );
+    println!(
+        "  {} - Query specific cluster",
+        cmd_style.apply_to("SELECT * FROM pods WHERE _cluster = 'prod'")
+    );
+    println!(
+        "  {} - Query all clusters",
+        cmd_style.apply_to("SELECT * FROM pods WHERE _cluster = '*'")
+    );
     println!();
     println!("{}", help_style.apply_to("Shortcuts:"));
     println!("  {} - SHOW TABLES", cmd_style.apply_to("\\dt"));
@@ -669,7 +718,11 @@ pub async fn run_repl(mut session: K8sSessionContext, pool: Arc<K8sClientPool>) 
                             .map(|ctx| {
                                 vec![
                                     ctx.clone(),
-                                    if ctx == &current { "*".to_string() } else { String::new() },
+                                    if ctx == &current {
+                                        "*".to_string()
+                                    } else {
+                                        String::new()
+                                    },
                                 ]
                             })
                             .collect(),
@@ -681,7 +734,12 @@ pub async fn run_repl(mut session: K8sSessionContext, pool: Arc<K8sClientPool>) 
                     }
                     println!(
                         "{}",
-                        style(format!("{} row{}", result.rows.len(), if result.rows.len() == 1 { "" } else { "s" })).dim()
+                        style(format!(
+                            "{} row{}",
+                            result.rows.len(),
+                            if result.rows.len() == 1 { "" } else { "s" }
+                        ))
+                        .dim()
                     );
                     println!();
                     continue;

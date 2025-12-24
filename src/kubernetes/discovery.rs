@@ -7,8 +7,8 @@
 //! the Kubernetes discovery API.
 
 use anyhow::Result;
-use kube::discovery::{ApiCapabilities, ApiResource, Discovery, Scope};
 use kube::Client;
+use kube::discovery::{ApiCapabilities, ApiResource, Discovery, Scope};
 use std::collections::HashMap;
 
 /// Column definition for schema
@@ -124,10 +124,12 @@ impl ResourceRegistry {
 
         // Add aliases
         for alias in &info.aliases {
-            self.alias_map.insert(alias.clone(), info.table_name.clone());
+            self.alias_map
+                .insert(alias.clone(), info.table_name.clone());
         }
         // Add the table name itself as an alias
-        self.alias_map.insert(info.table_name.clone(), info.table_name.clone());
+        self.alias_map
+            .insert(info.table_name.clone(), info.table_name.clone());
         // Store the resource info
         self.by_table_name.insert(info.table_name.clone(), info);
     }
@@ -161,7 +163,10 @@ const CORE_RESOURCES: &[(&str, &[&str])] = &[
     ("cronjobs", &["cronjob", "cj"]),
     ("statefulsets", &["statefulset", "sts"]),
     ("daemonsets", &["daemonset", "ds"]),
-    ("persistentvolumeclaims", &["persistentvolumeclaim", "pvc", "pvcs"]),
+    (
+        "persistentvolumeclaims",
+        &["persistentvolumeclaim", "pvc", "pvcs"],
+    ),
     ("persistentvolumes", &["persistentvolume", "pv", "pvs"]),
     ("replicasets", &["replicaset", "rs"]),
     ("events", &["event", "ev"]),
@@ -169,7 +174,10 @@ const CORE_RESOURCES: &[(&str, &[&str])] = &[
     ("endpoints", &["endpoint", "ep"]),
     ("resourcequotas", &["resourcequota", "quota"]),
     ("limitranges", &["limitrange", "limits"]),
-    ("horizontalpodautoscalers", &["horizontalpodautoscaler", "hpa"]),
+    (
+        "horizontalpodautoscalers",
+        &["horizontalpodautoscaler", "hpa"],
+    ),
     ("poddisruptionbudgets", &["poddisruptionbudget", "pdb"]),
     ("networkpolicies", &["networkpolicy", "netpol"]),
     ("storageclasses", &["storageclass", "sc"]),
@@ -204,8 +212,14 @@ pub async fn discover_resources(client: &Client) -> Result<ResourceRegistry> {
             // A resource is only "core" if its name matches AND it's from a standard K8s API group
             let is_standard_group = matches!(
                 ar.group.as_str(),
-                "" | "apps" | "batch" | "networking.k8s.io" | "policy" | "rbac.authorization.k8s.io"
-                | "storage.k8s.io" | "autoscaling" | "coordination.k8s.io"
+                "" | "apps"
+                    | "batch"
+                    | "networking.k8s.io"
+                    | "policy"
+                    | "rbac.authorization.k8s.io"
+                    | "storage.k8s.io"
+                    | "autoscaling"
+                    | "coordination.k8s.io"
             );
             let (is_core, aliases) = if is_standard_group {
                 if let Some(known_aliases) = core_names.get(table_name.as_str()) {

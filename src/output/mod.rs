@@ -1,11 +1,11 @@
-mod table;
-mod json;
 mod csv;
+mod json;
+mod table;
 mod yaml;
 
-pub use table::TableFormatter;
-pub use json::JsonFormatter;
 pub use csv::CsvFormatter;
+pub use json::JsonFormatter;
+pub use table::TableFormatter;
 pub use yaml::YamlFormatter;
 
 use crate::cli::OutputFormat;

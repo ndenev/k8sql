@@ -27,7 +27,10 @@ impl K8sSessionContext {
     /// Create a new K8sSessionContext with all discovered K8s resources registered as tables
     pub async fn new(pool: Arc<K8sClientPool>) -> anyhow::Result<Self> {
         // Get the current Kubernetes context name for the catalog
-        let cluster_name = pool.current_context().await.unwrap_or_else(|_| "k8s".to_string());
+        let cluster_name = pool
+            .current_context()
+            .await
+            .unwrap_or_else(|_| "k8s".to_string());
 
         // Enable information_schema and use cluster name as catalog
         let config = SessionConfig::new()

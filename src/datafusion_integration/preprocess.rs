@@ -57,20 +57,14 @@ mod tests {
     fn test_label_equality() {
         let sql = "SELECT * FROM pods WHERE labels.app = 'nginx'";
         let result = preprocess_sql(sql);
-        assert_eq!(
-            result,
-            "SELECT * FROM pods WHERE labels['app'] = 'nginx'"
-        );
+        assert_eq!(result, "SELECT * FROM pods WHERE labels['app'] = 'nginx'");
     }
 
     #[test]
     fn test_label_inequality() {
         let sql = "SELECT * FROM pods WHERE labels.env != 'prod'";
         let result = preprocess_sql(sql);
-        assert_eq!(
-            result,
-            "SELECT * FROM pods WHERE labels['env'] != 'prod'"
-        );
+        assert_eq!(result, "SELECT * FROM pods WHERE labels['env'] != 'prod'");
     }
 
     #[test]

@@ -1,14 +1,14 @@
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use kube::api::DynamicObject;
 use kube::config::{KubeConfigOptions, Kubeconfig};
-use kube::{api::ListParams, Api, Client, Config};
+use kube::{Api, Client, Config, api::ListParams};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 use tracing::{debug, warn};
 
-use super::discovery::{discover_resources, ResourceInfo, ResourceRegistry};
+use super::discovery::{ResourceInfo, ResourceRegistry, discover_resources};
 use crate::sql::ApiFilters;
 
 /// How long to cache discovered resources before auto-refresh
@@ -65,7 +65,10 @@ impl K8sClientPool {
 
         // Verify context exists
         if !kubeconfig.contexts.iter().any(|c| c.name == context_name) {
-            return Err(anyhow!("Context '{}' not found in kubeconfig", context_name));
+            return Err(anyhow!(
+                "Context '{}' not found in kubeconfig",
+                context_name
+            ));
         }
 
         let pool = Self {
@@ -77,7 +80,8 @@ impl K8sClientPool {
 
         // Pre-connect to the default context and discover resources
         pool.get_or_create_client(&context_name).await?;
-        pool.discover_resources_for_context(&context_name, false).await?;
+        pool.discover_resources_for_context(&context_name, false)
+            .await?;
 
         Ok(pool)
     }
@@ -125,7 +129,11 @@ impl K8sClientPool {
     }
 
     /// Get resource info for a table name
-    pub async fn get_resource_info(&self, table: &str, context: Option<&str>) -> Result<Option<ResourceInfo>> {
+    pub async fn get_resource_info(
+        &self,
+        table: &str,
+        context: Option<&str>,
+    ) -> Result<Option<ResourceInfo>> {
         let registry = self.get_registry(context).await?;
         Ok(registry.get(table).cloned())
     }
@@ -224,7 +232,12 @@ impl K8sClientPool {
         let resource_info = self
             .get_resource_info(table, context)
             .await?
-            .ok_or_else(|| anyhow!("Unknown table: '{}'. Run SHOW TABLES to see available resources.", table))?;
+            .ok_or_else(|| {
+                anyhow!(
+                    "Unknown table: '{}'. Run SHOW TABLES to see available resources.",
+                    table
+                )
+            })?;
 
         let client = self.get_client(context).await?;
         let ar = &resource_info.api_resource;
@@ -241,7 +254,9 @@ impl K8sClientPool {
         };
 
         // Fetch with retry logic for transient failures
-        let list = self.list_with_retry(&api, &list_params, table, context).await?;
+        let list = self
+            .list_with_retry(&api, &list_params, table, context)
+            .await?;
 
         // Build apiVersion string (e.g., "v1", "apps/v1", "cert-manager.io/v1")
         let api_version = if resource_info.group.is_empty() {
@@ -258,7 +273,10 @@ impl K8sClientPool {
                 let mut value = serde_json::to_value(item).unwrap_or(serde_json::Value::Null);
                 // Inject apiVersion and kind (K8s list API doesn't include these per-item)
                 if let serde_json::Value::Object(ref mut map) = value {
-                    map.insert("apiVersion".to_string(), serde_json::Value::String(api_version.clone()));
+                    map.insert(
+                        "apiVersion".to_string(),
+                        serde_json::Value::String(api_version.clone()),
+                    );
                     map.insert("kind".to_string(), serde_json::Value::String(kind.clone()));
                 }
                 value

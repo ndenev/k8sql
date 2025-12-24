@@ -7,8 +7,8 @@ use std::any::Any;
 use std::sync::Arc;
 use std::time::Instant;
 
-use datafusion::arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
+use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::catalog::Session;
 use datafusion::datasource::memory::MemorySourceConfig;
 use datafusion::datasource::{TableProvider, TableType};
@@ -24,8 +24,8 @@ use tracing::{debug, info};
 /// Prevents overwhelming the network or hitting rate limits
 const MAX_CONCURRENT_CLUSTERS: usize = 5;
 
-use crate::kubernetes::discovery::{generate_schema, ResourceInfo};
 use crate::kubernetes::K8sClientPool;
+use crate::kubernetes::discovery::{ResourceInfo, generate_schema};
 use crate::sql::ApiFilters;
 
 use super::convert::{json_to_record_batch, to_arrow_schema};
@@ -340,7 +340,12 @@ impl TableProvider for K8sTableProvider {
                 async move {
                     let start = Instant::now();
                     let resources = pool
-                        .fetch_resources(&table_name, namespace.as_deref(), Some(&cluster), &api_filters)
+                        .fetch_resources(
+                            &table_name,
+                            namespace.as_deref(),
+                            Some(&cluster),
+                            &api_filters,
+                        )
                         .await
                         .unwrap_or_default();
                     let elapsed = start.elapsed();
@@ -364,20 +369,28 @@ impl TableProvider for K8sTableProvider {
         // This allows DataFusion to process clusters in parallel
         let mut partitions: Vec<Vec<datafusion::arrow::array::RecordBatch>> = Vec::new();
         let mut total_rows = 0usize;
+        let mut batch_schema: Option<SchemaRef> = None;
 
         for (cluster, resources) in results {
             let row_count = resources.len();
             total_rows += row_count;
             if !resources.is_empty() {
                 let batch = json_to_record_batch(&cluster, &resource_info, resources)?;
+                // Capture the schema from the first non-empty batch
+                if batch_schema.is_none() {
+                    batch_schema = Some(batch.schema());
+                }
                 // Each cluster's data is its own partition
                 partitions.push(vec![batch]);
             }
         }
 
-        // If no data, create a single empty partition with correct schema
+        // Use the inferred schema from batches, or fall back to provider schema for empty results
+        let exec_schema = batch_schema.unwrap_or_else(|| self.schema.clone());
+
+        // If no data, create a single empty partition with the schema
         if partitions.is_empty() {
-            let empty_batch = datafusion::arrow::array::RecordBatch::new_empty(self.schema.clone());
+            let empty_batch = datafusion::arrow::array::RecordBatch::new_empty(exec_schema.clone());
             partitions.push(vec![empty_batch]);
         }
 
@@ -392,11 +405,8 @@ impl TableProvider for K8sTableProvider {
 
         // Create MemorySourceConfig execution plan with multiple partitions
         // DataFusion's executor will process partitions in parallel
-        let plan = MemorySourceConfig::try_new_exec(
-            &partitions,
-            self.schema.clone(),
-            projection.cloned(),
-        )?;
+        // Use the batch schema which may have native struct types for spec/status
+        let plan = MemorySourceConfig::try_new_exec(&partitions, exec_schema, projection.cloned())?;
 
         Ok(plan)
     }

@@ -6,11 +6,11 @@
 //! This module provides a DataFusion TableProvider implementation for Kubernetes resources,
 //! allowing full SQL support including JOINs, aggregations, and subqueries.
 
-mod provider;
-mod convert;
 mod context;
+mod convert;
 mod hooks;
 mod preprocess;
+mod provider;
 
 pub use context::K8sSessionContext;
 pub use hooks::ShowDatabasesHook;
