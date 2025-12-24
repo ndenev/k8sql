@@ -17,9 +17,9 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
+use crate::datafusion_integration::K8sSessionContext;
 use crate::kubernetes::{discovery, K8sClientPool};
 use crate::output::QueryResult;
-use crate::sql::{QueryExecutor, SqlParser};
 
 // SQL keywords for completion
 const KEYWORDS: &[&str] = &[
@@ -535,9 +535,7 @@ fn format_expanded(result: &QueryResult) -> String {
     output
 }
 
-pub async fn run_repl(executor: QueryExecutor, pool: Arc<K8sClientPool>) -> Result<()> {
-    let parser = SqlParser::new();
-
+pub async fn run_repl(mut session: K8sSessionContext, pool: Arc<K8sClientPool>) -> Result<()> {
     // Populate completion cache from cluster
     let cache = CompletionCache::populate(&pool).await.unwrap_or_default();
     let cache = Arc::new(RwLock::new(cache));
@@ -601,55 +599,60 @@ pub async fn run_repl(executor: QueryExecutor, pool: Arc<K8sClientPool>) -> Resu
                 // Check if this is a USE command (for cache refresh after success)
                 let is_use_command = lower.starts_with("use ");
 
-                // Execute query with spinner
+                // Handle USE command specially (requires context switch)
+                if is_use_command {
+                    let context_name = input.trim()[4..].trim();
+                    if let Err(e) = pool.switch_context(context_name).await {
+                        println!("{} {}", style("Error:").red().bold(), style(e).red());
+                    } else {
+                        println!("Switched to context: {}", style(context_name).cyan());
+                        // Refresh tables after context switch
+                        if let Err(e) = session.refresh_tables().await {
+                            println!("{} {}", style("Warning:").yellow(), style(e).yellow());
+                        }
+                        // Refresh completion cache
+                        if let Ok(new_cache) = CompletionCache::populate(&pool).await {
+                            if let Ok(mut cache_guard) = cache.write() {
+                                *cache_guard = new_cache;
+                            }
+                        }
+                    }
+                    println!();
+                    continue;
+                }
+
+                // Execute query with spinner using DataFusion
                 let spinner = create_spinner("Executing query...");
                 let start = Instant::now();
 
-                match parser.parse(input) {
-                    Ok(query) => {
-                        match executor.execute(query).await {
-                            Ok(result) => {
-                                spinner.finish_and_clear();
-                                let elapsed = start.elapsed();
+                match session.execute_sql_to_strings(input).await {
+                    Ok(result) => {
+                        spinner.finish_and_clear();
+                        let elapsed = start.elapsed();
 
-                                if result.rows.is_empty() {
-                                    println!("{}", style("(0 rows)").dim());
-                                } else {
-                                    if expanded {
-                                        print!("{}", format_expanded(&result));
-                                    } else {
-                                        println!("{}", format_table(&result));
-                                    }
-                                    println!(
-                                        "{}",
-                                        style(format!(
-                                            "{} row{} ({:.2}s)",
-                                            result.rows.len(),
-                                            if result.rows.len() == 1 { "" } else { "s" },
-                                            elapsed.as_secs_f64()
-                                        ))
-                                        .dim()
-                                    );
-                                }
-
-                                // Refresh completion cache after successful USE command
-                                if is_use_command {
-                                    if let Ok(new_cache) = CompletionCache::populate(&pool).await {
-                                        if let Ok(mut cache_guard) = cache.write() {
-                                            *cache_guard = new_cache;
-                                        }
-                                    }
-                                }
+                        if result.rows.is_empty() {
+                            println!("{}", style("(0 rows)").dim());
+                        } else {
+                            if expanded {
+                                print!("{}", format_expanded(&result));
+                            } else {
+                                println!("{}", format_table(&result));
                             }
-                            Err(e) => {
-                                spinner.finish_and_clear();
-                                println!("{} {}", style("Error:").red().bold(), style(e).red());
-                            }
+                            println!(
+                                "{}",
+                                style(format!(
+                                    "{} row{} ({:.2}s)",
+                                    result.rows.len(),
+                                    if result.rows.len() == 1 { "" } else { "s" },
+                                    elapsed.as_secs_f64()
+                                ))
+                                .dim()
+                            );
                         }
                     }
                     Err(e) => {
                         spinner.finish_and_clear();
-                        println!("{} {}", style("Parse error:").red().bold(), style(e).red());
+                        println!("{} {}", style("Error:").red().bold(), style(e).red());
                     }
                 }
                 println!();

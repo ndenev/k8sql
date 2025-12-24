@@ -2,4 +2,3 @@ mod client;
 pub mod discovery;
 
 pub use client::K8sClientPool;
-pub use discovery::ColumnDef;

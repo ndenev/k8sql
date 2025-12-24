@@ -13,6 +13,7 @@ use std::collections::HashMap;
 
 /// Information about a discovered Kubernetes resource
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct ResourceInfo {
     /// The API resource definition
     pub api_resource: ApiResource,
@@ -37,6 +38,7 @@ impl ResourceInfo {
     }
 
     /// Get the full API group/version string
+    #[allow(dead_code)]
     pub fn api_version(&self) -> String {
         if self.group.is_empty() {
             self.version.clone()
@@ -257,6 +259,7 @@ pub fn generate_schema(info: &ResourceInfo) -> Vec<ColumnDef> {
 
 /// Column definition for schema
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct ColumnDef {
     pub name: String,
     pub data_type: String,

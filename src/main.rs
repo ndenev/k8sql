@@ -3,6 +3,7 @@
 
 mod cli;
 mod daemon;
+mod datafusion_integration;
 mod kubernetes;
 mod output;
 mod sql;
@@ -13,8 +14,8 @@ use std::sync::Arc;
 
 use cli::{Args, Command};
 use daemon::PgWireServer;
+use datafusion_integration::K8sSessionContext;
 use kubernetes::K8sClientPool;
-use sql::{QueryExecutor, SqlParser};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -63,8 +64,7 @@ async fn main() -> Result<()> {
 
 async fn run_batch(args: &Args) -> Result<()> {
     let pool = Arc::new(K8sClientPool::new(args.context.as_deref(), &args.namespace).await?);
-    let parser = SqlParser::new();
-    let executor = QueryExecutor::new(pool);
+    let session = K8sSessionContext::new(Arc::clone(&pool)).await?;
 
     let queries = if let Some(query) = &args.query {
         vec![query.clone()]
@@ -80,18 +80,12 @@ async fn run_batch(args: &Args) -> Result<()> {
     };
 
     for query_str in queries {
-        match parser.parse(&query_str) {
-            Ok(query) => match executor.execute(query).await {
-                Ok(result) => {
-                    println!("{}", result.format(&args.output, args.no_headers));
-                }
-                Err(e) => {
-                    eprintln!("Error executing query: {}", e);
-                    std::process::exit(1);
-                }
-            },
+        match session.execute_sql_to_strings(&query_str).await {
+            Ok(result) => {
+                println!("{}", result.format(&args.output, args.no_headers));
+            }
             Err(e) => {
-                eprintln!("Error parsing query: {}", e);
+                eprintln!("Error executing query: {}", e);
                 std::process::exit(1);
             }
         }
@@ -102,7 +96,7 @@ async fn run_batch(args: &Args) -> Result<()> {
 
 async fn run_interactive(args: &Args) -> Result<()> {
     let pool = Arc::new(K8sClientPool::new(args.context.as_deref(), &args.namespace).await?);
-    let executor = QueryExecutor::new(Arc::clone(&pool));
+    let session = K8sSessionContext::new(Arc::clone(&pool)).await?;
 
-    cli::repl::run_repl(executor, pool).await
+    cli::repl::run_repl(session, pool).await
 }
