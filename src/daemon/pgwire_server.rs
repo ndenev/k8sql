@@ -5,7 +5,7 @@ use std::fmt::Debug;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use futures::{stream, Sink, SinkExt, StreamExt};
+use futures::{stream, Sink, StreamExt};
 use tokio::net::TcpListener;
 
 use pgwire::api::auth::noop::NoopStartupHandler;
@@ -14,7 +14,6 @@ use pgwire::api::query::{PlaceholderExtendedQueryHandler, SimpleQueryHandler};
 use pgwire::api::results::{DataRowEncoder, FieldFormat, FieldInfo, QueryResponse, Response, Tag};
 use pgwire::api::{ClientInfo, NoopErrorHandler, PgWireServerHandlers, Type};
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
-use pgwire::messages::response::NoticeResponse;
 use pgwire::messages::PgWireBackendMessage;
 use pgwire::tokio::process_socket;
 
@@ -84,7 +83,7 @@ impl NoopStartupHandler for K8sBackend {}
 impl SimpleQueryHandler for K8sBackend {
     async fn do_query<'a, C>(
         &self,
-        client: &mut C,
+        _client: &mut C,
         query: &'a str,
     ) -> PgWireResult<Vec<Response<'a>>>
     where
@@ -93,17 +92,6 @@ impl SimpleQueryHandler for K8sBackend {
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
         tracing::debug!("Executing query: {}", query);
-
-        // Send a notice that we received the query
-        client
-            .send(PgWireBackendMessage::NoticeResponse(NoticeResponse::from(
-                ErrorInfo::new(
-                    "NOTICE".to_owned(),
-                    "01000".to_owned(),
-                    format!("k8sql: {}", query),
-                ),
-            )))
-            .await?;
 
         // Parse the query
         let parsed = match self.parser.parse(query) {
