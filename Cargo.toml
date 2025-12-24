@@ -13,7 +13,7 @@ datafusion = "51"
 datafusion-functions-json = "0.51"
 
 # Kubernetes client
-kube = { version = "0.98", features = ["runtime", "client", "derive", "rustls-tls"] }
+kube = { version = "0.98", features = ["runtime", "client", "derive", "rustls-tls", "http-proxy"] }
 k8s-openapi = { version = "0.24", features = ["v1_32"] }
 
 # TLS provider for rustls (aws-lc-rs preferred for performance)
