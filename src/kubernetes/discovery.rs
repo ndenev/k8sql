@@ -228,29 +228,51 @@ pub fn generate_schema(info: &ResourceInfo) -> Vec<ColumnDef> {
     // For non-namespaced resources, still include namespace column but it will be null
     // This keeps schema consistent
 
-    // Add spec and status as JSONB columns
-    columns.extend(vec![
-        ColumnDef {
-            name: "spec".to_string(),
-            data_type: "jsonb".to_string(),
-            json_path: Some("spec".to_string()),
-            description: "Resource specification".to_string(),
-        },
-        ColumnDef {
-            name: "status".to_string(),
-            data_type: "jsonb".to_string(),
-            json_path: Some("status".to_string()),
-            description: "Resource status".to_string(),
-        },
-    ]);
-
-    // For core resources, add type-specific columns
+    // For core resources, add type-specific columns first
     if info.is_core {
         let extra = get_core_resource_columns(&info.table_name);
-        // Insert before spec/status
-        let insert_pos = columns.len() - 2;
-        for col in extra.into_iter().rev() {
-            columns.insert(insert_pos, col);
+        columns.extend(extra);
+    }
+
+    // Add spec/status or data columns based on resource type
+    // ConfigMaps and Secrets don't have spec/status
+    match info.table_name.as_str() {
+        "configmaps" => {
+            columns.push(ColumnDef {
+                name: "data".to_string(),
+                data_type: "jsonb".to_string(),
+                json_path: Some("data".to_string()),
+                description: "Configuration data".to_string(),
+            });
+        }
+        "secrets" => {
+            columns.push(ColumnDef {
+                name: "type".to_string(),
+                data_type: "text".to_string(),
+                json_path: Some("type".to_string()),
+                description: "Secret type (Opaque, kubernetes.io/tls, etc.)".to_string(),
+            });
+            columns.push(ColumnDef {
+                name: "data".to_string(),
+                data_type: "jsonb".to_string(),
+                json_path: Some("data".to_string()),
+                description: "Secret data (base64 encoded)".to_string(),
+            });
+        }
+        _ => {
+            // Most resources have spec and status
+            columns.push(ColumnDef {
+                name: "spec".to_string(),
+                data_type: "jsonb".to_string(),
+                json_path: Some("spec".to_string()),
+                description: "Resource specification".to_string(),
+            });
+            columns.push(ColumnDef {
+                name: "status".to_string(),
+                data_type: "jsonb".to_string(),
+                json_path: Some("status".to_string()),
+                description: "Resource status".to_string(),
+            });
         }
     }
 
