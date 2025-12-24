@@ -1,0 +1,64 @@
+[package]
+name = "k8sql"
+version = "0.1.0"
+edition = "2024"
+authors = ["Nikolay Denev <ndenev@gmail.com>"]
+license = "BSD-3-Clause"
+description = "Query Kubernetes with SQL"
+repository = "https://github.com/ndenev/k8sql"
+
+[dependencies]
+# SQL parsing
+sqlparser = { version = "0.60", features = ["serde"] }
+
+# Kubernetes client
+kube = { version = "0.98", features = ["runtime", "client", "derive", "rustls-tls"] }
+k8s-openapi = { version = "0.24", features = ["v1_32"] }
+
+# TLS provider for rustls (aws-lc-rs preferred for performance)
+rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", "std", "tls12"] }
+
+# PostgreSQL wire protocol (for daemon mode)
+pgwire = "0.28"
+
+# REPL / CLI
+rustyline = { version = "15", features = ["derive"] }
+indicatif = "0.17"
+console = "0.15"
+comfy-table = "7"
+dirs = "6"
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# CLI argument parsing
+clap = { version = "4", features = ["derive"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Error handling
+thiserror = "2"
+anyhow = "1"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Table formatting for output
+tabled = "0.17"
+
+# Chrono for timestamp handling
+chrono = { version = "0.4", features = ["serde"] }
+
+# Futures
+futures = "0.3"
+
+# YAML output
+serde_yaml = "0.9"
+
+# Regex for LIKE pattern matching
+regex = "1"
+
+
