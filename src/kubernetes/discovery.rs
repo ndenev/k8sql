@@ -7,9 +7,23 @@
 //! the Kubernetes discovery API.
 
 use anyhow::Result;
+use k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::{
+    CustomResourceDefinition, JSONSchemaProps,
+};
+use kube::api::Api;
 use kube::discovery::{ApiCapabilities, ApiResource, Discovery, Scope};
 use kube::Client;
 use std::collections::HashMap;
+
+/// Column definition for schema
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct ColumnDef {
+    pub name: String,
+    pub data_type: String,
+    pub json_path: Option<String>,
+    pub description: String,
+}
 
 /// Information about a discovered Kubernetes resource
 #[derive(Debug, Clone)]
@@ -29,6 +43,8 @@ pub struct ResourceInfo {
     pub group: String,
     /// API version
     pub version: String,
+    /// Schema columns extracted from CRD (for non-core resources)
+    pub crd_columns: Option<Vec<ColumnDef>>,
 }
 
 impl ResourceInfo {
@@ -132,6 +148,9 @@ pub async fn discover_resources(client: &Client) -> Result<ResourceRegistry> {
     // Build a set of known core resource names for quick lookup
     let core_names: HashMap<&str, &[&str]> = CORE_RESOURCES.iter().cloned().collect();
 
+    // Fetch all CRDs for schema introspection
+    let crd_schemas = fetch_crd_schemas(client).await.unwrap_or_default();
+
     // Run discovery
     let discovery = Discovery::new(client.clone()).run().await?;
 
@@ -155,6 +174,14 @@ pub async fn discover_resources(client: &Client) -> Result<ResourceRegistry> {
                 (false, aliases)
             };
 
+            // For non-core resources, look up CRD schema
+            let crd_columns = if !is_core && !ar.group.is_empty() {
+                let crd_name = format!("{}.{}", ar.plural, ar.group);
+                crd_schemas.get(&crd_name).cloned()
+            } else {
+                None
+            };
+
             let info = ResourceInfo {
                 api_resource: ar.clone(),
                 capabilities: caps.clone(),
@@ -163,6 +190,7 @@ pub async fn discover_resources(client: &Client) -> Result<ResourceRegistry> {
                 is_core,
                 group: ar.group.clone(),
                 version: ar.version.clone(),
+                crd_columns,
             };
 
             registry.add(info);
@@ -170,6 +198,147 @@ pub async fn discover_resources(client: &Client) -> Result<ResourceRegistry> {
     }
 
     Ok(registry)
+}
+
+/// Fetch CRD definitions and extract their schemas
+async fn fetch_crd_schemas(client: &Client) -> Result<HashMap<String, Vec<ColumnDef>>> {
+    let crd_api: Api<CustomResourceDefinition> = Api::all(client.clone());
+    let crds = crd_api.list(&Default::default()).await?;
+
+    let mut schemas = HashMap::new();
+
+    for crd in crds {
+        let crd_name = crd.metadata.name.clone().unwrap_or_default();
+
+        // Get the schema from the first (or stored) version
+        for version in &crd.spec.versions {
+            if let Some(schema) = &version.schema {
+                if let Some(props) = &schema.open_api_v3_schema {
+                    let columns = extract_columns_from_schema(props);
+                    if !columns.is_empty() {
+                        schemas.insert(crd_name.clone(), columns);
+                        break; // Use first version with schema
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(schemas)
+}
+
+/// Extract column definitions from a JSONSchemaProps
+fn extract_columns_from_schema(schema: &JSONSchemaProps) -> Vec<ColumnDef> {
+    let mut columns = Vec::new();
+
+    // Extract top-level properties (spec, status, etc.)
+    if let Some(properties) = &schema.properties {
+        // Process spec fields
+        if let Some(spec_schema) = properties.get("spec") {
+            extract_nested_columns(&mut columns, spec_schema, "spec", 2);
+        }
+
+        // Process status fields
+        if let Some(status_schema) = properties.get("status") {
+            extract_nested_columns(&mut columns, status_schema, "status", 2);
+        }
+    }
+
+    columns
+}
+
+/// Reserved column names that we use for metadata
+const RESERVED_COLUMNS: &[&str] = &[
+    "_cluster",
+    "name",
+    "namespace",
+    "uid",
+    "created",
+    "labels",
+    "annotations",
+    "spec",
+    "status",
+    "data",
+    "type",
+];
+
+/// Extract columns from nested schema properties
+fn extract_nested_columns(
+    columns: &mut Vec<ColumnDef>,
+    schema: &JSONSchemaProps,
+    prefix: &str,
+    max_depth: usize,
+) {
+    if max_depth == 0 {
+        return;
+    }
+
+    if let Some(properties) = &schema.properties {
+        for (name, prop) in properties {
+            let json_path = format!("{}.{}", prefix, name);
+            let data_type = json_schema_type_to_sql(prop);
+            let description = prop.description.clone().unwrap_or_default();
+
+            // Skip reserved column names to avoid conflicts with metadata columns
+            if RESERVED_COLUMNS.contains(&name.as_str()) {
+                continue;
+            }
+
+            // For simple types, add as column
+            if is_simple_type(prop) {
+                columns.push(ColumnDef {
+                    name: name.clone(),
+                    data_type,
+                    json_path: Some(json_path),
+                    description,
+                });
+            } else if prop.type_.as_deref() == Some("object") && max_depth > 1 {
+                // For nested objects, recurse but with limited depth
+                extract_nested_columns(columns, prop, &json_path, max_depth - 1);
+            }
+        }
+    }
+}
+
+/// Check if a schema type is simple (not nested object/array)
+fn is_simple_type(schema: &JSONSchemaProps) -> bool {
+    match schema.type_.as_deref() {
+        Some("string") | Some("integer") | Some("number") | Some("boolean") => true,
+        Some("array") => {
+            // Arrays of simple types are ok
+            if let Some(items) = &schema.items {
+                match items {
+                    k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::JSONSchemaPropsOrArray::Schema(item_schema) => {
+                        matches!(item_schema.type_.as_deref(), Some("string") | Some("integer") | Some("number") | Some("boolean"))
+                    }
+                    _ => false,
+                }
+            } else {
+                false
+            }
+        }
+        _ => false,
+    }
+}
+
+/// Convert JSON Schema type to SQL type
+fn json_schema_type_to_sql(schema: &JSONSchemaProps) -> String {
+    match schema.type_.as_deref() {
+        Some("string") => {
+            // Check format for more specific types
+            match schema.format.as_deref() {
+                Some("date-time") => "timestamp".to_string(),
+                Some("date") => "date".to_string(),
+                _ => "text".to_string(),
+            }
+        }
+        Some("integer") => "integer".to_string(),
+        Some("number") => "numeric".to_string(),
+        Some("boolean") => "boolean".to_string(),
+        Some("array") => "jsonb".to_string(),
+        Some("object") => "jsonb".to_string(),
+        _ => "text".to_string(),
+    }
 }
 
 /// Generate a PostgreSQL-style schema for a discovered resource
@@ -232,6 +401,9 @@ pub fn generate_schema(info: &ResourceInfo) -> Vec<ColumnDef> {
     if info.is_core {
         let extra = get_core_resource_columns(&info.table_name);
         columns.extend(extra);
+    } else if let Some(crd_cols) = &info.crd_columns {
+        // For CRDs, add columns extracted from the schema
+        columns.extend(crd_cols.clone());
     }
 
     // Add spec/status or data columns based on resource type
@@ -277,16 +449,6 @@ pub fn generate_schema(info: &ResourceInfo) -> Vec<ColumnDef> {
     }
 
     columns
-}
-
-/// Column definition for schema
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
-pub struct ColumnDef {
-    pub name: String,
-    pub data_type: String,
-    pub json_path: Option<String>,
-    pub description: String,
 }
 
 /// Get additional columns for core resources
