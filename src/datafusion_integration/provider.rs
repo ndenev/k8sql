@@ -5,6 +5,7 @@
 
 use std::any::Any;
 use std::sync::Arc;
+use std::time::Instant;
 
 use datafusion::arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
@@ -12,10 +13,16 @@ use datafusion::catalog::Session;
 use datafusion::datasource::memory::MemorySourceConfig;
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::error::Result;
-use datafusion::logical_expr::TableProviderFilterPushDown;
+use datafusion::logical_expr::{Operator, TableProviderFilterPushDown};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::Expr;
+use futures::stream::{self, StreamExt};
 use tokio::sync::RwLock;
+use tracing::{debug, info};
+
+/// Maximum number of clusters to query concurrently
+/// Prevents overwhelming the network or hitting rate limits
+const MAX_CONCURRENT_CLUSTERS: usize = 5;
 
 use crate::kubernetes::discovery::{generate_schema, ResourceInfo};
 use crate::kubernetes::K8sClientPool;
@@ -93,6 +100,113 @@ impl K8sTableProvider {
         }
         None
     }
+
+    /// Extract label selectors from DataFusion expressions
+    /// Looks for patterns like `json_get_str(labels, 'key') = 'value'`
+    /// (after SQL preprocessing converts `labels.key` to this form)
+    /// Returns a K8s label selector string like "app=nginx,env=prod"
+    fn extract_label_selectors(&self, filters: &[Expr]) -> Option<String> {
+        let mut selectors = Vec::new();
+
+        for filter in filters {
+            self.collect_label_selectors(filter, &mut selectors);
+        }
+
+        if selectors.is_empty() {
+            None
+        } else {
+            Some(selectors.join(","))
+        }
+    }
+
+    /// Recursively collect label selectors from an expression tree
+    fn collect_label_selectors(&self, expr: &Expr, selectors: &mut Vec<String>) {
+        match expr {
+            // Handle AND expressions - recurse into both sides
+            Expr::BinaryExpr(binary) if binary.op == Operator::And => {
+                self.collect_label_selectors(&binary.left, selectors);
+                self.collect_label_selectors(&binary.right, selectors);
+            }
+            // Handle equality: labels['key'] = 'value'
+            Expr::BinaryExpr(binary) if binary.op == Operator::Eq => {
+                if let Some(selector) = self.extract_label_selector(binary, "=") {
+                    selectors.push(selector);
+                }
+            }
+            // Handle inequality: labels['key'] != 'value'
+            Expr::BinaryExpr(binary) if binary.op == Operator::NotEq => {
+                if let Some(selector) = self.extract_label_selector(binary, "!=") {
+                    selectors.push(selector);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Extract a label selector from labels['key'] = 'value' pattern (native map access)
+    /// or json_get_str(labels, 'key') = 'value' pattern (legacy)
+    fn extract_label_selector(
+        &self,
+        binary: &datafusion::logical_expr::BinaryExpr,
+        op: &str,
+    ) -> Option<String> {
+        // Debug: log the expression structure
+        debug!(
+            left = ?binary.left,
+            right = ?binary.right,
+            "Analyzing binary expression for label selector"
+        );
+
+        // Try native map access: get_field(labels, 'key') pattern
+        // DataFusion represents labels['key'] as ScalarFunction { name: "get_field", args: [Column("labels"), Literal("key")] }
+        if let Expr::ScalarFunction(func) = binary.left.as_ref() {
+            let func_name = func.name();
+            debug!(func_name = %func_name, args_len = func.args.len(), "Found ScalarFunction on left side");
+
+            // Handle get_field for native map access (labels['key'])
+            if func_name == "get_field" && func.args.len() >= 2 {
+                if let Expr::Column(col) = &func.args[0] {
+                    if col.name == "labels" {
+                        // Second arg should be the label key as a literal
+                        if let Expr::Literal(key_lit, _) = &func.args[1] {
+                            if let datafusion::common::ScalarValue::Utf8(Some(key)) = key_lit {
+                                // Right side should be the value literal
+                                if let Expr::Literal(val_lit, _) = binary.right.as_ref() {
+                                    if let datafusion::common::ScalarValue::Utf8(Some(value)) =
+                                        val_lit
+                                    {
+                                        debug!(key = %key, value = %value, "Extracted label selector via get_field");
+                                        return Some(format!("{}{}{}", key, op, value));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Legacy: handle json_get_str for backward compatibility
+            if func_name == "json_get_str" && func.args.len() >= 2 {
+                if let Expr::Column(col) = &func.args[0] {
+                    if col.name == "labels" {
+                        if let Expr::Literal(key_lit, _) = &func.args[1] {
+                            if let datafusion::common::ScalarValue::Utf8(Some(key)) = key_lit {
+                                if let Expr::Literal(val_lit, _) = binary.right.as_ref() {
+                                    if let datafusion::common::ScalarValue::Utf8(Some(value)) =
+                                        val_lit
+                                    {
+                                        debug!(key = %key, value = %value, "Extracted label selector via json_get_str");
+                                        return Some(format!("{}{}{}", key, op, value));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
 }
 
 impl std::fmt::Debug for K8sTableProvider {
@@ -121,15 +235,33 @@ impl TableProvider for K8sTableProvider {
         &self,
         filters: &[&Expr],
     ) -> Result<Vec<TableProviderFilterPushDown>> {
-        // We can push down namespace and _cluster filters to the K8s API
+        // We can push down these filters to the K8s API:
+        // - namespace = 'x' -> Uses namespaced API
+        // - _cluster = 'x' -> Queries specific cluster
+        // - labels['key'] = 'value' -> K8s label selector (native map access via get_field)
+        // - json_get_str(labels, 'key') = 'value' -> K8s label selector (legacy)
         // Other filters will be handled by DataFusion
         Ok(filters
             .iter()
             .map(|f| {
                 if let Expr::BinaryExpr(binary) = f {
+                    // Check for column-based filters (namespace, _cluster)
                     if let Expr::Column(col) = binary.left.as_ref() {
                         if col.name == "namespace" || col.name == "_cluster" {
                             return TableProviderFilterPushDown::Exact;
+                        }
+                    }
+                    // Check for labels['key'] pattern (native map access via get_field or json_get_str)
+                    if let Expr::ScalarFunction(func) = binary.left.as_ref() {
+                        let func_name = func.name();
+                        if (func_name == "get_field" || func_name == "json_get_str")
+                            && !func.args.is_empty()
+                        {
+                            if let Expr::Column(col) = &func.args[0] {
+                                if col.name == "labels" {
+                                    return TableProviderFilterPushDown::Exact;
+                                }
+                            }
                         }
                     }
                 }
@@ -148,6 +280,23 @@ impl TableProvider for K8sTableProvider {
         // Extract pushdown filters - these go to the K8s API to reduce data fetched
         let namespace = self.extract_namespace_filter(filters);
         let cluster_filter = self.extract_cluster_filter(filters);
+        let label_selector = self.extract_label_selectors(filters);
+
+        // Log pushdown filters for debugging
+        if namespace.is_some() || label_selector.is_some() {
+            debug!(
+                table = %self.resource_info.table_name,
+                namespace = ?namespace,
+                labels = ?label_selector,
+                "Pushing down filters to K8s API"
+            );
+        }
+
+        // Build API filters with label selector
+        let api_filters = ApiFilters {
+            label_selector,
+            field_selector: None, // TODO: Add field selector support for status.phase etc.
+        };
 
         // Determine which cluster(s) to query
         let clusters: Vec<String> = if let Some(ref cf) = cluster_filter {
@@ -163,38 +312,88 @@ impl TableProvider for K8sTableProvider {
             vec![current]
         };
 
-        // Fetch data from each cluster
-        let mut batches = Vec::new();
-        let api_filters = ApiFilters::default(); // TODO: Extract label/field selectors
+        // Fetch data from all clusters IN PARALLEL
+        // Each cluster becomes a separate partition for DataFusion to process
+        let table_name = self.resource_info.table_name.clone();
+        let resource_info = self.resource_info.clone();
+        let pool = self.pool.clone();
 
-        for cluster in &clusters {
-            let resources = self
-                .pool
-                .fetch_resources(
-                    &self.resource_info.table_name,
-                    namespace.as_deref(),
-                    Some(cluster),
-                    &api_filters,
-                )
-                .await
-                .unwrap_or_default();
+        let num_clusters = clusters.len();
+        info!(
+            table = %table_name,
+            clusters = num_clusters,
+            namespace = ?namespace,
+            labels = ?api_filters.label_selector,
+            "Fetching resources from K8s API"
+        );
 
+        let fetch_start = Instant::now();
+
+        // Execute cluster queries with concurrency limit to avoid overwhelming APIs
+        let results: Vec<_> = stream::iter(clusters.iter().cloned())
+            .map(|cluster| {
+                let pool = pool.clone();
+                let table_name = table_name.clone();
+                let namespace = namespace.clone();
+                let api_filters = api_filters.clone();
+
+                async move {
+                    let start = Instant::now();
+                    let resources = pool
+                        .fetch_resources(&table_name, namespace.as_deref(), Some(&cluster), &api_filters)
+                        .await
+                        .unwrap_or_default();
+                    let elapsed = start.elapsed();
+                    debug!(
+                        cluster = %cluster,
+                        table = %table_name,
+                        rows = resources.len(),
+                        elapsed_ms = elapsed.as_millis(),
+                        "Fetched from cluster"
+                    );
+                    (cluster, resources)
+                }
+            })
+            // Limit concurrent requests to avoid overwhelming K8s APIs
+            .buffer_unordered(MAX_CONCURRENT_CLUSTERS)
+            .collect()
+            .await;
+        let fetch_elapsed = fetch_start.elapsed();
+
+        // Convert results to partitions - one partition per cluster
+        // This allows DataFusion to process clusters in parallel
+        let mut partitions: Vec<Vec<datafusion::arrow::array::RecordBatch>> = Vec::new();
+        let mut total_rows = 0usize;
+
+        for (cluster, resources) in results {
+            let row_count = resources.len();
+            total_rows += row_count;
             if !resources.is_empty() {
-                let batch = json_to_record_batch(cluster, &self.resource_info, resources)?;
-                batches.push(batch);
+                let batch = json_to_record_batch(&cluster, &resource_info, resources)?;
+                // Each cluster's data is its own partition
+                partitions.push(vec![batch]);
             }
         }
 
-        // If no data, create an empty batch with correct schema
-        if batches.is_empty() {
+        // If no data, create a single empty partition with correct schema
+        if partitions.is_empty() {
             let empty_batch = datafusion::arrow::array::RecordBatch::new_empty(self.schema.clone());
-            batches.push(empty_batch);
+            partitions.push(vec![empty_batch]);
         }
 
-        // Create MemorySourceConfig execution plan with our batches (one partition)
-        // DataFusion's optimizer will automatically apply remaining filters and limits
+        info!(
+            table = %self.resource_info.table_name,
+            clusters = num_clusters,
+            partitions = partitions.len(),
+            total_rows = total_rows,
+            fetch_ms = fetch_elapsed.as_millis(),
+            "K8s API fetch complete"
+        );
+
+        // Create MemorySourceConfig execution plan with multiple partitions
+        // DataFusion's executor will process partitions in parallel
         let plan = MemorySourceConfig::try_new_exec(
-            &[batches],
+            &partitions,
             self.schema.clone(),
             projection.cloned(),
         )?;

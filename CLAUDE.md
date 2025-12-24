@@ -70,6 +70,7 @@ src/
 │   ├── context.rs             # K8sSessionContext - DataFusion session setup
 │   ├── provider.rs            # K8sTableProvider - TableProvider implementation
 │   ├── convert.rs             # JSON to Arrow RecordBatch conversion
+│   ├── preprocess.rs          # SQL preprocessing (labels.x → labels['x'])
 │   └── hooks.rs               # Query hooks for filter extraction
 ├── kubernetes/
 │   ├── mod.rs
@@ -94,11 +95,13 @@ src/
 
 k8sql uses Apache DataFusion as its SQL query engine:
 
-- **K8sSessionContext** (`context.rs`): Wraps DataFusion's SessionContext, registers all K8s resources as tables, and provides JSON functions for querying nested fields.
+- **K8sSessionContext** (`context.rs`): Wraps DataFusion's SessionContext, registers all K8s resources as tables, provides JSON functions for querying nested fields.
 
-- **K8sTableProvider** (`provider.rs`): Implements DataFusion's TableProvider trait. Fetches data from Kubernetes API on scan, pushes namespace and cluster filters.
+- **K8sTableProvider** (`provider.rs`): Implements DataFusion's TableProvider trait. Fetches data from Kubernetes API on scan, extracts and pushes filters (namespace, cluster, label selectors) to the API.
 
-- **JSON to Arrow conversion** (`convert.rs`): Converts K8s JSON resources to Arrow RecordBatches for DataFusion processing.
+- **JSON to Arrow conversion** (`convert.rs`): Converts K8s JSON resources to Arrow RecordBatches. Labels/annotations use native `Map<Utf8, Utf8>` type for efficient access.
+
+- **SQL Preprocessing** (`preprocess.rs`): Transforms `labels.key` syntax to `labels['key']` for native map access before DataFusion parsing.
 
 ### Resource Discovery (`src/kubernetes/discovery.rs`)
 
@@ -138,10 +141,10 @@ All resources share a consistent schema:
 | `namespace` | text | Namespace (null for cluster-scoped) |
 | `uid` | text | Unique identifier |
 | `created` | timestamp | Creation timestamp |
-| `labels` | json | Resource labels |
-| `annotations` | json | Resource annotations |
-| `spec` | json | Resource specification |
-| `status` | json | Resource status |
+| `labels` | Map<Utf8, Utf8> | Native map, access with `labels['key']` |
+| `annotations` | Map<Utf8, Utf8> | Native map, access with `annotations['key']` |
+| `spec` | json (Utf8) | Resource specification (JSON string) |
+| `status` | json (Utf8) | Resource status (JSON string) |
 
 Special cases:
 - **ConfigMaps/Secrets**: `data` column instead of spec/status
@@ -150,19 +153,37 @@ Special cases:
 
 ## Query Optimization
 
-Currently pushed to K8s API:
+### Server-side (pushed to K8s API):
 
 | SQL Condition | K8s API Optimization |
 |---------------|---------------------|
 | `namespace = 'x'` | Uses namespaced API |
+| `labels.app = 'nginx'` | K8s label selector |
+| `labels['app'] = 'nginx'` | Same (bracket notation) |
+| `labels.app = 'x' AND labels.env = 'y'` | Combined: `app=x,env=y` |
 | `_cluster = 'prod'` | Only queries that cluster |
 | `_cluster = '*'` | Queries all clusters in parallel |
 
-Handled client-side by DataFusion:
-- All JSON field access (`json_get_str(status, 'phase')`)
+### Client-side (DataFusion):
+- JSON field access (`json_get_str(status, 'phase')`)
 - LIKE patterns
 - Complex expressions
-- ORDER BY, LIMIT
+- ORDER BY, LIMIT, GROUP BY
+
+### SQL Preprocessing (`src/datafusion_integration/preprocess.rs`)
+
+Transforms k8sql syntax to DataFusion-compatible SQL:
+- `labels.app = 'value'` → `labels['app'] = 'value'` (native map access)
+- `annotations.key = 'value'` → `annotations['key'] = 'value'`
+
+This enables dot-notation while using DataFusion's native Map operations.
+
+### JSON Array Access
+
+Use `json_get_array()` with `UNNEST` for array expansion:
+```sql
+SELECT json_get_str(UNNEST(json_get_array(spec, 'containers')), 'image') FROM pods
+```
 
 ## REPL Controls
 

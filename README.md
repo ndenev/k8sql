@@ -98,20 +98,72 @@ SELECT name, json_get_json(spec, 'containers') as containers FROM pods
 | `json_get_float(json, key, ...)` | Extract as float |
 | `json_get_bool(json, key, ...)` | Extract as boolean |
 | `json_get_json(json, key, ...)` | Extract nested JSON as string |
+| `json_get_array(json, key, ...)` | Extract as Arrow array (for UNNEST) |
+| `json_length(json)` | Get length of array or object |
+| `json_keys(json)` | Get keys of JSON object |
 | `json_contains(json, key, ...)` | Check if key exists |
 
 The function syntax supports chaining multiple keys and array indices in a single call, making it convenient for deeply nested access.
 
-### Label Queries
+### Labels and Annotations
 
-Query resources by labels using the `labels.` prefix:
+Labels and annotations are stored as native Map types, enabling efficient access with bracket notation:
 
 ```sql
+-- Access a specific label
+SELECT name, labels['app'] as app FROM pods
+
 -- Filter by label (pushed to K8s API as label selector)
 SELECT * FROM pods WHERE labels.app = 'nginx'
 
--- Multiple label conditions
+-- Multiple label conditions (combined into single API call)
 SELECT * FROM pods WHERE labels.app = 'nginx' AND labels.env = 'prod'
+
+-- Access annotations
+SELECT name, annotations['kubectl.kubernetes.io/last-applied-configuration'] as config
+FROM deployments
+
+-- Labels with special characters (dots, slashes)
+SELECT * FROM pods WHERE labels.app.kubernetes.io/name = 'cert-manager'
+```
+
+The `labels.key = 'value'` syntax is automatically converted to native map access and pushed to the Kubernetes API as a label selector for efficient server-side filtering.
+
+### Working with Arrays (UNNEST)
+
+Use `json_get_array()` with `UNNEST` to expand JSON arrays into rows:
+
+```sql
+-- Get all containers from a pod
+SELECT name, UNNEST(json_get_array(spec, 'containers')) as container
+FROM pods
+WHERE namespace = 'kube-system'
+
+-- Get all container images from a pod
+SELECT name, json_get_str(UNNEST(json_get_array(spec, 'containers')), 'image') as image
+FROM pods
+
+-- Get all unique images across all pods
+SELECT DISTINCT json_get_str(UNNEST(json_get_array(spec, 'containers')), 'image') as image
+FROM pods
+ORDER BY image
+
+-- Get container names and images together
+SELECT
+    name as pod,
+    json_get_str(UNNEST(json_get_array(spec, 'containers')), 'name') as container,
+    json_get_str(UNNEST(json_get_array(spec, 'containers')), 'image') as image
+FROM pods
+WHERE namespace = 'default'
+
+-- Count containers per pod
+SELECT name, json_length(json_get_json(spec, 'containers')) as container_count
+FROM pods
+
+-- Get all volume mounts
+SELECT name,
+       json_get_str(UNNEST(json_get_array(spec, 'volumes')), 'name') as volume
+FROM pods
 ```
 
 ## Example Queries
@@ -185,11 +237,6 @@ SELECT name, namespace,
        json_get_int(status, 'availableReplicas') as available
 FROM deployments
 
--- Find pods running a specific image
-SELECT name, namespace, json_get_str(spec, 'containers', 0, 'image') as image
-FROM pods
-WHERE json_get_str(spec, 'containers', 0, 'image') LIKE '%nginx%'
-
 -- Services with their types
 SELECT name, namespace,
        json_get_str(spec, 'type') as type,
@@ -212,6 +259,48 @@ SELECT name, json_get_str(spec, 'secretName') as secret
 FROM certificates
 ```
 
+### Container Image Queries
+
+```sql
+-- All images used in a namespace
+SELECT DISTINCT json_get_str(UNNEST(json_get_array(spec, 'containers')), 'image') as image
+FROM pods
+WHERE namespace = 'kube-system'
+ORDER BY image
+
+-- Find pods using a specific image
+SELECT name, namespace,
+       json_get_str(UNNEST(json_get_array(spec, 'containers')), 'image') as image
+FROM pods
+WHERE json_get_str(UNNEST(json_get_array(spec, 'containers')), 'image') LIKE '%nginx%'
+
+-- Images grouped by namespace
+SELECT namespace,
+       json_get_str(UNNEST(json_get_array(spec, 'containers')), 'image') as image
+FROM pods
+ORDER BY namespace, image
+
+-- Count pods per image (top 10 most used images)
+SELECT json_get_str(UNNEST(json_get_array(spec, 'containers')), 'image') as image,
+       COUNT(*) as count
+FROM pods
+GROUP BY image
+ORDER BY count DESC
+LIMIT 10
+
+-- Find pods with multiple containers
+SELECT name, namespace, json_length(json_get_json(spec, 'containers')) as container_count
+FROM pods
+WHERE json_length(json_get_json(spec, 'containers')) > 1
+
+-- All container names and their images
+SELECT name as pod, namespace,
+       json_get_str(UNNEST(json_get_array(spec, 'containers')), 'name') as container,
+       json_get_str(UNNEST(json_get_array(spec, 'containers')), 'image') as image
+FROM pods
+WHERE namespace = 'default'
+```
+
 ## Table Schema
 
 All Kubernetes resources are exposed with a consistent schema:
@@ -225,8 +314,8 @@ All Kubernetes resources are exposed with a consistent schema:
 | `namespace` | text | Namespace (null for cluster-scoped resources) |
 | `uid` | text | Unique identifier |
 | `created` | timestamp | Creation timestamp |
-| `labels` | json | Resource labels as JSON object |
-| `annotations` | json | Resource annotations as JSON object |
+| `labels` | Map<Utf8, Utf8> | Resource labels (access with `labels['key']`) |
+| `annotations` | Map<Utf8, Utf8> | Resource annotations (access with `annotations['key']`) |
 | `spec` | json | Resource specification (desired state) |
 | `status` | json | Resource status (current state) |
 
@@ -325,14 +414,24 @@ k8sql optimizes queries by pushing predicates to the Kubernetes API when possibl
 
 | Predicate | Optimization |
 |-----------|--------------|
-| `namespace = 'x'` | Uses `Api::namespaced()` |
-| `labels.app = 'nginx'` | K8s label selector |
-| `namespace LIKE '%'` | Queries all, filters client-side |
+| `namespace = 'x'` | Uses `Api::namespaced()` - only fetches from that namespace |
+| `labels.app = 'nginx'` | K8s label selector - server-side filtering |
+| `labels['app'] = 'nginx'` | Same as above (bracket notation) |
+| `labels.app = 'x' AND labels.env = 'y'` | Combined label selector: `app=x,env=y` |
 | `_cluster = 'prod'` | Only queries that cluster |
-| `_cluster = '*'` | Queries all clusters |
+| `_cluster = '*'` | Queries all clusters in parallel |
+| `namespace LIKE '%'` | Queries all, filters client-side |
 | `json_get_str(...)` | Client-side JSON parsing |
 
-Note: JSON field filtering (e.g., `WHERE json_get_str(status, 'phase') = 'Running'`) is performed client-side after fetching resources.
+**Server-side optimizations** reduce API calls and network traffic by filtering at the Kubernetes API level. Label selectors are especially powerful - the API returns only matching resources.
+
+**Client-side filters** (LIKE patterns, JSON field comparisons) are applied after fetching resources. For large clusters, prefer server-side filters when possible.
+
+Use `-v` flag to see what filters are being pushed down:
+```bash
+k8sql -v -q "SELECT name FROM pods WHERE labels.app = 'nginx' AND namespace = 'default'"
+# Shows: labels=Some("app=nginx"), namespace=Some("default")
+```
 
 ## REPL Commands
 

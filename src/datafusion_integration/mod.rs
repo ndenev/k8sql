@@ -10,6 +10,7 @@ mod provider;
 mod convert;
 mod context;
 mod hooks;
+mod preprocess;
 
 pub use context::K8sSessionContext;
 pub use hooks::ShowDatabasesHook;

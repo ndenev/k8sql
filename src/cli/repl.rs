@@ -117,6 +117,29 @@ impl CompletionCache {
 
 struct SqlHelper {
     cache: Arc<RwLock<CompletionCache>>,
+    /// Pre-compiled regexes for keyword highlighting (avoids recompiling on every keystroke)
+    keyword_patterns: Vec<(regex::Regex, &'static str)>,
+}
+
+impl SqlHelper {
+    fn new(cache: Arc<RwLock<CompletionCache>>) -> Self {
+        // Pre-compile keyword regexes once at startup
+        let keyword_patterns: Vec<_> = KEYWORDS
+            .iter()
+            .filter_map(|&kw| {
+                regex::RegexBuilder::new(&format!(r"\b{}\b", regex::escape(kw)))
+                    .case_insensitive(true)
+                    .build()
+                    .ok()
+                    .map(|re| (re, kw))
+            })
+            .collect();
+
+        Self {
+            cache,
+            keyword_patterns,
+        }
+    }
 }
 
 impl Helper for SqlHelper {}
@@ -425,18 +448,15 @@ impl Completer for SqlHelper {
 
 impl Highlighter for SqlHelper {
     fn highlight<'l>(&self, line: &'l str, _pos: usize) -> Cow<'l, str> {
-        // Simple SQL keyword highlighting
+        // Use pre-compiled regex patterns for fast keyword highlighting
         let mut result = line.to_string();
 
-        for &kw in KEYWORDS {
-            // Case-insensitive replacement with colored version
-            let re = regex::RegexBuilder::new(&format!(r"\b{}\b", regex::escape(kw)))
-                .case_insensitive(true)
-                .build()
-                .unwrap();
-            result = re.replace_all(&result, |_caps: &regex::Captures| {
-                format!("\x1b[1;34m{}\x1b[0m", kw)
-            }).to_string();
+        for (re, kw) in &self.keyword_patterns {
+            result = re
+                .replace_all(&result, |_caps: &regex::Captures| {
+                    format!("\x1b[1;34m{}\x1b[0m", kw)
+                })
+                .to_string();
         }
 
         Cow::Owned(result)
@@ -558,12 +578,11 @@ pub async fn run_repl(mut session: K8sSessionContext, pool: Arc<K8sClientPool>) 
         .unwrap_or_default();
     let cache = Arc::new(RwLock::new(cache));
 
-    let helper = SqlHelper {
-        cache: Arc::clone(&cache),
-    };
+    let helper = SqlHelper::new(Arc::clone(&cache));
     let config = rustyline::Config::builder()
         .auto_add_history(true)
         .max_history_size(1000)?
+        .tab_stop(4)
         .build();
 
     let mut rl: Editor<SqlHelper, DefaultHistory> = Editor::with_config(config)?;

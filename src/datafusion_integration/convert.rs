@@ -5,8 +5,8 @@
 
 use std::sync::Arc;
 
-use datafusion::arrow::array::{ArrayRef, RecordBatch, StringBuilder};
-use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use datafusion::arrow::array::{ArrayRef, MapBuilder, RecordBatch, StringBuilder};
+use datafusion::arrow::datatypes::{DataType, Field, Fields, Schema, SchemaRef};
 use datafusion::error::Result;
 
 use crate::kubernetes::discovery::{generate_schema, ColumnDef, ResourceInfo};
@@ -16,12 +16,34 @@ pub fn to_arrow_schema(columns: &[ColumnDef]) -> SchemaRef {
     let fields: Vec<Field> = columns
         .iter()
         .map(|col| {
-            // For now, all columns are strings (we can add type inference later)
-            Field::new(&col.name, DataType::Utf8, true)
+            let data_type = match col.name.as_str() {
+                // Labels and annotations are Map<Utf8, Utf8> for native access
+                "labels" | "annotations" => {
+                    // Map type: MapBuilder produces Struct<keys: Utf8, values: Utf8>
+                    let entries_field = Field::new(
+                        "entries",
+                        DataType::Struct(Fields::from(vec![
+                            Field::new("keys", DataType::Utf8, false),
+                            Field::new("values", DataType::Utf8, true),
+                        ])),
+                        false,
+                    );
+                    DataType::Map(Arc::new(entries_field), false)
+                }
+                // All other columns remain as strings for now
+                _ => DataType::Utf8,
+            };
+            Field::new(&col.name, data_type, true)
         })
         .collect();
 
     Arc::new(Schema::new(fields))
+}
+
+/// Builder enum to handle different column types
+enum ColumnBuilder {
+    String(StringBuilder),
+    Map(MapBuilder<StringBuilder, StringBuilder>),
 }
 
 /// Convert K8s JSON resources to Arrow RecordBatch
@@ -36,25 +58,58 @@ pub fn json_to_record_batch(
     let columns = generate_schema(resource_info);
     let schema = to_arrow_schema(&columns);
 
-    // Create string builders for each column
-    let mut builders: Vec<StringBuilder> = columns.iter().map(|_| StringBuilder::new()).collect();
+    // Create appropriate builders for each column type
+    let mut builders: Vec<ColumnBuilder> = columns
+        .iter()
+        .map(|col| match col.name.as_str() {
+            "labels" | "annotations" => {
+                ColumnBuilder::Map(MapBuilder::new(None, StringBuilder::new(), StringBuilder::new()))
+            }
+            _ => ColumnBuilder::String(StringBuilder::new()),
+        })
+        .collect();
 
     // Process each resource
     for resource in &resources {
         for (idx, col) in columns.iter().enumerate() {
-            let value = if col.name == "_cluster" {
-                cluster.to_string()
-            } else {
-                extract_field_value(resource, &col.name, col.json_path.as_deref())
-            };
-            builders[idx].append_value(&value);
+            match &mut builders[idx] {
+                ColumnBuilder::String(builder) => {
+                    let value = if col.name == "_cluster" {
+                        cluster.to_string()
+                    } else {
+                        extract_field_value(resource, &col.name, col.json_path.as_deref())
+                    };
+                    builder.append_value(&value);
+                }
+                ColumnBuilder::Map(builder) => {
+                    // Extract JSON object and convert to Map entries
+                    let json_value = get_nested_value(resource, col.json_path.as_deref().unwrap_or(&col.name));
+                    if let serde_json::Value::Object(map) = json_value {
+                        for (key, value) in map {
+                            builder.keys().append_value(&key);
+                            match value {
+                                serde_json::Value::String(s) => builder.values().append_value(&s),
+                                serde_json::Value::Null => builder.values().append_null(),
+                                other => builder.values().append_value(other.to_string()),
+                            }
+                        }
+                        builder.append(true)?;
+                    } else {
+                        // Null or non-object: append empty map
+                        builder.append(true)?;
+                    }
+                }
+            }
         }
     }
 
-    // Build arrays
+    // Build arrays from builders
     let arrays: Vec<ArrayRef> = builders
         .into_iter()
-        .map(|mut b| Arc::new(b.finish()) as ArrayRef)
+        .map(|builder| match builder {
+            ColumnBuilder::String(mut b) => Arc::new(b.finish()) as ArrayRef,
+            ColumnBuilder::Map(mut b) => Arc::new(b.finish()) as ArrayRef,
+        })
         .collect();
 
     let batch = RecordBatch::try_new(schema, arrays)?;

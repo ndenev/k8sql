@@ -6,12 +6,25 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
+use tracing::{debug, warn};
 
 use super::discovery::{discover_resources, ResourceInfo, ResourceRegistry};
 use crate::sql::ApiFilters;
 
 /// How long to cache discovered resources before auto-refresh
 const REGISTRY_TTL: Duration = Duration::from_secs(300); // 5 minutes
+
+/// Timeout for connecting to K8s API
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Timeout for reading K8s API responses
+const READ_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Maximum retry attempts for transient failures
+const MAX_RETRIES: u32 = 3;
+
+/// Base delay for exponential backoff (doubles each retry)
+const RETRY_BASE_DELAY: Duration = Duration::from_millis(100);
 
 /// Cached registry with timestamp
 struct CachedRegistry {
@@ -132,8 +145,8 @@ impl K8sClientPool {
             return Err(anyhow!("Context '{}' not found in kubeconfig", context));
         }
 
-        // Create new client
-        let config = Config::from_custom_kubeconfig(
+        // Create new client with timeouts
+        let mut config = Config::from_custom_kubeconfig(
             self.kubeconfig.clone(),
             &KubeConfigOptions {
                 context: Some(context.to_string()),
@@ -141,6 +154,10 @@ impl K8sClientPool {
             },
         )
         .await?;
+
+        // Set timeouts for reliability
+        config.connect_timeout = Some(CONNECT_TIMEOUT);
+        config.read_timeout = Some(READ_TIMEOUT);
 
         let client = Client::try_from(config)?;
 
@@ -195,6 +212,7 @@ impl K8sClientPool {
 
     /// Fetch resources using dynamic discovery
     /// Works for all resource types: core, extensions, and CRDs
+    /// Includes retry logic with exponential backoff for transient failures
     pub async fn fetch_resources(
         &self,
         table: &str,
@@ -222,8 +240,8 @@ impl K8sClientPool {
             Api::all_with(client, ar)
         };
 
-        // Fetch and convert to JSON values
-        let list = api.list(&list_params).await?;
+        // Fetch with retry logic for transient failures
+        let list = self.list_with_retry(&api, &list_params, table, context).await?;
 
         // Build apiVersion string (e.g., "v1", "apps/v1", "cert-manager.io/v1")
         let api_version = if resource_info.group.is_empty() {
@@ -248,6 +266,72 @@ impl K8sClientPool {
             .collect();
 
         Ok(values)
+    }
+
+    /// List resources with retry logic and exponential backoff
+    async fn list_with_retry(
+        &self,
+        api: &Api<DynamicObject>,
+        params: &ListParams,
+        table: &str,
+        context: Option<&str>,
+    ) -> Result<kube::api::ObjectList<DynamicObject>> {
+        let mut last_error = None;
+        let ctx_name = context.unwrap_or("default");
+
+        for attempt in 0..MAX_RETRIES {
+            match api.list(params).await {
+                Ok(list) => return Ok(list),
+                Err(e) => {
+                    // Check if this is a retryable error
+                    if Self::is_retryable_error(&e) {
+                        let delay = RETRY_BASE_DELAY * 2u32.pow(attempt);
+                        warn!(
+                            table = %table,
+                            context = %ctx_name,
+                            attempt = attempt + 1,
+                            max_attempts = MAX_RETRIES,
+                            delay_ms = delay.as_millis(),
+                            error = %e,
+                            "Retryable error, backing off"
+                        );
+                        tokio::time::sleep(delay).await;
+                        last_error = Some(e);
+                    } else {
+                        // Non-retryable error, fail immediately
+                        debug!(
+                            table = %table,
+                            context = %ctx_name,
+                            error = %e,
+                            "Non-retryable error"
+                        );
+                        return Err(anyhow!("K8s API error: {}", e));
+                    }
+                }
+            }
+        }
+
+        Err(anyhow!(
+            "Failed after {} retries: {}",
+            MAX_RETRIES,
+            last_error.map(|e| e.to_string()).unwrap_or_default()
+        ))
+    }
+
+    /// Check if an error is retryable (transient failures)
+    fn is_retryable_error(err: &kube::Error) -> bool {
+        match err {
+            // Network/connection errors are retryable
+            kube::Error::HyperError(_) => true,
+            // API errors: retry on 429 (rate limit), 503 (unavailable), 504 (timeout)
+            kube::Error::Api(api_err) => {
+                matches!(api_err.code, 429 | 503 | 504)
+            }
+            // Timeout errors are retryable
+            kube::Error::InferConfig(_) => false,
+            kube::Error::Discovery(_) => false,
+            _ => false,
+        }
     }
 
     /// Build ListParams from API filters (label selectors, field selectors)
