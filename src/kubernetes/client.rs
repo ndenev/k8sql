@@ -56,7 +56,8 @@ pub struct K8sClientPool {
     kubeconfig: Kubeconfig,
     clients: Arc<RwLock<HashMap<String, Client>>>,
     registries: Arc<RwLock<HashMap<String, CachedRegistry>>>,
-    current_context: Arc<RwLock<String>>,
+    /// Current active contexts (supports multi-USE)
+    current_contexts: Arc<RwLock<Vec<String>>>,
     /// Progress reporter for query status updates
     progress: ProgressHandle,
 }
@@ -82,7 +83,7 @@ impl K8sClientPool {
             kubeconfig,
             clients: Arc::new(RwLock::new(HashMap::new())),
             registries: Arc::new(RwLock::new(HashMap::new())),
-            current_context: Arc::new(RwLock::new(context_name.clone())),
+            current_contexts: Arc::new(RwLock::new(vec![context_name.clone()])),
             progress: crate::progress::create_progress_handle(),
         };
 
@@ -123,7 +124,13 @@ impl K8sClientPool {
     pub async fn get_registry(&self, context: Option<&str>) -> Result<ResourceRegistry> {
         let ctx = match context {
             Some(c) => c.to_string(),
-            None => self.current_context.read().await.clone(),
+            None => self
+                .current_contexts
+                .read()
+                .await
+                .first()
+                .cloned()
+                .ok_or_else(|| anyhow!("No current context set"))?,
         };
 
         // Ensure we have discovered resources for this context (respects TTL)
@@ -190,7 +197,13 @@ impl K8sClientPool {
     pub async fn get_client(&self, context: Option<&str>) -> Result<Client> {
         let ctx = match context {
             Some(c) => c.to_string(),
-            None => self.current_context.read().await.clone(),
+            None => self
+                .current_contexts
+                .read()
+                .await
+                .first()
+                .cloned()
+                .ok_or_else(|| anyhow!("No current context set"))?,
         };
         self.get_or_create_client(&ctx).await
     }
@@ -204,8 +217,18 @@ impl K8sClientPool {
             .collect())
     }
 
+    /// Get the first/primary current context (for backward compatibility)
     pub async fn current_context(&self) -> Result<String> {
-        Ok(self.current_context.read().await.clone())
+        let contexts = self.current_contexts.read().await;
+        contexts
+            .first()
+            .cloned()
+            .ok_or_else(|| anyhow!("No current context set"))
+    }
+
+    /// Get all current contexts (for multi-USE support)
+    pub async fn current_contexts(&self) -> Vec<String> {
+        self.current_contexts.read().await.clone()
     }
 
     /// Get the progress reporter handle for subscribing to updates
@@ -213,22 +236,107 @@ impl K8sClientPool {
         &self.progress
     }
 
-    pub async fn switch_context(&self, context: &str) -> Result<()> {
-        // Verify context exists
-        if !self.kubeconfig.contexts.iter().any(|c| c.name == context) {
-            return Err(anyhow!("Context '{}' not found", context));
+    /// Switch to one or more contexts
+    /// Supports: "context1" or "context1, context2, context3" or glob patterns like "prod-*"
+    pub async fn switch_context(&self, context_spec: &str) -> Result<()> {
+        let all_contexts: Vec<String> = self
+            .kubeconfig
+            .contexts
+            .iter()
+            .map(|c| c.name.clone())
+            .collect();
+
+        // Parse the context specification (comma-separated, with optional glob patterns)
+        let mut matched_contexts = Vec::new();
+
+        for part in context_spec.split(',') {
+            let pattern = part.trim();
+            if pattern.is_empty() {
+                continue;
+            }
+
+            // Check if it's a glob pattern
+            if pattern.contains('*') || pattern.contains('?') {
+                // Use simple glob matching
+                for ctx in &all_contexts {
+                    if Self::glob_match(pattern, ctx) {
+                        if !matched_contexts.contains(ctx) {
+                            matched_contexts.push(ctx.clone());
+                        }
+                    }
+                }
+            } else {
+                // Exact match
+                if all_contexts.contains(&pattern.to_string()) {
+                    if !matched_contexts.contains(&pattern.to_string()) {
+                        matched_contexts.push(pattern.to_string());
+                    }
+                } else {
+                    return Err(anyhow!("Context '{}' not found", pattern));
+                }
+            }
         }
 
-        // Ensure we have a client for this context
-        self.get_or_create_client(context).await?;
+        if matched_contexts.is_empty() {
+            return Err(anyhow!(
+                "No contexts matched pattern '{}'",
+                context_spec
+            ));
+        }
 
-        // Force rediscovery of resources (makes USE a way to refresh)
-        self.discover_resources_for_context(context, true).await?;
+        // Ensure we have clients and discovered resources for all contexts
+        for ctx in &matched_contexts {
+            self.get_or_create_client(ctx).await?;
+            self.discover_resources_for_context(ctx, true).await?;
+        }
 
-        // Switch current context
-        *self.current_context.write().await = context.to_string();
+        // Update current contexts
+        *self.current_contexts.write().await = matched_contexts;
 
         Ok(())
+    }
+
+    /// Simple glob pattern matching (supports * and ?)
+    fn glob_match(pattern: &str, text: &str) -> bool {
+        let mut pattern_chars = pattern.chars().peekable();
+        let mut text_chars = text.chars().peekable();
+
+        while let Some(p) = pattern_chars.next() {
+            match p {
+                '*' => {
+                    // * matches zero or more characters
+                    if pattern_chars.peek().is_none() {
+                        return true; // trailing * matches everything
+                    }
+                    // Try matching the rest of the pattern at each position
+                    let remaining_pattern: String = pattern_chars.collect();
+                    let mut remaining_text = String::new();
+                    while text_chars.peek().is_some() {
+                        remaining_text.push(text_chars.next().unwrap());
+                        let text_suffix: String = text_chars.clone().collect();
+                        if Self::glob_match(&remaining_pattern, &text_suffix) {
+                            return true;
+                        }
+                    }
+                    return Self::glob_match(&remaining_pattern, "");
+                }
+                '?' => {
+                    // ? matches exactly one character
+                    if text_chars.next().is_none() {
+                        return false;
+                    }
+                }
+                c => {
+                    // Literal character must match
+                    if text_chars.next() != Some(c) {
+                        return false;
+                    }
+                }
+            }
+        }
+
+        // Pattern exhausted - text must also be exhausted
+        text_chars.next().is_none()
     }
 
     /// Fetch resources using dynamic discovery

@@ -30,6 +30,19 @@ use crate::sql::ApiFilters;
 
 use super::convert::{json_to_record_batch, to_arrow_schema};
 
+/// Represents how clusters should be selected for a query
+#[derive(Debug, Clone)]
+enum ClusterFilter {
+    /// Use the current/default context(s)
+    Default,
+    /// Query all available clusters
+    All,
+    /// Query specific clusters (from _cluster = 'x' or _cluster IN (...))
+    Include(Vec<String>),
+    /// Query all clusters except these (from _cluster NOT IN (...))
+    Exclude(Vec<String>),
+}
+
 /// A DataFusion TableProvider that fetches data from Kubernetes
 pub struct K8sTableProvider {
     /// The resource info for this table
@@ -78,19 +91,76 @@ impl K8sTableProvider {
     }
 
     /// Extract _cluster filter from DataFusion expressions
-    fn extract_cluster_filter(&self, filters: &[Expr]) -> Option<String> {
+    /// Supports: _cluster = 'x', _cluster = '*', _cluster IN (...), _cluster NOT IN (...)
+    fn extract_cluster_filter(&self, filters: &[Expr]) -> ClusterFilter {
         for filter in filters {
+            // Handle _cluster = 'value' or _cluster = '*'
             if let Expr::BinaryExpr(binary) = filter
-                && let (Expr::Column(col), Expr::Literal(lit, _)) =
-                    (binary.left.as_ref(), binary.right.as_ref())
+                && let Expr::Column(col) = binary.left.as_ref()
                 && col.name == "_cluster"
-                && matches!(binary.op, datafusion::logical_expr::Operator::Eq)
+                && matches!(binary.op, Operator::Eq)
+                && let Expr::Literal(lit, _) = binary.right.as_ref()
                 && let datafusion::common::ScalarValue::Utf8(Some(cluster)) = lit
             {
-                return Some(cluster.clone());
+                if cluster == "*" {
+                    return ClusterFilter::All;
+                }
+                return ClusterFilter::Include(vec![cluster.clone()]);
+            }
+
+            // Handle _cluster IN ('a', 'b', 'c')
+            if let Expr::InList(in_list) = filter
+                && let Expr::Column(col) = in_list.expr.as_ref()
+                && col.name == "_cluster"
+                && !in_list.negated
+            {
+                let clusters: Vec<String> = in_list
+                    .list
+                    .iter()
+                    .filter_map(|e| {
+                        if let Expr::Literal(lit, _) = e
+                            && let datafusion::common::ScalarValue::Utf8(Some(s)) = lit
+                        {
+                            Some(s.clone())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                if !clusters.is_empty() {
+                    // Check if '*' is in the list - treat as All
+                    if clusters.iter().any(|c| c == "*") {
+                        return ClusterFilter::All;
+                    }
+                    return ClusterFilter::Include(clusters);
+                }
+            }
+
+            // Handle _cluster NOT IN ('a', 'b')
+            if let Expr::InList(in_list) = filter
+                && let Expr::Column(col) = in_list.expr.as_ref()
+                && col.name == "_cluster"
+                && in_list.negated
+            {
+                let clusters: Vec<String> = in_list
+                    .list
+                    .iter()
+                    .filter_map(|e| {
+                        if let Expr::Literal(lit, _) = e
+                            && let datafusion::common::ScalarValue::Utf8(Some(s)) = lit
+                        {
+                            Some(s.clone())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                if !clusters.is_empty() {
+                    return ClusterFilter::Exclude(clusters);
+                }
             }
         }
-        None
+        ClusterFilter::Default
     }
 
     /// Extract label selectors from DataFusion expressions
@@ -222,12 +292,20 @@ impl TableProvider for K8sTableProvider {
         // We can push down these filters to the K8s API:
         // - namespace = 'x' -> Uses namespaced API
         // - _cluster = 'x' -> Queries specific cluster
+        // - _cluster IN (...) / NOT IN (...) -> Queries specific clusters
         // - labels['key'] = 'value' -> K8s label selector (native map access via get_field)
         // - json_get_str(labels, 'key') = 'value' -> K8s label selector (legacy)
         // Other filters will be handled by DataFusion
         Ok(filters
             .iter()
             .map(|f| {
+                // Check for _cluster IN (...) or NOT IN (...)
+                if let Expr::InList(in_list) = f
+                    && let Expr::Column(col) = in_list.expr.as_ref()
+                    && col.name == "_cluster"
+                {
+                    return TableProviderFilterPushDown::Exact;
+                }
                 if let Expr::BinaryExpr(binary) = f {
                     // Check for column-based filters (namespace, _cluster)
                     if let Expr::Column(col) = binary.left.as_ref()
@@ -280,18 +358,30 @@ impl TableProvider for K8sTableProvider {
             field_selector: None, // TODO: Add field selector support for status.phase etc.
         };
 
-        // Determine which cluster(s) to query
-        let clusters: Vec<String> = if let Some(ref cf) = cluster_filter {
-            if cf == "*" {
-                // Query all clusters
-                self.pool.list_contexts().unwrap_or_default()
-            } else {
-                vec![cf.clone()]
+        // Determine which cluster(s) to query based on filter
+        let all_contexts = self.pool.list_contexts().unwrap_or_default();
+        let clusters: Vec<String> = match cluster_filter {
+            ClusterFilter::Default => {
+                // Use current context(s) from pool
+                self.pool.current_contexts().await
             }
-        } else {
-            // Use current context
-            let current = self.pool.current_context().await.unwrap_or_default();
-            vec![current]
+            ClusterFilter::All => {
+                // Query all available clusters
+                all_contexts
+            }
+            ClusterFilter::Include(list) => {
+                // Query only specified clusters (validate they exist)
+                list.into_iter()
+                    .filter(|c| all_contexts.contains(c))
+                    .collect()
+            }
+            ClusterFilter::Exclude(exclude_list) => {
+                // Query all clusters except the excluded ones
+                all_contexts
+                    .into_iter()
+                    .filter(|c| !exclude_list.contains(c))
+                    .collect()
+            }
         };
 
         // Fetch data from all clusters IN PARALLEL

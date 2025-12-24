@@ -86,7 +86,7 @@ async fn run_batch(args: &Args) -> Result<()> {
         let normalized = normalized.trim_end_matches(';');
         if normalized == "SHOW DATABASES" {
             let contexts = pool.list_contexts().unwrap_or_default();
-            let current = pool.current_context().await.unwrap_or_default();
+            let current_contexts = pool.current_contexts().await;
             let result = output::QueryResult {
                 columns: vec!["database".to_string(), "current".to_string()],
                 rows: contexts
@@ -94,7 +94,7 @@ async fn run_batch(args: &Args) -> Result<()> {
                     .map(|ctx| {
                         vec![
                             ctx.clone(),
-                            if *ctx == current {
+                            if current_contexts.contains(ctx) {
                                 "*".to_string()
                             } else {
                                 String::new()

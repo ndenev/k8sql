@@ -572,8 +572,8 @@ fn print_help() {
         cmd_style.apply_to("DESCRIBE <table>")
     );
     println!(
-        "  {}  - Switch to a different cluster",
-        cmd_style.apply_to("USE <cluster>")
+        "  {}  - Switch to cluster(s): USE prod, USE prod-*, USE c1, c2, c3",
+        cmd_style.apply_to("USE <pattern>")
     );
     println!();
     println!("{}", help_style.apply_to("Examples:"));
@@ -692,11 +692,20 @@ pub async fn run_repl(mut session: K8sSessionContext, pool: Arc<K8sClientPool>) 
 
                 // Handle USE command specially (requires context switch)
                 if is_use_command {
-                    let context_name = input.trim()[4..].trim();
-                    if let Err(e) = pool.switch_context(context_name).await {
+                    let context_spec = input.trim()[4..].trim().trim_end_matches(';');
+                    if let Err(e) = pool.switch_context(context_spec).await {
                         println!("{} {}", style("Error:").red().bold(), style(e).red());
                     } else {
-                        println!("Switched to context: {}", style(context_name).cyan());
+                        let contexts = pool.current_contexts().await;
+                        if contexts.len() == 1 {
+                            println!("Switched to context: {}", style(&contexts[0]).cyan());
+                        } else {
+                            println!(
+                                "Switched to {} contexts: {}",
+                                style(contexts.len()).cyan(),
+                                style(contexts.join(", ")).cyan()
+                            );
+                        }
                         // Refresh tables after context switch
                         if let Err(e) = session.refresh_tables().await {
                             println!("{} {}", style("Warning:").yellow(), style(e).yellow());
@@ -715,7 +724,7 @@ pub async fn run_repl(mut session: K8sSessionContext, pool: Arc<K8sClientPool>) 
                 // Handle SHOW DATABASES specially (list Kubernetes contexts)
                 if lower.trim().trim_end_matches(';') == "show databases" {
                     let contexts = pool.list_contexts().unwrap_or_default();
-                    let current = pool.current_context().await.unwrap_or_default();
+                    let current_contexts = pool.current_contexts().await;
                     let result = QueryResult {
                         columns: vec!["database".to_string(), "current".to_string()],
                         rows: contexts
@@ -723,7 +732,7 @@ pub async fn run_repl(mut session: K8sSessionContext, pool: Arc<K8sClientPool>) 
                             .map(|ctx| {
                                 vec![
                                     ctx.clone(),
-                                    if ctx == &current {
+                                    if current_contexts.contains(ctx) {
                                         "*".to_string()
                                     } else {
                                         String::new()
