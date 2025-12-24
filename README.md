@@ -42,11 +42,16 @@ SELECT * FROM pods WHERE _cluster = 'prod-cluster'
 -- Query multiple specific clusters
 SELECT * FROM pods WHERE _cluster IN ('prod', 'staging')
 
+-- Exclude problematic clusters
+SELECT * FROM pods WHERE _cluster NOT IN ('broken-cluster', 'dev-old')
+
 -- Query ALL clusters in your kubeconfig
 SELECT * FROM pods WHERE _cluster = '*'
 ```
 
 The `'*'` wildcard is a special value that expands to all available kubectl contexts, executing parallel queries across all clusters.
+
+All cluster filters (`=`, `IN`, `NOT IN`) are pushed down to the query planner, so only the specified clusters are actually queried.
 
 ### Querying Nested JSON Fields
 
@@ -419,6 +424,8 @@ k8sql optimizes queries by pushing predicates to the Kubernetes API when possibl
 | `labels['app'] = 'nginx'` | Same as above (bracket notation) |
 | `labels.app = 'x' AND labels.env = 'y'` | Combined label selector: `app=x,env=y` |
 | `_cluster = 'prod'` | Only queries that cluster |
+| `_cluster IN ('a', 'b')` | Only queries specified clusters |
+| `_cluster NOT IN ('x')` | Queries all except specified clusters |
 | `_cluster = '*'` | Queries all clusters in parallel |
 | `namespace LIKE '%'` | Queries all, filters client-side |
 | `json_get_str(...)` | Client-side JSON parsing |
@@ -437,14 +444,42 @@ k8sql -v -q "SELECT name FROM pods WHERE labels.app = 'nginx' AND namespace = 'd
 
 ```
 SHOW TABLES          - List available tables
-SHOW DATABASES       - List kubectl contexts
+SHOW DATABASES       - List kubectl contexts (active ones marked with *)
 DESCRIBE <table>     - Show table schema
-USE <cluster>        - Switch to cluster
+USE <cluster>        - Switch to cluster(s) - see below
 \dt                  - Shortcut for SHOW TABLES
 \l                   - Shortcut for SHOW DATABASES
 \d <table>           - Shortcut for DESCRIBE
+\x                   - Toggle expanded display mode
 \q                   - Quit
 ```
+
+### Multi-Cluster USE
+
+The `USE` command supports multiple clusters and glob patterns:
+
+```sql
+-- Single cluster (traditional)
+USE prod-us;
+
+-- Multiple clusters (comma-separated)
+USE prod-us, prod-eu, staging;
+
+-- Glob patterns
+USE prod-*;           -- matches prod-us, prod-eu, prod-asia, etc.
+USE *-staging;        -- matches app-staging, db-staging, etc.
+USE prod-?;           -- matches prod-1, prod-2, etc. (? = single char)
+
+-- Combine patterns and explicit names
+USE prod-*, staging;
+```
+
+After `USE`, queries without a `_cluster` filter will run against all active contexts. `SHOW DATABASES` displays all active contexts marked with `*`.
+
+This is useful for:
+- Excluding problematic clusters that always timeout
+- Working with a subset of your many clusters
+- Quickly switching between environment sets (all prod, all staging, etc.)
 
 ## Daemon Mode
 
