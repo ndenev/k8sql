@@ -25,15 +25,13 @@ Performance is our second priority - still very important.
 
 ## Project Overview
 
-k8sql exposes the Kubernetes API as a SQL-compatible database. kubectl contexts are treated as databases (switchable with `USE cluster1;`) and Kubernetes resources are exposed as tables. The `_cluster` column is part of every table's primary key, enabling cross-cluster queries.
+k8sql exposes the Kubernetes API as a SQL-compatible database using Apache DataFusion as the query engine. kubectl contexts are treated as databases (switchable with `USE cluster1;`) and Kubernetes resources are exposed as tables. The `_cluster` column is part of every table's primary key, enabling cross-cluster queries.
 
 ## Build Commands
 
 ```bash
 cargo build              # Debug build
 cargo build --release    # Release build
-cargo run                # Run in interactive REPL mode
-cargo run -- -q "..."    # Run batch query
 cargo test               # Run all tests
 ```
 
@@ -45,7 +43,7 @@ k8sql
 
 # Batch mode - single query
 k8sql -q "SELECT * FROM pods"
-k8sql -q "SELECT name, status.phase FROM pods WHERE namespace = 'kube-system'"
+k8sql -q "SELECT name, json_get_str(status, 'phase') as phase FROM pods WHERE namespace = 'kube-system'"
 
 # Multi-cluster queries
 k8sql -q "SELECT * FROM pods WHERE _cluster = 'prod'"
@@ -53,9 +51,6 @@ k8sql -q "SELECT * FROM pods WHERE _cluster = '*'"  # All clusters
 
 # Batch mode with context and output format
 k8sql -c prod-cluster -q "SELECT * FROM deployments" -o json
-
-# Execute queries from file
-k8sql -f queries.sql
 
 # Daemon mode (PostgreSQL wire protocol)
 k8sql daemon --port 15432
@@ -65,122 +60,117 @@ k8sql daemon --port 15432
 
 ```
 src/
-├── main.rs              # Entry point, CLI argument parsing, mode dispatch
+├── main.rs                    # Entry point, CLI argument parsing, mode dispatch
 ├── cli/
 │   ├── mod.rs
-│   ├── args.rs          # Clap argument definitions
-│   └── repl.rs          # Rustyline REPL with completion/highlighting
-├── sql/
+│   ├── args.rs                # Clap argument definitions
+│   └── repl.rs                # Rustyline REPL with completion/highlighting
+├── datafusion_integration/
 │   ├── mod.rs
-│   ├── parser.rs        # SQL parsing with sqlparser (PostgreSQL dialect)
-│   ├── ast.rs           # Internal query representation (TableRef, ColumnRef, etc.)
-│   ├── planner.rs       # Query planner - optimizes predicates for K8s API
-│   └── executor.rs      # Query execution using QueryPlan
+│   ├── context.rs             # K8sSessionContext - DataFusion session setup
+│   ├── provider.rs            # K8sTableProvider - TableProvider implementation
+│   ├── convert.rs             # JSON to Arrow RecordBatch conversion
+│   └── hooks.rs               # Query hooks for filter extraction
 ├── kubernetes/
 │   ├── mod.rs
-│   ├── client.rs        # K8sClientPool - multi-cluster connection caching
-│   └── discovery.rs     # Dynamic resource discovery and schema generation
+│   ├── client.rs              # K8sClientPool - multi-cluster connection caching
+│   └── discovery.rs           # Dynamic resource discovery and schema generation
+├── sql/
+│   └── mod.rs                 # ApiFilters type for filter pushdown
 ├── output/
-│   └── mod.rs           # QueryResult type and format dispatch (table/json/csv/yaml)
+│   ├── mod.rs                 # QueryResult type and format dispatch
+│   ├── table.rs               # Pretty table output
+│   ├── json.rs                # JSON output
+│   ├── csv.rs                 # CSV output
+│   └── yaml.rs                # YAML output
 └── daemon/
     ├── mod.rs
-    └── pgwire_server.rs # PostgreSQL wire protocol server
+    └── pgwire_server.rs       # PostgreSQL wire protocol server
 ```
 
 ## Key Components
 
-### Query Planner (`src/sql/planner.rs`)
+### DataFusion Integration (`src/datafusion_integration/`)
 
-The query planner analyzes WHERE clauses and determines:
-- **ClusterScope**: Which clusters to query (Current, Specific, All)
-- **NamespaceScope**: Which namespaces (All or Specific)
-- **ApiFilters**: Label/field selectors to push to K8s API
-- **ClientFilters**: Conditions to apply client-side after fetch
+k8sql uses Apache DataFusion as its SQL query engine:
 
-```rust
-pub struct QueryPlan {
-    pub cluster_scope: ClusterScope,
-    pub namespace_scope: NamespaceScope,
-    pub api_filters: ApiFilters,      // Pushed to K8s API
-    pub client_filters: ClientFilters, // Applied in executor
-    pub table: String,
-}
-```
+- **K8sSessionContext** (`context.rs`): Wraps DataFusion's SessionContext, registers all K8s resources as tables, and provides JSON functions for querying nested fields.
+
+- **K8sTableProvider** (`provider.rs`): Implements DataFusion's TableProvider trait. Fetches data from Kubernetes API on scan, pushes namespace and cluster filters.
+
+- **JSON to Arrow conversion** (`convert.rs`): Converts K8s JSON resources to Arrow RecordBatches for DataFusion processing.
+
+### Resource Discovery (`src/kubernetes/discovery.rs`)
+
+Dynamic resource discovery at startup:
+- Discovers all available resources including CRDs
+- Generates consistent schema: `_cluster`, `api_version`, `kind`, metadata fields, `spec`/`status` as JSON
+- Special schemas for ConfigMaps, Secrets, Events, and metrics resources
+- Core resources (v1, apps, batch, etc.) take priority over conflicting names from other API groups
 
 ### K8sClientPool (`src/kubernetes/client.rs`)
 
 Manages connections to multiple Kubernetes clusters:
 - Caches clients by context name
+- Caches resource registries with TTL
 - Supports parallel queries across clusters
-- Passes ApiFilters (label/field selectors) to ListParams
 
 ## Key Dependencies
 
-- **sqlparser**: SQL parsing with PostgreSQL dialect
+- **datafusion**: SQL query engine (Apache Arrow-based)
+- **datafusion-functions-json**: JSON querying functions (`json_get_str`, `json_get_int`, etc.)
+- **datafusion-postgres**: PostgreSQL wire protocol for daemon mode
 - **kube**: Kubernetes client (kube-rs)
 - **k8s-openapi**: Kubernetes API type definitions (v1.32)
-- **pgwire**: PostgreSQL wire protocol (for daemon mode)
 - **rustyline**: REPL with readline support
-- **indicatif**: Progress spinners
-- **comfy-table**: Pretty table output
-- **console**: Terminal colors
+- **clap**: CLI argument parsing
 
-## Supported Resources (Tables)
+## Table Schema
 
-| Table | Aliases | Scope | Primary Key |
-|-------|---------|-------|-------------|
-| pods | pod | Namespace | (_cluster, namespace, name) |
-| services | service, svc | Namespace | (_cluster, namespace, name) |
-| deployments | deployment, deploy | Namespace | (_cluster, namespace, name) |
-| configmaps | configmap, cm | Namespace | (_cluster, namespace, name) |
-| secrets | secret | Namespace | (_cluster, namespace, name) |
-| ingresses | ingress, ing | Namespace | (_cluster, namespace, name) |
-| jobs | job | Namespace | (_cluster, namespace, name) |
-| cronjobs | cronjob, cj | Namespace | (_cluster, namespace, name) |
-| statefulsets | statefulset, sts | Namespace | (_cluster, namespace, name) |
-| daemonsets | daemonset, ds | Namespace | (_cluster, namespace, name) |
-| pvcs | pvc, persistentvolumeclaim | Namespace | (_cluster, namespace, name) |
-| nodes | node | Cluster | (_cluster, name) |
-| namespaces | namespace, ns | Cluster | (_cluster, name) |
-| pvs | pv, persistentvolume | Cluster | (_cluster, name) |
+All resources share a consistent schema:
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `_cluster` | text | Kubernetes context name |
+| `api_version` | text | API version (v1, apps/v1, etc.) |
+| `kind` | text | Resource kind (Pod, Deployment, etc.) |
+| `name` | text | Resource name |
+| `namespace` | text | Namespace (null for cluster-scoped) |
+| `uid` | text | Unique identifier |
+| `created` | timestamp | Creation timestamp |
+| `labels` | json | Resource labels |
+| `annotations` | json | Resource annotations |
+| `spec` | json | Resource specification |
+| `status` | json | Resource status |
+
+Special cases:
+- **ConfigMaps/Secrets**: `data` column instead of spec/status
+- **Events**: `type`, `reason`, `message`, `count`, etc.
+- **PodMetrics/NodeMetrics**: `timestamp`, `window`, `containers`/`usage`
 
 ## Query Optimization
 
-The planner pushes these predicates to the K8s API:
+Currently pushed to K8s API:
 
 | SQL Condition | K8s API Optimization |
 |---------------|---------------------|
-| `namespace = 'x'` | `Api::namespaced("x")` |
-| `labels.app = 'nginx'` | `ListParams::labels("app=nginx")` |
-| `status.phase = 'Running'` | `ListParams::fields("status.phase=Running")` |
-| `_cluster = 'prod'` | Only query that cluster |
+| `namespace = 'x'` | Uses namespaced API |
+| `_cluster = 'prod'` | Only queries that cluster |
+| `_cluster = '*'` | Queries all clusters in parallel |
 
-These remain client-side:
-- `namespace LIKE '%'`
-- `name LIKE 'foo%'`
+Handled client-side by DataFusion:
+- All JSON field access (`json_get_str(status, 'phase')`)
+- LIKE patterns
 - Complex expressions
-
-## Development Status
-
-See PLAN.md for detailed roadmap. Current status:
-- Phase 1: Core SQL Engine ✓
-- Phase 2: Interactive REPL ✓
-- Phase 3: Batch Mode ✓
-- Phase 4: Multi-cluster support ✓
-- Phase 5: Query Planner ✓
-- Phase 6: Daemon Mode ✓ (simple query protocol)
-- Dynamic Resource Discovery ✓ (CRDs auto-discovered)
+- ORDER BY, LIMIT
 
 ## REPL Controls
 
-- **Enter**: Execute query
-- **Ctrl+D**: Quit
-- **Ctrl+C**: Cancel current input
 - **Tab**: Auto-complete keywords/tables/columns
 - **↑/↓**: Navigate history
-- **help**: Show available commands
+- **Ctrl+D**: Quit
 - **\dt**: SHOW TABLES
 - **\l**: SHOW DATABASES
 - **\d table**: DESCRIBE table
-- **\x**: Toggle expanded display (for viewing long field values)
+- **\x**: Toggle expanded display
 - **\q**: Quit
