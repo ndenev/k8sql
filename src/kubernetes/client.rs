@@ -224,10 +224,27 @@ impl K8sClientPool {
 
         // Fetch and convert to JSON values
         let list = api.list(&list_params).await?;
+
+        // Build apiVersion string (e.g., "v1", "apps/v1", "cert-manager.io/v1")
+        let api_version = if resource_info.group.is_empty() {
+            resource_info.version.clone()
+        } else {
+            format!("{}/{}", resource_info.group, resource_info.version)
+        };
+        let kind = &resource_info.api_resource.kind;
+
         let values: Vec<serde_json::Value> = list
             .items
             .into_iter()
-            .map(|item| serde_json::to_value(item).unwrap_or(serde_json::Value::Null))
+            .map(|item| {
+                let mut value = serde_json::to_value(item).unwrap_or(serde_json::Value::Null);
+                // Inject apiVersion and kind (K8s list API doesn't include these per-item)
+                if let serde_json::Value::Object(ref mut map) = value {
+                    map.insert("apiVersion".to_string(), serde_json::Value::String(api_version.clone()));
+                    map.insert("kind".to_string(), serde_json::Value::String(kind.clone()));
+                }
+                value
+            })
             .collect();
 
         Ok(values)

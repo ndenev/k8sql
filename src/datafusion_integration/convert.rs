@@ -98,42 +98,17 @@ fn get_nested_value(value: &serde_json::Value, path: &str) -> serde_json::Value 
     current.clone()
 }
 
-/// Format a JSON value as a string for display
+/// Format a JSON value as a string for storage/display
+/// Arrays and objects are kept as JSON strings to enable JSON function queries
 fn format_json_value(value: &serde_json::Value) -> String {
     match value {
         serde_json::Value::Null => String::new(),
         serde_json::Value::Bool(b) => b.to_string(),
         serde_json::Value::Number(n) => n.to_string(),
         serde_json::Value::String(s) => s.clone(),
-        serde_json::Value::Array(arr) => {
-            // Format arrays as comma-separated values or JSON
-            if arr.iter().all(|v| v.is_string()) {
-                arr.iter()
-                    .filter_map(|v| v.as_str())
-                    .collect::<Vec<_>>()
-                    .join(",")
-            } else {
-                serde_json::to_string(arr).unwrap_or_default()
-            }
-        }
-        serde_json::Value::Object(obj) => {
-            // Format objects as key=value pairs or JSON
-            let simple: Vec<String> = obj
-                .iter()
-                .filter_map(|(k, v)| {
-                    if let serde_json::Value::String(s) = v {
-                        Some(format!("{}={}", k, s))
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-
-            if simple.len() == obj.len() {
-                simple.join(",")
-            } else {
-                serde_json::to_string(obj).unwrap_or_default()
-            }
+        // Keep arrays and objects as JSON strings for JSON function compatibility
+        serde_json::Value::Array(_) | serde_json::Value::Object(_) => {
+            serde_json::to_string(value).unwrap_or_default()
         }
     }
 }

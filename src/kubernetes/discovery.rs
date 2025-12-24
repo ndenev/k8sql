@@ -13,10 +13,13 @@ use std::collections::HashMap;
 
 /// Column definition for schema
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct ColumnDef {
     pub name: String,
+    /// SQL type (text, jsonb, timestamp, integer) - reserved for future typed schema
     pub data_type: String,
     pub json_path: Option<String>,
+    /// Human-readable description - reserved for enhanced DESCRIBE output
     pub description: String,
 }
 
@@ -76,7 +79,49 @@ impl ResourceRegistry {
     }
 
     /// Add a resource to the registry
-    pub fn add(&mut self, info: ResourceInfo) {
+    /// Core resources (from CORE_RESOURCES) take priority for the primary table name
+    /// Non-core resources with conflicting names are registered under their Kind name
+    pub fn add(&mut self, mut info: ResourceInfo) {
+        let original_table_name = info.table_name.clone();
+
+        // Check if this table already exists
+        if let Some(existing) = self.by_table_name.get(&original_table_name) {
+            if existing.is_core && !info.is_core {
+                // Core exists, rename incoming non-core to its Kind name
+                let kind_name = info.api_resource.kind.to_lowercase();
+                if self.by_table_name.contains_key(&kind_name) {
+                    return; // Kind name also conflicts, skip
+                }
+                info.table_name = kind_name;
+                info.aliases = vec![];
+            } else if !existing.is_core && info.is_core {
+                // Non-core exists, core is arriving - move non-core to Kind name first
+                let existing_owned = existing.clone();
+                let kind_name = existing_owned.api_resource.kind.to_lowercase();
+
+                if !self.by_table_name.contains_key(&kind_name) {
+                    // Re-register existing non-core under its Kind name
+                    let mut renamed = existing_owned;
+                    renamed.table_name = kind_name.clone();
+                    renamed.aliases = vec![];
+
+                    self.alias_map.insert(kind_name.clone(), kind_name.clone());
+                    self.by_table_name.insert(kind_name, renamed);
+                }
+                // Remove the old entry's alias mapping (will be replaced by core)
+                // Core will be added normally below
+            } else if !existing.is_core && !info.is_core {
+                // Both non-core with same name - rename incoming to Kind name
+                let kind_name = info.api_resource.kind.to_lowercase();
+                if self.by_table_name.contains_key(&kind_name) {
+                    return;
+                }
+                info.table_name = kind_name;
+                info.aliases = vec![];
+            }
+            // If both are core (shouldn't happen), later one wins
+        }
+
         // Add aliases
         for alias in &info.aliases {
             self.alias_map.insert(alias.clone(), info.table_name.clone());
@@ -156,10 +201,22 @@ pub async fn discover_resources(client: &Client) -> Result<ResourceRegistry> {
             let table_name = ar.plural.to_lowercase();
 
             // Check if this is a core resource we know about
-            let (is_core, aliases) = if let Some(known_aliases) = core_names.get(table_name.as_str()) {
-                (true, known_aliases.iter().map(|s| s.to_string()).collect())
+            // A resource is only "core" if its name matches AND it's from a standard K8s API group
+            let is_standard_group = matches!(
+                ar.group.as_str(),
+                "" | "apps" | "batch" | "networking.k8s.io" | "policy" | "rbac.authorization.k8s.io"
+                | "storage.k8s.io" | "autoscaling" | "coordination.k8s.io"
+            );
+            let (is_core, aliases) = if is_standard_group {
+                if let Some(known_aliases) = core_names.get(table_name.as_str()) {
+                    (true, known_aliases.iter().map(|s| s.to_string()).collect())
+                } else {
+                    // Standard group but not in our known list - not core
+                    let aliases = vec![ar.kind.to_lowercase()];
+                    (false, aliases)
+                }
             } else {
-                // For discovered resources, use kind as alias
+                // Non-standard group (CRDs, metrics, etc.) - never core
                 let aliases = vec![ar.kind.to_lowercase()];
                 (false, aliases)
             };
@@ -191,6 +248,19 @@ pub fn generate_schema(info: &ResourceInfo) -> Vec<ColumnDef> {
             data_type: "text".to_string(),
             json_path: None,
             description: "Kubernetes context/cluster name".to_string(),
+        },
+        // API version and kind - self-describing columns for CRD safety
+        ColumnDef {
+            name: "api_version".to_string(),
+            data_type: "text".to_string(),
+            json_path: Some("apiVersion".to_string()),
+            description: "API version (e.g., v1, apps/v1, cert-manager.io/v1)".to_string(),
+        },
+        ColumnDef {
+            name: "kind".to_string(),
+            data_type: "text".to_string(),
+            json_path: Some("kind".to_string()),
+            description: "Resource kind (e.g., Pod, Deployment, Certificate)".to_string(),
         },
         // Common metadata columns
         ColumnDef {
@@ -306,6 +376,52 @@ pub fn generate_schema(info: &ResourceInfo) -> Vec<ColumnDef> {
                     data_type: "jsonb".to_string(),
                     json_path: Some("source".to_string()),
                     description: "Component that generated the event".to_string(),
+                },
+            ]);
+        }
+        "podmetrics" => {
+            // PodMetrics from metrics.k8s.io - has containers with CPU/memory usage
+            columns.extend(vec![
+                ColumnDef {
+                    name: "timestamp".to_string(),
+                    data_type: "timestamp".to_string(),
+                    json_path: Some("timestamp".to_string()),
+                    description: "Time when metrics were collected".to_string(),
+                },
+                ColumnDef {
+                    name: "window".to_string(),
+                    data_type: "text".to_string(),
+                    json_path: Some("window".to_string()),
+                    description: "Time window of the metrics sample".to_string(),
+                },
+                ColumnDef {
+                    name: "containers".to_string(),
+                    data_type: "jsonb".to_string(),
+                    json_path: Some("containers".to_string()),
+                    description: "Container metrics (cpu, memory usage per container)".to_string(),
+                },
+            ]);
+        }
+        "nodemetrics" => {
+            // NodeMetrics from metrics.k8s.io - has node-level CPU/memory usage
+            columns.extend(vec![
+                ColumnDef {
+                    name: "timestamp".to_string(),
+                    data_type: "timestamp".to_string(),
+                    json_path: Some("timestamp".to_string()),
+                    description: "Time when metrics were collected".to_string(),
+                },
+                ColumnDef {
+                    name: "window".to_string(),
+                    data_type: "text".to_string(),
+                    json_path: Some("window".to_string()),
+                    description: "Time window of the metrics sample".to_string(),
+                },
+                ColumnDef {
+                    name: "usage".to_string(),
+                    data_type: "jsonb".to_string(),
+                    json_path: Some("usage".to_string()),
+                    description: "Node resource usage (cpu, memory)".to_string(),
                 },
             ]);
         }

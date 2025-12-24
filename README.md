@@ -122,11 +122,11 @@ SELECT * FROM pods WHERE labels.app = 'nginx' AND labels.env = 'prod'
 -- All pods in current context
 SELECT * FROM pods
 
--- Specific columns
-SELECT name, namespace, phase, node FROM pods
+-- Specific columns including API version and kind
+SELECT api_version, kind, name, namespace FROM pods LIMIT 10
 
 -- With ordering and limit
-SELECT name, namespace, phase FROM pods ORDER BY name LIMIT 10
+SELECT name, namespace, json_get_str(status, 'phase') as phase FROM pods ORDER BY name LIMIT 10
 
 -- Descending order
 SELECT name, created FROM pods ORDER BY created DESC
@@ -219,6 +219,8 @@ All Kubernetes resources are exposed with a consistent schema:
 | Column | Type | Description |
 |--------|------|-------------|
 | `_cluster` | text | Kubernetes context/cluster name |
+| `api_version` | text | API version (e.g., `v1`, `apps/v1`, `cert-manager.io/v1`) |
+| `kind` | text | Resource kind (e.g., `Pod`, `Deployment`, `Certificate`) |
 | `name` | text | Resource name |
 | `namespace` | text | Namespace (null for cluster-scoped resources) |
 | `uid` | text | Unique identifier |
@@ -228,11 +230,67 @@ All Kubernetes resources are exposed with a consistent schema:
 | `spec` | json | Resource specification (desired state) |
 | `status` | json | Resource status (current state) |
 
+The `api_version` and `kind` columns are self-describing - they identify exactly what type of resource each row represents. This is especially useful when querying CRDs across multiple clusters that might have different versions installed.
+
 Special cases:
 - **ConfigMaps/Secrets**: Have `data` column instead of spec/status
 - **Events**: Have dedicated columns for `type`, `reason`, `message`, `count`, etc.
+- **PodMetrics/NodeMetrics**: Have `timestamp`, `window`, and `containers`/`usage` columns (see below)
 
 Use `DESCRIBE <table>` to see the exact schema for any resource.
+
+## Metrics Tables
+
+If the Kubernetes metrics-server is installed, k8sql exposes pod and node metrics:
+
+| Table | Description |
+|-------|-------------|
+| `podmetrics` | CPU/memory usage per pod (from `metrics.k8s.io`) |
+| `nodemetrics` | CPU/memory usage per node (from `metrics.k8s.io`) |
+
+### PodMetrics Schema
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `name` | text | Pod name |
+| `namespace` | text | Namespace |
+| `timestamp` | timestamp | When metrics were collected |
+| `window` | text | Measurement time window |
+| `containers` | json | Array of container metrics |
+
+### NodeMetrics Schema
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `name` | text | Node name |
+| `timestamp` | timestamp | When metrics were collected |
+| `window` | text | Measurement time window |
+| `usage` | json | Node resource usage (cpu, memory) |
+
+### Metrics Query Examples
+
+```sql
+-- Pod CPU and memory usage
+SELECT name, namespace,
+       json_get_str(containers, 0, 'usage', 'cpu') as cpu,
+       json_get_str(containers, 0, 'usage', 'memory') as memory
+FROM podmetrics
+
+-- Node resource usage
+SELECT name,
+       json_get_str(usage, 'cpu') as cpu,
+       json_get_str(usage, 'memory') as memory
+FROM nodemetrics
+
+-- Find pods using most memory (note: values are strings like "123456Ki")
+SELECT name, namespace,
+       json_get_str(containers, 0, 'usage', 'memory') as memory
+FROM podmetrics
+ORDER BY memory DESC
+LIMIT 10
+```
+
+Note: CPU values are in nanocores (e.g., `"2083086n"` = ~2 millicores), memory in kibibytes (e.g., `"44344Ki"`).
 
 ## Supported Resources
 
@@ -256,6 +314,8 @@ Common resources with aliases:
 | nodes | node | Cluster |
 | namespaces | namespace, ns | Cluster |
 | persistentvolumes | pv | Cluster |
+| podmetrics | - | Namespaced |
+| nodemetrics | - | Cluster |
 
 CRDs are automatically discovered and available using their plural name (e.g., `certificates`, `issuers` for cert-manager).
 
