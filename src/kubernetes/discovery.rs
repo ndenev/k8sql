@@ -223,7 +223,11 @@ pub fn build_core_registry() -> ResourceRegistry {
     add_resource!(Event, namespaced, ["event", "ev"]);
     add_resource!(ServiceAccount, namespaced, ["serviceaccount", "sa"]);
     add_resource!(Endpoints, namespaced, ["endpoint", "ep"]);
-    add_resource!(PersistentVolumeClaim, namespaced, ["persistentvolumeclaim", "pvc"]);
+    add_resource!(
+        PersistentVolumeClaim,
+        namespaced,
+        ["persistentvolumeclaim", "pvc"]
+    );
     add_resource!(ResourceQuota, namespaced, ["resourcequota", "quota"]);
     add_resource!(LimitRange, namespaced, ["limitrange", "limits"]);
 
@@ -247,10 +251,18 @@ pub fn build_core_registry() -> ResourceRegistry {
     add_resource!(NetworkPolicy, namespaced, ["networkpolicy", "netpol"]);
 
     // Autoscaling API (autoscaling/v2)
-    add_resource!(HorizontalPodAutoscaler, namespaced, ["horizontalpodautoscaler", "hpa"]);
+    add_resource!(
+        HorizontalPodAutoscaler,
+        namespaced,
+        ["horizontalpodautoscaler", "hpa"]
+    );
 
     // Policy API (policy/v1)
-    add_resource!(PodDisruptionBudget, namespaced, ["poddisruptionbudget", "pdb"]);
+    add_resource!(
+        PodDisruptionBudget,
+        namespaced,
+        ["poddisruptionbudget", "pdb"]
+    );
 
     // Storage API (storage.k8s.io/v1) - cluster-scoped
     add_resource!(StorageClass, cluster, ["storageclass", "sc"]);
@@ -273,7 +285,9 @@ pub fn build_core_registry() -> ResourceRegistry {
 ///
 /// Note: This function queries the discovery API which can be slow with many clusters.
 /// For fast startup, use `build_core_registry()` which provides instant access to core K8s resources.
-pub async fn discover_resources(client: &Client) -> Result<(ResourceRegistry, Vec<(String, String)>)> {
+pub async fn discover_resources(
+    client: &Client,
+) -> Result<(ResourceRegistry, Vec<(String, String)>)> {
     use futures::future::join_all;
     use kube::discovery::oneshot;
 

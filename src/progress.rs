@@ -154,3 +154,135 @@ pub type ProgressHandle = Arc<ProgressReporter>;
 pub fn create_progress_handle() -> ProgressHandle {
     Arc::new(ProgressReporter::new())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_progress_reporter_new() {
+        let reporter = ProgressReporter::new();
+        assert_eq!(reporter.progress(), (0, 0));
+    }
+
+    #[test]
+    fn test_progress_reporter_default() {
+        let reporter = ProgressReporter::default();
+        assert_eq!(reporter.progress(), (0, 0));
+    }
+
+    #[test]
+    fn test_start_query() {
+        let reporter = ProgressReporter::new();
+        reporter.start_query("pods", 3);
+
+        assert_eq!(reporter.progress(), (0, 3));
+    }
+
+    #[test]
+    fn test_cluster_complete_increments() {
+        let reporter = ProgressReporter::new();
+        reporter.start_query("pods", 3);
+
+        reporter.cluster_complete("cluster-1", 10, 100);
+        assert_eq!(reporter.progress(), (1, 3));
+
+        reporter.cluster_complete("cluster-2", 20, 150);
+        assert_eq!(reporter.progress(), (2, 3));
+
+        reporter.cluster_complete("cluster-3", 15, 200);
+        assert_eq!(reporter.progress(), (3, 3));
+    }
+
+    #[test]
+    fn test_subscribe_receives_updates() {
+        let reporter = ProgressReporter::new();
+        let mut receiver = reporter.subscribe();
+
+        reporter.start_query("pods", 2);
+
+        // Check we received the update
+        let update = receiver.try_recv().unwrap();
+        match update {
+            ProgressUpdate::StartingQuery {
+                table,
+                cluster_count,
+            } => {
+                assert_eq!(table, "pods");
+                assert_eq!(cluster_count, 2);
+            }
+            _ => panic!("Expected StartingQuery update"),
+        }
+    }
+
+    #[test]
+    fn test_multiple_updates() {
+        let reporter = ProgressReporter::new();
+        let mut receiver = reporter.subscribe();
+
+        // Send various updates
+        reporter.connecting("cluster-1");
+        reporter.connected("cluster-1", 50);
+        reporter.discovering("cluster-1");
+        reporter.discovery_complete("cluster-1", 100, 200);
+        reporter.registering_tables(100);
+        reporter.start_query("pods", 1);
+        reporter.cluster_complete("cluster-1", 25, 100);
+        reporter.query_complete(25, 150);
+
+        // Verify all updates were received
+        let updates: Vec<_> = std::iter::from_fn(|| receiver.try_recv().ok()).collect();
+        assert_eq!(updates.len(), 8);
+
+        // Check types of updates
+        assert!(matches!(updates[0], ProgressUpdate::Connecting { .. }));
+        assert!(matches!(updates[1], ProgressUpdate::Connected { .. }));
+        assert!(matches!(updates[2], ProgressUpdate::Discovering { .. }));
+        assert!(matches!(
+            updates[3],
+            ProgressUpdate::DiscoveryComplete { .. }
+        ));
+        assert!(matches!(
+            updates[4],
+            ProgressUpdate::RegisteringTables { .. }
+        ));
+        assert!(matches!(updates[5], ProgressUpdate::StartingQuery { .. }));
+        assert!(matches!(updates[6], ProgressUpdate::ClusterComplete { .. }));
+        assert!(matches!(updates[7], ProgressUpdate::QueryComplete { .. }));
+    }
+
+    #[test]
+    fn test_create_progress_handle() {
+        let handle = create_progress_handle();
+        assert_eq!(handle.progress(), (0, 0));
+    }
+
+    #[test]
+    fn test_start_query_resets_counters() {
+        let reporter = ProgressReporter::new();
+
+        // First query
+        reporter.start_query("pods", 3);
+        reporter.cluster_complete("c1", 10, 100);
+        reporter.cluster_complete("c2", 10, 100);
+        assert_eq!(reporter.progress(), (2, 3));
+
+        // Start a new query - should reset
+        reporter.start_query("deployments", 2);
+        assert_eq!(reporter.progress(), (0, 2));
+    }
+
+    #[test]
+    fn test_progress_update_clone_and_debug() {
+        // Verify Clone and Debug traits work
+        let update = ProgressUpdate::StartingQuery {
+            table: "pods".to_string(),
+            cluster_count: 3,
+        };
+
+        let cloned = update.clone();
+        let debug_str = format!("{:?}", cloned);
+        assert!(debug_str.contains("StartingQuery"));
+        assert!(debug_str.contains("pods"));
+    }
+}

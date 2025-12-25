@@ -156,10 +156,7 @@ mod tests {
     fn test_json_arrow_precedence_less_than() {
         let sql = "SELECT * FROM pods WHERE spec->>'replicas' > 1";
         let result = preprocess_sql(sql);
-        assert_eq!(
-            result,
-            "SELECT * FROM pods WHERE (spec->>'replicas') > 1"
-        );
+        assert_eq!(result, "SELECT * FROM pods WHERE (spec->>'replicas') > 1");
     }
 
     #[test]

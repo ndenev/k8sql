@@ -197,7 +197,10 @@ impl K8sClientPool {
 
         if crd_groups.is_empty() {
             // No CRD groups, just save cluster groups and return
-            if let Err(e) = self.resource_cache.save_cluster_groups(context, &api_groups) {
+            if let Err(e) = self
+                .resource_cache
+                .save_cluster_groups(context, &api_groups)
+            {
                 warn!(context = %context, error = %e, "Failed to save cluster groups");
             }
             return Ok(0);
@@ -237,7 +240,10 @@ impl K8sClientPool {
                     resources.iter().map(CachedResourceInfo::from).collect();
 
                 // Save to cache
-                if let Err(e) = self.resource_cache.save_group(group, version, &cached_resources) {
+                if let Err(e) = self
+                    .resource_cache
+                    .save_group(group, version, &cached_resources)
+                {
                     warn!(
                         context = %context,
                         group = %group,
@@ -263,12 +269,19 @@ impl K8sClientPool {
         };
 
         // Step 5: Save cluster groups list for next time
-        if let Err(e) = self.resource_cache.save_cluster_groups(context, &api_groups) {
+        if let Err(e) = self
+            .resource_cache
+            .save_cluster_groups(context, &api_groups)
+        {
             warn!(context = %context, error = %e, "Failed to save cluster groups");
         }
 
         // Total CRD count
-        let crd_count = cached_groups.iter().map(|g| g.resources.len()).sum::<usize>() + discovered_count;
+        let crd_count = cached_groups
+            .iter()
+            .map(|g| g.resources.len())
+            .sum::<usize>()
+            + discovered_count;
 
         Ok(crd_count)
     }
@@ -331,7 +344,10 @@ impl K8sClientPool {
         }
 
         // Save cluster groups list
-        if let Err(e) = self.resource_cache.save_cluster_groups(context, &crd_groups) {
+        if let Err(e) = self
+            .resource_cache
+            .save_cluster_groups(context, &crd_groups)
+        {
             warn!(context = %context, error = %e, "Failed to save cluster groups");
         }
 

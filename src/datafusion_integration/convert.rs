@@ -162,6 +162,7 @@ fn format_json_value(value: &serde_json::Value) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use datafusion::arrow::array::Array;
 
     #[test]
     fn test_get_nested_value() {
@@ -187,5 +188,228 @@ mod tests {
             get_nested_value(&json, "nonexistent"),
             serde_json::Value::Null
         );
+    }
+
+    #[test]
+    fn test_get_nested_value_array_index() {
+        let json = serde_json::json!({
+            "containers": [
+                {"name": "nginx", "image": "nginx:latest"},
+                {"name": "sidecar", "image": "sidecar:v1"}
+            ]
+        });
+
+        // Access array by index
+        let first_container = get_nested_value(&json, "containers.0");
+        assert_eq!(first_container["name"], "nginx");
+
+        let second_name = get_nested_value(&json, "containers.1.name");
+        assert_eq!(second_name, "sidecar");
+
+        // Out of bounds returns null
+        let oob = get_nested_value(&json, "containers.10");
+        assert_eq!(oob, serde_json::Value::Null);
+
+        // Non-numeric index on array returns null
+        let invalid = get_nested_value(&json, "containers.invalid");
+        assert_eq!(invalid, serde_json::Value::Null);
+    }
+
+    #[test]
+    fn test_get_nested_value_deeply_nested() {
+        let json = serde_json::json!({
+            "spec": {
+                "containers": [
+                    {
+                        "resources": {
+                            "limits": {
+                                "cpu": "100m",
+                                "memory": "128Mi"
+                            }
+                        }
+                    }
+                ]
+            }
+        });
+
+        let cpu = get_nested_value(&json, "spec.containers.0.resources.limits.cpu");
+        assert_eq!(cpu, "100m");
+    }
+
+    #[test]
+    fn test_get_nested_value_primitive_path() {
+        // Trying to navigate into a primitive value
+        let json = serde_json::json!({
+            "name": "test"
+        });
+
+        let result = get_nested_value(&json, "name.nested");
+        assert_eq!(result, serde_json::Value::Null);
+    }
+
+    #[test]
+    fn test_format_json_value_null() {
+        assert_eq!(format_json_value(&serde_json::Value::Null), None);
+    }
+
+    #[test]
+    fn test_format_json_value_bool() {
+        assert_eq!(
+            format_json_value(&serde_json::json!(true)),
+            Some("true".to_string())
+        );
+        assert_eq!(
+            format_json_value(&serde_json::json!(false)),
+            Some("false".to_string())
+        );
+    }
+
+    #[test]
+    fn test_format_json_value_number() {
+        assert_eq!(
+            format_json_value(&serde_json::json!(42)),
+            Some("42".to_string())
+        );
+        assert_eq!(
+            format_json_value(&serde_json::json!(3.14)),
+            Some("3.14".to_string())
+        );
+    }
+
+    #[test]
+    fn test_format_json_value_string() {
+        assert_eq!(
+            format_json_value(&serde_json::json!("hello")),
+            Some("hello".to_string())
+        );
+    }
+
+    #[test]
+    fn test_format_json_value_object() {
+        let obj = serde_json::json!({"key": "value"});
+        let result = format_json_value(&obj).unwrap();
+        // Should be valid JSON string
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["key"], "value");
+    }
+
+    #[test]
+    fn test_format_json_value_array() {
+        let arr = serde_json::json!([1, 2, 3]);
+        let result = format_json_value(&arr).unwrap();
+        // Should be valid JSON string
+        let parsed: Vec<i32> = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn test_to_arrow_schema() {
+        let columns = vec![
+            ColumnDef {
+                name: "_cluster".to_string(),
+                data_type: "text".to_string(),
+                json_path: None,
+                description: "Cluster name".to_string(),
+            },
+            ColumnDef {
+                name: "name".to_string(),
+                data_type: "text".to_string(),
+                json_path: Some("metadata.name".to_string()),
+                description: "Resource name".to_string(),
+            },
+            ColumnDef {
+                name: "namespace".to_string(),
+                data_type: "text".to_string(),
+                json_path: Some("metadata.namespace".to_string()),
+                description: "Namespace".to_string(),
+            },
+        ];
+
+        let schema = to_arrow_schema(&columns);
+        assert_eq!(schema.fields().len(), 3);
+        assert_eq!(schema.field(0).name(), "_cluster");
+        assert_eq!(schema.field(1).name(), "name");
+        assert_eq!(schema.field(2).name(), "namespace");
+        // All should be Utf8
+        assert_eq!(schema.field(0).data_type(), &DataType::Utf8);
+        assert_eq!(schema.field(1).data_type(), &DataType::Utf8);
+        assert_eq!(schema.field(2).data_type(), &DataType::Utf8);
+    }
+
+    #[test]
+    fn test_extract_field_value_with_json_path() {
+        let resource = serde_json::json!({
+            "metadata": {
+                "name": "nginx-pod"
+            }
+        });
+
+        let result = extract_field_value(&resource, "name", Some("metadata.name"));
+        assert_eq!(result, Some("nginx-pod".to_string()));
+    }
+
+    #[test]
+    fn test_extract_field_value_without_json_path() {
+        let resource = serde_json::json!({
+            "name": "direct-name"
+        });
+
+        let result = extract_field_value(&resource, "name", None);
+        assert_eq!(result, Some("direct-name".to_string()));
+    }
+
+    #[test]
+    fn test_extract_field_value_missing() {
+        let resource = serde_json::json!({});
+
+        let result = extract_field_value(&resource, "name", Some("metadata.name"));
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_build_cluster_column() {
+        let (array, field) = build_cluster_column("test-cluster", 3).unwrap();
+
+        assert_eq!(field.name(), "_cluster");
+        assert_eq!(field.data_type(), &DataType::Utf8);
+
+        let string_array = array
+            .as_any()
+            .downcast_ref::<datafusion::arrow::array::StringArray>()
+            .unwrap();
+        assert_eq!(string_array.len(), 3);
+        assert_eq!(string_array.value(0), "test-cluster");
+        assert_eq!(string_array.value(1), "test-cluster");
+        assert_eq!(string_array.value(2), "test-cluster");
+    }
+
+    #[test]
+    fn test_build_string_column() {
+        let col = ColumnDef {
+            name: "name".to_string(),
+            data_type: "text".to_string(),
+            json_path: Some("metadata.name".to_string()),
+            description: "Resource name".to_string(),
+        };
+
+        let resources = vec![
+            serde_json::json!({"metadata": {"name": "nginx"}}),
+            serde_json::json!({"metadata": {"name": "redis"}}),
+            serde_json::json!({"metadata": {}}), // missing name
+        ];
+
+        let (array, field) = build_string_column(&col, &resources).unwrap();
+
+        assert_eq!(field.name(), "name");
+        assert_eq!(field.data_type(), &DataType::Utf8);
+
+        let string_array = array
+            .as_any()
+            .downcast_ref::<datafusion::arrow::array::StringArray>()
+            .unwrap();
+        assert_eq!(string_array.len(), 3);
+        assert_eq!(string_array.value(0), "nginx");
+        assert_eq!(string_array.value(1), "redis");
+        assert!(string_array.is_null(2)); // missing value should be null
     }
 }

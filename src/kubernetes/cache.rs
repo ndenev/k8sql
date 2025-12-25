@@ -159,7 +159,13 @@ pub fn group_cache_key(group: &str, version: &str) -> String {
     } else {
         group
             .chars()
-            .map(|c| if c.is_alphanumeric() || c == '-' { c } else { '_' })
+            .map(|c| {
+                if c.is_alphanumeric() || c == '-' {
+                    c
+                } else {
+                    '_'
+                }
+            })
             .collect()
     };
     format!("{}_{}", safe_group, version)
@@ -216,7 +222,13 @@ impl ResourceCache {
     fn cluster_path(&self, cluster: &str) -> PathBuf {
         let safe_name: String = cluster
             .chars()
-            .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+            .map(|c| {
+                if c.is_alphanumeric() || c == '-' || c == '_' {
+                    c
+                } else {
+                    '_'
+                }
+            })
             .collect();
         self.clusters_dir().join(format!("{}.json", safe_name))
     }
@@ -309,12 +321,17 @@ impl ResourceCache {
     }
 
     /// Save a single API group's resources
-    pub fn save_group(&self, group: &str, version: &str, resources: &[CachedResourceInfo]) -> Result<()> {
+    pub fn save_group(
+        &self,
+        group: &str,
+        version: &str,
+        resources: &[CachedResourceInfo],
+    ) -> Result<()> {
         self.ensure_dirs()?;
 
         let cached = CachedGroup::new(group.to_string(), version.to_string(), resources.to_vec());
-        let content = serde_json::to_string_pretty(&cached)
-            .context("Failed to serialize group cache")?;
+        let content =
+            serde_json::to_string_pretty(&cached).context("Failed to serialize group cache")?;
 
         let path = self.group_path(group, version);
         std::fs::write(&path, content)
@@ -506,7 +523,11 @@ mod tests {
         let group = CachedGroup::new(
             "cert-manager.io".to_string(),
             "v1".to_string(),
-            vec![sample_cached_resource("Certificate", "cert-manager.io", "v1")],
+            vec![sample_cached_resource(
+                "Certificate",
+                "cert-manager.io",
+                "v1",
+            )],
         );
 
         // Should be fresh with default TTL
@@ -573,10 +594,18 @@ mod tests {
 
         // Save some groups
         cache
-            .save_group("apps", "v1", &[sample_cached_resource("Deployment", "apps", "v1")])
+            .save_group(
+                "apps",
+                "v1",
+                &[sample_cached_resource("Deployment", "apps", "v1")],
+            )
             .unwrap();
         cache
-            .save_group("batch", "v1", &[sample_cached_resource("Job", "batch", "v1")])
+            .save_group(
+                "batch",
+                "v1",
+                &[sample_cached_resource("Job", "batch", "v1")],
+            )
             .unwrap();
 
         // Check groups - all should be cached
@@ -597,7 +626,11 @@ mod tests {
 
         // Save only one group
         cache
-            .save_group("apps", "v1", &[sample_cached_resource("Deployment", "apps", "v1")])
+            .save_group(
+                "apps",
+                "v1",
+                &[sample_cached_resource("Deployment", "apps", "v1")],
+            )
             .unwrap();
 
         // Check groups - one cached, one missing
@@ -658,7 +691,11 @@ mod tests {
             .save_cluster_groups("cluster1", &[("apps".to_string(), "v1".to_string())])
             .unwrap();
         cache
-            .save_group("apps", "v1", &[sample_cached_resource("Deployment", "apps", "v1")])
+            .save_group(
+                "apps",
+                "v1",
+                &[sample_cached_resource("Deployment", "apps", "v1")],
+            )
             .unwrap();
 
         // Clear all

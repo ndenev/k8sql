@@ -70,3 +70,91 @@ impl TableFormatter {
         format!("{}\n({} rows)", output, result.rows.len())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_truncate_value_short() {
+        let short = "hello";
+        let result = truncate_value(short, 10);
+        assert_eq!(result, "hello");
+        // Should be borrowed, not owned
+        assert!(matches!(result, Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn test_truncate_value_exact_length() {
+        let exact = "1234567890";
+        let result = truncate_value(exact, 10);
+        assert_eq!(result, "1234567890");
+        assert!(matches!(result, Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn test_truncate_value_too_long() {
+        let long = "this is a very long string that needs truncation";
+        let result = truncate_value(long, 20);
+        // Should be 17 chars + "..." = 20 total
+        assert!(result.ends_with("..."));
+        assert!(result.chars().count() <= 20);
+        assert!(matches!(result, Cow::Owned(_)));
+    }
+
+    #[test]
+    fn test_truncate_value_unicode() {
+        // Unicode characters should be counted as single chars, not bytes
+        let unicode = "日本語テストです長い文字列";
+        let result = truncate_value(unicode, 8);
+        assert!(result.chars().count() <= 8);
+        assert!(result.ends_with("..."));
+    }
+
+    #[test]
+    fn test_truncate_spec_column() {
+        let result = QueryResult {
+            columns: vec!["name".to_string(), "spec".to_string()],
+            rows: vec![vec![
+                "nginx".to_string(),
+                // 80 char spec - should be truncated to 60
+                "a".repeat(80),
+            ]],
+        };
+
+        let output = TableFormatter::format(&result, false);
+        // The output should NOT contain the full 80 char string
+        assert!(!output.contains(&"a".repeat(80)));
+        // Should contain truncated version with ...
+        assert!(output.contains("..."));
+    }
+
+    #[test]
+    fn test_no_truncate_normal_column() {
+        let result = QueryResult {
+            columns: vec!["name".to_string(), "uid".to_string()],
+            rows: vec![vec![
+                "nginx".to_string(),
+                // 80 char uid - should NOT be truncated (not a WIDE_COLUMN)
+                "a".repeat(80),
+            ]],
+        };
+
+        let output = TableFormatter::format(&result, false);
+        // The full string should be present
+        assert!(output.contains(&"a".repeat(80)));
+    }
+
+    #[test]
+    fn test_wide_columns_list() {
+        // Verify all expected columns are in WIDE_COLUMNS
+        assert!(WIDE_COLUMNS.contains(&"spec"));
+        assert!(WIDE_COLUMNS.contains(&"status"));
+        assert!(WIDE_COLUMNS.contains(&"labels"));
+        assert!(WIDE_COLUMNS.contains(&"annotations"));
+        assert!(WIDE_COLUMNS.contains(&"data"));
+        // And some that shouldn't be
+        assert!(!WIDE_COLUMNS.contains(&"name"));
+        assert!(!WIDE_COLUMNS.contains(&"namespace"));
+    }
+}

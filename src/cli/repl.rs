@@ -814,10 +814,7 @@ pub async fn run_repl(mut session: K8sSessionContext, pool: Arc<K8sClientPool>) 
                     match pool.refresh_tables().await {
                         Ok(count) => {
                             spinner.finish_and_clear();
-                            println!(
-                                "{}",
-                                style(format!("Refreshed {} tables", count)).green()
-                            );
+                            println!("{}", style(format!("Refreshed {} tables", count)).green());
                         }
                         Err(e) => {
                             spinner.finish_and_clear();
