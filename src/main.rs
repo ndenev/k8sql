@@ -13,11 +13,79 @@ mod sql;
 use anyhow::Result;
 use clap::Parser;
 use std::sync::Arc;
+use tracing_subscriber::prelude::*;
 
 use cli::{Args, Command};
 use daemon::PgWireServer;
 use datafusion_integration::K8sSessionContext;
 use kubernetes::K8sClientPool;
+
+/// Initialize logging with file output and optional stderr
+fn init_logging(verbose: bool, to_stderr: bool) {
+    use tracing_rolling_file::{RollingConditionBase, RollingFileAppenderBase};
+    use tracing_subscriber::fmt::format::FmtSpan;
+
+    // Create log directory
+    let log_dir = config::base_dir()
+        .map(|p| p.join("log"))
+        .unwrap_or_else(|_| std::path::PathBuf::from("."));
+
+    if let Err(e) = std::fs::create_dir_all(&log_dir) {
+        eprintln!("Warning: Could not create log directory: {}", e);
+        return;
+    }
+
+    // File appender with size-based rotation:
+    // - Max 10MB per file
+    // - Keep up to 5 files (total max ~50MB)
+    // - Also rotate daily
+    let log_path = log_dir.join("k8sql.log");
+    let condition = RollingConditionBase::new()
+        .daily()
+        .max_size(10 * 1024 * 1024); // 10MB
+
+    let file_appender = match RollingFileAppenderBase::new(log_path, condition, 5) {
+        Ok(appender) => appender,
+        Err(e) => {
+            eprintln!("Warning: Could not create log file: {}", e);
+            return;
+        }
+    };
+
+    // Use non-blocking writer for better performance
+    let (non_blocking, _guard) = file_appender.get_non_blocking_appender();
+    // Leak the guard to keep the background writer alive
+    std::mem::forget(_guard);
+
+    let filter = if verbose { "k8sql=debug" } else { "k8sql=info" };
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(filter));
+
+    // File layer (always enabled)
+    let file_layer = tracing_subscriber::fmt::layer()
+        .with_writer(non_blocking)
+        .with_ansi(false)
+        .with_span_events(FmtSpan::NONE);
+
+    if to_stderr && verbose {
+        // Both file and stderr output
+        let stderr_layer = tracing_subscriber::fmt::layer()
+            .with_writer(std::io::stderr)
+            .with_span_events(FmtSpan::NONE);
+
+        tracing_subscriber::registry()
+            .with(env_filter)
+            .with(file_layer)
+            .with(stderr_layer)
+            .init();
+    } else {
+        // File only
+        tracing_subscriber::registry()
+            .with(env_filter)
+            .with(file_layer)
+            .init();
+    }
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -28,12 +96,11 @@ async fn main() -> Result<()> {
 
     let args = Args::parse();
 
-    // Initialize logging (only for non-interactive modes to avoid TUI interference)
-    if args.verbose && (args.query.is_some() || args.file.is_some()) {
-        tracing_subscriber::fmt()
-            .with_env_filter("k8sql=debug")
-            .init();
-    }
+    // Initialize logging
+    // - Always log to file (~/.k8sql/log/k8sql.log)
+    // - For batch mode with -v, also log to stderr
+    let is_batch = args.query.is_some() || args.file.is_some();
+    init_logging(args.verbose, is_batch && args.verbose);
 
     // Handle subcommands
     if let Some(cmd) = &args.command {
@@ -42,11 +109,6 @@ async fn main() -> Result<()> {
                 run_interactive(&args).await?;
             }
             Command::Daemon { port, bind } => {
-                if args.verbose {
-                    tracing_subscriber::fmt()
-                        .with_env_filter("k8sql=debug")
-                        .init();
-                }
                 let server = PgWireServer::new(*port, bind.clone());
                 server.run().await?;
             }

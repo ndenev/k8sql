@@ -295,8 +295,17 @@ pub async fn discover_resources(
     let mut api_groups: Vec<(String, String)> = Vec::new();
 
     // Step 1: Get all API groups (single API call)
+    let t0 = std::time::Instant::now();
     let core_groups = client.list_core_api_versions().await?;
+    tracing::debug!("list_core_api_versions: {:?}", t0.elapsed());
+
+    let t1 = std::time::Instant::now();
     let api_group_list = client.list_api_groups().await?;
+    tracing::debug!(
+        "list_api_groups: {:?} ({} groups)",
+        t1.elapsed(),
+        api_group_list.groups.len()
+    );
 
     // Collect all (group, version) pairs for fingerprinting
     // Core API (v1)
@@ -343,12 +352,15 @@ pub async fn discover_resources(
         .collect();
     group_names.push(""); // Core API
 
+    let t2 = std::time::Instant::now();
+    let num_groups = group_names.len();
     let futures: Vec<_> = group_names
         .iter()
         .map(|&group_name| {
             let client = client.clone();
             let group = group_name.to_string();
             async move {
+                let t = std::time::Instant::now();
                 let result = if group.is_empty() {
                     // Core API - use pinned_kind for well-known resources
                     // or we can use the Discovery approach
@@ -356,15 +368,28 @@ pub async fn discover_resources(
                 } else {
                     oneshot::group(&client, &group).await
                 };
-                (group, result)
+                let elapsed = t.elapsed();
+                (group, result, elapsed)
             }
         })
         .collect();
 
     let results = join_all(futures).await;
+    tracing::debug!("oneshot::group x{}: {:?} total", num_groups, t2.elapsed());
+
+    // Log slowest groups
+    let mut timings: Vec<_> = results.iter().map(|(g, _, t)| (g.as_str(), *t)).collect();
+    timings.sort_by(|a, b| b.1.cmp(&a.1));
+    for (group, elapsed) in timings.iter().take(5) {
+        tracing::debug!(
+            "  slowest: {} {:?}",
+            if group.is_empty() { "core" } else { group },
+            elapsed
+        );
+    }
 
     // Process results
-    for (group_name, result) in results {
+    for (group_name, result, _elapsed) in results {
         let group = match result {
             Ok(g) => g,
             Err(e) => {
@@ -421,13 +446,21 @@ pub async fn get_api_groups(client: &Client) -> Result<Vec<(String, String)>> {
     let mut api_groups: Vec<(String, String)> = Vec::new();
 
     // Core API (v1)
+    let t0 = std::time::Instant::now();
     let core_groups = client.list_core_api_versions().await?;
+    tracing::debug!("get_api_groups: list_core_api_versions {:?}", t0.elapsed());
     for version in &core_groups.versions {
         api_groups.push(("".to_string(), version.clone()));
     }
 
     // Other API groups
+    let t1 = std::time::Instant::now();
     let api_group_list = client.list_api_groups().await?;
+    tracing::debug!(
+        "get_api_groups: list_api_groups {:?} ({} groups)",
+        t1.elapsed(),
+        api_group_list.groups.len()
+    );
     for group in &api_group_list.groups {
         if let Some(pref) = group.preferred_version.as_ref() {
             api_groups.push((group.name.clone(), pref.version.clone()));
@@ -448,6 +481,8 @@ pub async fn discover_groups(
     use futures::future::join_all;
     use kube::discovery::oneshot;
 
+    let t0 = std::time::Instant::now();
+    let num_groups = groups.len();
     let futures: Vec<_> = groups
         .iter()
         .map(|(group_name, version)| {
@@ -455,18 +490,30 @@ pub async fn discover_groups(
             let group = group_name.clone();
             let ver = version.clone();
             async move {
+                let t = std::time::Instant::now();
                 let result = oneshot::group(&client, &group).await;
-                ((group, ver), result)
+                ((group, ver), result, t.elapsed())
             }
         })
         .collect();
 
     let results = join_all(futures).await;
+    tracing::debug!("discover_groups x{}: {:?} total", num_groups, t0.elapsed());
+
+    // Log slowest groups
+    let mut timings: Vec<_> = results
+        .iter()
+        .map(|((g, _), _, t)| (g.as_str(), *t))
+        .collect();
+    timings.sort_by(|a, b| b.1.cmp(&a.1));
+    for (group, elapsed) in timings.iter().take(5) {
+        tracing::debug!("  slowest: {} {:?}", group, elapsed);
+    }
 
     let mut discovered: std::collections::HashMap<(String, String), Vec<ResourceInfo>> =
         std::collections::HashMap::new();
 
-    for ((group_name, version), result) in results {
+    for ((group_name, version), result, _elapsed) in results {
         let group = match result {
             Ok(g) => g,
             Err(e) => {

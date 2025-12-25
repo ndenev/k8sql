@@ -45,6 +45,7 @@ anyhow = "1"
 # Logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-rolling-file = { version = "0.1", features = ["non-blocking"] }
 
 # Futures
 futures = "0.3"
