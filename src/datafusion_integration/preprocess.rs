@@ -24,26 +24,29 @@ static ANNOTATION_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
 /// Preprocess SQL to convert k8sql-specific syntax to standard SQL
 ///
 /// Transformations:
-/// - `labels.app = 'nginx'` -> `labels['app'] = 'nginx'` (native Map access)
-/// - `annotations.key = 'value'` -> `annotations['key'] = 'value'`
+/// - `labels.app = 'nginx'` -> `json_get_str(labels, 'app') = 'nginx'`
+/// - `annotations.key = 'value'` -> `json_get_str(annotations, 'key') = 'value'`
 ///
-/// This allows dot-notation access while using DataFusion's native Map operations.
-/// The TableProvider can detect these patterns for K8s API pushdown.
+/// This allows dot-notation access while using DataFusion's JSON functions.
+/// The TableProvider can detect json_get_str patterns for K8s API label selector pushdown.
 pub fn preprocess_sql(sql: &str) -> String {
-    // Replace labels.key patterns with native map access labels['key']
+    // Replace labels.key patterns with json_get_str(labels, 'key')
     let result = LABEL_PATTERN.replace_all(sql, |caps: &regex::Captures| {
         let key = &caps[1];
         let operator = &caps[2];
         let value = &caps[3];
-        format!("labels['{}'] {} {}", key, operator, value)
+        format!("json_get_str(labels, '{}') {} {}", key, operator, value)
     });
 
-    // Replace annotations.key patterns with native map access
+    // Replace annotations.key patterns with json_get_str(annotations, 'key')
     let result = ANNOTATION_PATTERN.replace_all(&result, |caps: &regex::Captures| {
         let key = &caps[1];
         let operator = &caps[2];
         let value = &caps[3];
-        format!("annotations['{}'] {} {}", key, operator, value)
+        format!(
+            "json_get_str(annotations, '{}') {} {}",
+            key, operator, value
+        )
     });
 
     result.into_owned()
@@ -57,14 +60,20 @@ mod tests {
     fn test_label_equality() {
         let sql = "SELECT * FROM pods WHERE labels.app = 'nginx'";
         let result = preprocess_sql(sql);
-        assert_eq!(result, "SELECT * FROM pods WHERE labels['app'] = 'nginx'");
+        assert_eq!(
+            result,
+            "SELECT * FROM pods WHERE json_get_str(labels, 'app') = 'nginx'"
+        );
     }
 
     #[test]
     fn test_label_inequality() {
         let sql = "SELECT * FROM pods WHERE labels.env != 'prod'";
         let result = preprocess_sql(sql);
-        assert_eq!(result, "SELECT * FROM pods WHERE labels['env'] != 'prod'");
+        assert_eq!(
+            result,
+            "SELECT * FROM pods WHERE json_get_str(labels, 'env') != 'prod'"
+        );
     }
 
     #[test]
@@ -73,7 +82,7 @@ mod tests {
         let result = preprocess_sql(sql);
         assert_eq!(
             result,
-            "SELECT * FROM pods WHERE labels['app'] = 'nginx' AND labels['env'] = 'prod'"
+            "SELECT * FROM pods WHERE json_get_str(labels, 'app') = 'nginx' AND json_get_str(labels, 'env') = 'prod'"
         );
     }
 
@@ -83,7 +92,7 @@ mod tests {
         let result = preprocess_sql(sql);
         assert_eq!(
             result,
-            "SELECT * FROM pods WHERE labels['app.kubernetes.io/name'] = 'test'"
+            "SELECT * FROM pods WHERE json_get_str(labels, 'app.kubernetes.io/name') = 'test'"
         );
     }
 
@@ -93,7 +102,7 @@ mod tests {
         let result = preprocess_sql(sql);
         assert_eq!(
             result,
-            "SELECT * FROM pods WHERE annotations['key'] = 'value'"
+            "SELECT * FROM pods WHERE json_get_str(annotations, 'key') = 'value'"
         );
     }
 

@@ -70,7 +70,7 @@ src/
 │   ├── context.rs             # K8sSessionContext - DataFusion session setup
 │   ├── provider.rs            # K8sTableProvider - TableProvider implementation
 │   ├── convert.rs             # JSON to Arrow RecordBatch conversion
-│   ├── preprocess.rs          # SQL preprocessing (labels.x → labels['x'])
+│   ├── preprocess.rs          # SQL preprocessing (labels.x → json_get_str)
 │   └── hooks.rs               # Query hooks for filter extraction
 ├── kubernetes/
 │   ├── mod.rs
@@ -99,9 +99,9 @@ k8sql uses Apache DataFusion as its SQL query engine:
 
 - **K8sTableProvider** (`provider.rs`): Implements DataFusion's TableProvider trait. Fetches data from Kubernetes API on scan, extracts and pushes filters (namespace, cluster, label selectors) to the API.
 
-- **JSON to Arrow conversion** (`convert.rs`): Converts K8s JSON resources to Arrow RecordBatches. Labels/annotations use native `Map<Utf8, Utf8>` type for efficient access.
+- **JSON to Arrow conversion** (`convert.rs`): Converts K8s JSON resources to Arrow RecordBatches. All columns are UTF8 strings; labels/annotations are stored as JSON strings for pgwire compatibility.
 
-- **SQL Preprocessing** (`preprocess.rs`): Transforms `labels.key` syntax to `labels['key']` for native map access before DataFusion parsing.
+- **SQL Preprocessing** (`preprocess.rs`): Transforms `labels.key` syntax to `json_get_str(labels, 'key')` before DataFusion parsing. This enables both user-friendly dot notation and K8s API label selector pushdown.
 
 ### Resource Discovery (`src/kubernetes/discovery.rs`)
 
@@ -141,8 +141,8 @@ All resources share a consistent schema:
 | `namespace` | text | Namespace (null for cluster-scoped) |
 | `uid` | text | Unique identifier |
 | `created` | timestamp | Creation timestamp |
-| `labels` | Map<Utf8, Utf8> | Native map, access with `labels['key']` |
-| `annotations` | Map<Utf8, Utf8> | Native map, access with `annotations['key']` |
+| `labels` | text (JSON) | JSON object, access with `json_get_str(labels, 'key')` or `labels.key` |
+| `annotations` | text (JSON) | JSON object, access with `json_get_str(annotations, 'key')` or `annotations.key` |
 | `spec` | json (Utf8) | Resource specification (JSON string) |
 | `status` | json (Utf8) | Resource status (JSON string) |
 
@@ -158,8 +158,8 @@ Special cases:
 | SQL Condition | K8s API Optimization |
 |---------------|---------------------|
 | `namespace = 'x'` | Uses namespaced API |
-| `labels.app = 'nginx'` | K8s label selector |
-| `labels['app'] = 'nginx'` | Same (bracket notation) |
+| `labels.app = 'nginx'` | K8s label selector (preprocessed to json_get_str) |
+| `json_get_str(labels, 'app') = 'nginx'` | Same (explicit JSON access) |
 | `labels.app = 'x' AND labels.env = 'y'` | Combined: `app=x,env=y` |
 | `_cluster = 'prod'` | Only queries that cluster |
 | `_cluster = '*'` | Queries all clusters in parallel |
@@ -173,10 +173,10 @@ Special cases:
 ### SQL Preprocessing (`src/datafusion_integration/preprocess.rs`)
 
 Transforms k8sql syntax to DataFusion-compatible SQL:
-- `labels.app = 'value'` → `labels['app'] = 'value'` (native map access)
-- `annotations.key = 'value'` → `annotations['key'] = 'value'`
+- `labels.app = 'value'` → `json_get_str(labels, 'app') = 'value'`
+- `annotations.key = 'value'` → `json_get_str(annotations, 'key') = 'value'`
 
-This enables dot-notation while using DataFusion's native Map operations.
+This enables user-friendly dot-notation while using DataFusion's JSON functions. The TableProvider recognizes `json_get_str(labels, 'key')` patterns for K8s label selector pushdown.
 
 ### JSON Array Access
 

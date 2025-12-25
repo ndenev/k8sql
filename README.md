@@ -112,11 +112,11 @@ The function syntax supports chaining multiple keys and array indices in a singl
 
 ### Labels and Annotations
 
-Labels and annotations are stored as native Map types, enabling efficient access with bracket notation:
+Labels and annotations are stored as JSON strings, accessible via `json_get_str()` or convenient dot notation:
 
 ```sql
 -- Access a specific label
-SELECT name, labels['app'] as app FROM pods
+SELECT name, json_get_str(labels, 'app') as app FROM pods
 
 -- Filter by label (pushed to K8s API as label selector)
 SELECT * FROM pods WHERE labels.app = 'nginx'
@@ -125,14 +125,14 @@ SELECT * FROM pods WHERE labels.app = 'nginx'
 SELECT * FROM pods WHERE labels.app = 'nginx' AND labels.env = 'prod'
 
 -- Access annotations
-SELECT name, annotations['kubectl.kubernetes.io/last-applied-configuration'] as config
+SELECT name, json_get_str(annotations, 'kubectl.kubernetes.io/last-applied-configuration') as config
 FROM deployments
 
 -- Labels with special characters (dots, slashes)
 SELECT * FROM pods WHERE labels.app.kubernetes.io/name = 'cert-manager'
 ```
 
-The `labels.key = 'value'` syntax is automatically converted to native map access and pushed to the Kubernetes API as a label selector for efficient server-side filtering.
+The `labels.key = 'value'` syntax is automatically converted to `json_get_str(labels, 'key')` and pushed to the Kubernetes API as a label selector for efficient server-side filtering.
 
 ### Working with Arrays (UNNEST)
 
@@ -319,8 +319,8 @@ All Kubernetes resources are exposed with a consistent schema:
 | `namespace` | text | Namespace (null for cluster-scoped resources) |
 | `uid` | text | Unique identifier |
 | `created` | timestamp | Creation timestamp |
-| `labels` | Map<Utf8, Utf8> | Resource labels (access with `labels['key']`) |
-| `annotations` | Map<Utf8, Utf8> | Resource annotations (access with `annotations['key']`) |
+| `labels` | text (JSON) | Resource labels (access with `labels.key` or `json_get_str(labels, 'key')`) |
+| `annotations` | text (JSON) | Resource annotations (access with `annotations.key` or `json_get_str`) |
 | `spec` | json | Resource specification (desired state) |
 | `status` | json | Resource status (current state) |
 
@@ -421,7 +421,7 @@ k8sql optimizes queries by pushing predicates to the Kubernetes API when possibl
 |-----------|--------------|
 | `namespace = 'x'` | Uses `Api::namespaced()` - only fetches from that namespace |
 | `labels.app = 'nginx'` | K8s label selector - server-side filtering |
-| `labels['app'] = 'nginx'` | Same as above (bracket notation) |
+| `json_get_str(labels, 'app') = 'nginx'` | Same as above (explicit JSON access) |
 | `labels.app = 'x' AND labels.env = 'y'` | Combined label selector: `app=x,env=y` |
 | `_cluster = 'prod'` | Only queries that cluster |
 | `_cluster IN ('a', 'b')` | Only queries specified clusters |

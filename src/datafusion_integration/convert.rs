@@ -101,8 +101,10 @@ fn build_string_column(
     let mut builder = StringBuilder::new();
 
     for resource in resources {
-        let value = extract_field_value(resource, &col.name, col.json_path.as_deref());
-        builder.append_value(&value);
+        match extract_field_value(resource, &col.name, col.json_path.as_deref()) {
+            Some(value) => builder.append_value(&value),
+            None => builder.append_null(),
+        }
     }
 
     let array = Arc::new(builder.finish()) as ArrayRef;
@@ -111,11 +113,12 @@ fn build_string_column(
 }
 
 /// Extract a field value from a JSON resource
+/// Returns None for null/missing values to preserve SQL NULL semantics
 fn extract_field_value(
     resource: &serde_json::Value,
     field_name: &str,
     json_path: Option<&str>,
-) -> String {
+) -> Option<String> {
     let path = json_path.unwrap_or(field_name);
     let value = get_nested_value(resource, path);
     format_json_value(&value)
@@ -143,14 +146,15 @@ fn get_nested_value(value: &serde_json::Value, path: &str) -> serde_json::Value 
 }
 
 /// Format a JSON value as a string for storage/display
-fn format_json_value(value: &serde_json::Value) -> String {
+/// Returns None for null values to preserve SQL NULL semantics
+fn format_json_value(value: &serde_json::Value) -> Option<String> {
     match value {
-        serde_json::Value::Null => String::new(),
-        serde_json::Value::Bool(b) => b.to_string(),
-        serde_json::Value::Number(n) => n.to_string(),
-        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Null => None,
+        serde_json::Value::Bool(b) => Some(b.to_string()),
+        serde_json::Value::Number(n) => Some(n.to_string()),
+        serde_json::Value::String(s) => Some(s.clone()),
         serde_json::Value::Array(_) | serde_json::Value::Object(_) => {
-            serde_json::to_string(value).unwrap_or_default()
+            Some(serde_json::to_string(value).unwrap_or_default())
         }
     }
 }

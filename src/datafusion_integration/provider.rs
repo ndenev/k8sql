@@ -179,13 +179,13 @@ impl K8sTableProvider {
                 self.collect_label_selectors(&binary.left, selectors);
                 self.collect_label_selectors(&binary.right, selectors);
             }
-            // Handle equality: labels['key'] = 'value'
+            // Handle equality: json_get_str(labels, 'key') = 'value'
             Expr::BinaryExpr(binary) if binary.op == Operator::Eq => {
                 if let Some(selector) = self.extract_label_selector(binary, "=") {
                     selectors.push(selector);
                 }
             }
-            // Handle inequality: labels['key'] != 'value'
+            // Handle inequality: json_get_str(labels, 'key') != 'value'
             Expr::BinaryExpr(binary) if binary.op == Operator::NotEq => {
                 if let Some(selector) = self.extract_label_selector(binary, "!=") {
                     selectors.push(selector);
