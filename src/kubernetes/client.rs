@@ -63,7 +63,9 @@ pub struct K8sClientPool {
 }
 
 impl K8sClientPool {
-    pub async fn new(context: Option<&str>, _namespace: &str) -> Result<Self> {
+    /// Create a new client pool without connecting (fast, no I/O)
+    /// Call `initialize()` after subscribing to progress events
+    pub fn new(context: Option<&str>, _namespace: &str) -> Result<Self> {
         let kubeconfig = Kubeconfig::read()?;
 
         let context_name = context
@@ -79,20 +81,23 @@ impl K8sClientPool {
             ));
         }
 
-        let pool = Self {
+        Ok(Self {
             kubeconfig,
             clients: Arc::new(RwLock::new(HashMap::new())),
             registries: Arc::new(RwLock::new(HashMap::new())),
-            current_contexts: Arc::new(RwLock::new(vec![context_name.clone()])),
+            current_contexts: Arc::new(RwLock::new(vec![context_name])),
             progress: crate::progress::create_progress_handle(),
-        };
+        })
+    }
 
-        // Pre-connect to the default context and discover resources
-        pool.get_or_create_client(&context_name).await?;
-        pool.discover_resources_for_context(&context_name, false)
+    /// Initialize the pool by connecting to the default context and discovering resources
+    /// Subscribe to progress() before calling this to receive status updates
+    pub async fn initialize(&self) -> Result<()> {
+        let context_name = self.current_context().await?;
+        self.get_or_create_client(&context_name).await?;
+        self.discover_resources_for_context(&context_name, false)
             .await?;
-
-        Ok(pool)
+        Ok(())
     }
 
     /// Discover all available resources for a context

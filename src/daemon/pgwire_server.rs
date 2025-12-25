@@ -22,7 +22,8 @@ impl PgWireServer {
 
     pub async fn run(&self) -> anyhow::Result<()> {
         // Initialize connection to default context
-        let pool = Arc::new(K8sClientPool::new(None, "default").await?);
+        let pool = Arc::new(K8sClientPool::new(None, "default")?);
+        pool.initialize().await?;
         let session = K8sSessionContext::new(Arc::clone(&pool)).await?;
 
         // Get the underlying DataFusion SessionContext wrapped in Arc

@@ -58,8 +58,16 @@ impl K8sSessionContext {
         for info in tables {
             let provider = K8sTableProvider::new(info.clone(), Arc::clone(pool));
 
-            // Register with the primary table name
-            ctx.register_table(&info.table_name, Arc::new(provider))?;
+            // Register with the primary table name (ignore conflicts from duplicate CRDs)
+            if let Err(e) = ctx.register_table(&info.table_name, Arc::new(provider)) {
+                tracing::debug!(
+                    "Skipping duplicate table '{}' from {}/{}: {}",
+                    info.table_name,
+                    info.group,
+                    info.version,
+                    e
+                );
+            }
 
             // Also register aliases (ignore conflicts)
             for alias in &info.aliases {

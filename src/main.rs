@@ -64,7 +64,11 @@ async fn main() -> Result<()> {
 }
 
 async fn run_batch(args: &Args) -> Result<()> {
-    let pool = Arc::new(K8sClientPool::new(args.context.as_deref(), &args.namespace).await?);
+    let pool = Arc::new(K8sClientPool::new(
+        args.context.as_deref(),
+        &args.namespace,
+    )?);
+    pool.initialize().await?;
     let session = K8sSessionContext::new(Arc::clone(&pool)).await?;
 
     let queries = if let Some(query) = &args.query {
@@ -136,14 +140,20 @@ async fn run_interactive(args: &Args) -> Result<()> {
     spinner.set_message("Connecting to Kubernetes...");
     spinner.enable_steady_tick(std::time::Duration::from_millis(80));
 
-    // Create pool with progress reporting
-    let pool = Arc::new(K8sClientPool::new(args.context.as_deref(), &args.namespace).await?);
+    // Create pool (fast, no I/O) and subscribe to progress BEFORE initialization
+    let pool = Arc::new(K8sClientPool::new(
+        args.context.as_deref(),
+        &args.namespace,
+    )?);
     let mut progress_rx = pool.progress().subscribe();
 
-    // Create session with progress updates
+    // Initialize pool and create session with progress updates
     let session_result = {
         let pool = Arc::clone(&pool);
-        let mut session_handle = Box::pin(async move { K8sSessionContext::new(pool).await });
+        let mut init_handle = Box::pin(async move {
+            pool.initialize().await?;
+            K8sSessionContext::new(pool).await
+        });
 
         loop {
             tokio::select! {
@@ -165,7 +175,7 @@ async fn run_interactive(args: &Args) -> Result<()> {
                         _ => {}
                     }
                 }
-                result = &mut session_handle => {
+                result = &mut init_handle => {
                     break result;
                 }
             }
