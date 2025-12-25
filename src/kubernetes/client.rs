@@ -275,10 +275,7 @@ impl K8sClientPool {
         }
 
         if matched_contexts.is_empty() {
-            return Err(anyhow!(
-                "No contexts matched pattern '{}'",
-                context_spec
-            ));
+            return Err(anyhow!("No contexts matched pattern '{}'", context_spec));
         }
 
         // Ensure we have clients and discovered resources for all contexts

@@ -6,18 +6,15 @@
 //! Provides a way for the K8s provider to report progress during queries,
 //! which the REPL can display to the user.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::broadcast;
 
 /// Progress update message
 #[derive(Clone, Debug)]
 pub enum ProgressUpdate {
     /// Starting to query clusters
-    StartingQuery {
-        table: String,
-        cluster_count: usize,
-    },
+    StartingQuery { table: String, cluster_count: usize },
     /// Fetched data from a cluster
     ClusterComplete {
         cluster: String,
@@ -25,10 +22,7 @@ pub enum ProgressUpdate {
         elapsed_ms: u64,
     },
     /// All clusters complete
-    QueryComplete {
-        total_rows: usize,
-        elapsed_ms: u64,
-    },
+    QueryComplete { total_rows: usize, elapsed_ms: u64 },
 }
 
 /// Global progress reporter

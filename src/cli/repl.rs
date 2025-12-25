@@ -194,8 +194,7 @@ enum CompletionContext {
     NamespaceValue,
     /// After _cluster = or _cluster IN ( - complete with context values
     ClusterValue,
-    /// After a column name - complete with operators (planned feature)
-    #[allow(dead_code)]
+    /// After a column name - complete with operators
     Operator,
     /// Default - complete with keywords, tables, columns
     General,
@@ -243,31 +242,36 @@ impl SqlHelper {
             return CompletionContext::TableName;
         }
 
-        // Check if we're in WHERE clause and just typed a column name
-        if line_upper.contains("WHERE")
+        // Check if we're in WHERE clause context
+        let in_where_context = line_upper.contains("WHERE")
             || line_upper.contains(" AND ")
-            || line_upper.contains(" OR ")
-        {
-            // If the last token looks like a column name (no operator after it)
+            || line_upper.contains(" OR ");
+
+        if in_where_context {
             let trimmed = line.trim();
-            if !trimmed.is_empty() {
-                let last_char = trimmed.chars().last().unwrap();
-                // If last char is alphanumeric or underscore, might need operator
-                if last_char.is_alphanumeric() || last_char == '_' {
-                    // Check if there's a space before the current word
-                    let parts: Vec<&str> = trimmed.rsplitn(2, char::is_whitespace).collect();
-                    if parts.len() == 2 {
-                        let last_token = parts[0].to_uppercase();
-                        // If last token is not an operator or keyword, suggest operators
-                        if !OPERATORS.iter().any(|op| last_token == *op)
-                            && !["AND", "OR", "WHERE"].contains(&last_token.as_str())
-                        {
-                            // Could be column name, suggest operators next
-                            // But only if we're definitely after WHERE
-                        }
+
+            // Check if line ends with space after a potential column name
+            // This suggests user wants to type an operator next
+            if line.ends_with(' ') && !trimmed.is_empty() {
+                // Get the last token before the trailing space
+                let tokens: Vec<&str> = trimmed.split_whitespace().collect();
+                if let Some(last_token) = tokens.last() {
+                    let last_upper = last_token.to_uppercase();
+
+                    // If last token is not already an operator or keyword, suggest operators
+                    let is_operator = OPERATORS.iter().any(|op| last_upper == *op);
+                    let is_keyword = [
+                        "AND", "OR", "WHERE", "NOT", "IN", "LIKE", "IS", "NULL", "BETWEEN",
+                    ]
+                    .contains(&last_upper.as_str());
+                    let is_value = last_token.starts_with('\'') || last_token.ends_with('\'');
+
+                    if !is_operator && !is_keyword && !is_value {
+                        return CompletionContext::Operator;
                     }
                 }
             }
+
             return CompletionContext::ColumnName { table };
         }
 
@@ -845,7 +849,11 @@ pub async fn run_repl(mut session: K8sSessionContext, pool: Arc<K8sClientPool>) 
                         println!("{} {}", style("Error:").red().bold(), style(e).red());
                     }
                     Err(e) => {
-                        println!("{} {}", style("Error:").red().bold(), style(format!("Query task panicked: {}", e)).red());
+                        println!(
+                            "{} {}",
+                            style("Error:").red().bold(),
+                            style(format!("Query task panicked: {}", e)).red()
+                        );
                     }
                 }
                 println!();

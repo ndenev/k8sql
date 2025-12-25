@@ -399,7 +399,11 @@ impl TableProvider for K8sTableProvider {
                         "Fetched from cluster"
                     );
                     // Report cluster completion
-                    pool.progress().cluster_complete(&cluster, row_count, elapsed.as_millis() as u64);
+                    pool.progress().cluster_complete(
+                        &cluster,
+                        row_count,
+                        elapsed.as_millis() as u64,
+                    );
                     (cluster, resources)
                 }
             })
@@ -439,7 +443,8 @@ impl TableProvider for K8sTableProvider {
         }
 
         // Report query completion
-        pool.progress().query_complete(total_rows, fetch_elapsed.as_millis() as u64);
+        pool.progress()
+            .query_complete(total_rows, fetch_elapsed.as_millis() as u64);
 
         info!(
             table = %self.resource_info.table_name,
