@@ -348,3 +348,340 @@ impl Default for ResourceCache {
         Self::new().expect("Failed to create resource cache")
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    /// Create a test cache with a temporary directory
+    fn test_cache() -> (ResourceCache, TempDir) {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let cache = ResourceCache {
+            base_dir: temp_dir.path().to_path_buf(),
+            ttl: DEFAULT_CACHE_TTL,
+        };
+        (cache, temp_dir)
+    }
+
+    /// Create a sample CachedResourceInfo for testing
+    fn sample_cached_resource(name: &str, group: &str, version: &str) -> CachedResourceInfo {
+        CachedResourceInfo {
+            group: group.to_string(),
+            version: version.to_string(),
+            api_version: if group.is_empty() {
+                version.to_string()
+            } else {
+                format!("{}/{}", group, version)
+            },
+            kind: name.to_string(),
+            plural: format!("{}s", name.to_lowercase()),
+            scope: "Namespaced".to_string(),
+            table_name: format!("{}s", name.to_lowercase()),
+            aliases: vec![name.to_lowercase()],
+            is_core: false,
+        }
+    }
+
+    #[test]
+    fn test_group_cache_key_core() {
+        // Empty group should become "core"
+        assert_eq!(group_cache_key("", "v1"), "core_v1");
+    }
+
+    #[test]
+    fn test_group_cache_key_simple() {
+        assert_eq!(group_cache_key("apps", "v1"), "apps_v1");
+    }
+
+    #[test]
+    fn test_group_cache_key_with_dots() {
+        // Dots should be replaced with underscores
+        assert_eq!(
+            group_cache_key("cert-manager.io", "v1"),
+            "cert-manager_io_v1"
+        );
+    }
+
+    #[test]
+    fn test_group_cache_key_complex() {
+        assert_eq!(
+            group_cache_key("networking.k8s.io", "v1"),
+            "networking_k8s_io_v1"
+        );
+    }
+
+    #[test]
+    fn test_cached_resource_info_roundtrip() {
+        // Create a ResourceInfo
+        let resource_info = ResourceInfo {
+            api_resource: ApiResource {
+                group: "cert-manager.io".to_string(),
+                version: "v1".to_string(),
+                api_version: "cert-manager.io/v1".to_string(),
+                kind: "Certificate".to_string(),
+                plural: "certificates".to_string(),
+            },
+            capabilities: ApiCapabilities {
+                scope: Scope::Namespaced,
+                subresources: vec![],
+                operations: vec![],
+            },
+            table_name: "certificates".to_string(),
+            aliases: vec!["certificate".to_string(), "cert".to_string()],
+            is_core: false,
+            group: "cert-manager.io".to_string(),
+            version: "v1".to_string(),
+        };
+
+        // Convert to cached format
+        let cached = CachedResourceInfo::from(&resource_info);
+
+        // Verify fields
+        assert_eq!(cached.group, "cert-manager.io");
+        assert_eq!(cached.version, "v1");
+        assert_eq!(cached.kind, "Certificate");
+        assert_eq!(cached.scope, "Namespaced");
+        assert!(!cached.is_core);
+
+        // Convert back
+        let restored: ResourceInfo = cached.into();
+
+        // Verify roundtrip
+        assert_eq!(restored.api_resource.group, "cert-manager.io");
+        assert_eq!(restored.api_resource.kind, "Certificate");
+        assert_eq!(restored.table_name, "certificates");
+        assert!(!restored.is_core);
+    }
+
+    #[test]
+    fn test_cached_resource_info_cluster_scope() {
+        let resource_info = ResourceInfo {
+            api_resource: ApiResource {
+                group: "".to_string(),
+                version: "v1".to_string(),
+                api_version: "v1".to_string(),
+                kind: "Node".to_string(),
+                plural: "nodes".to_string(),
+            },
+            capabilities: ApiCapabilities {
+                scope: Scope::Cluster,
+                subresources: vec![],
+                operations: vec![],
+            },
+            table_name: "nodes".to_string(),
+            aliases: vec!["node".to_string()],
+            is_core: true,
+            group: "".to_string(),
+            version: "v1".to_string(),
+        };
+
+        let cached = CachedResourceInfo::from(&resource_info);
+        assert_eq!(cached.scope, "Cluster");
+        assert!(cached.is_core);
+
+        let restored: ResourceInfo = cached.into();
+        assert_eq!(restored.capabilities.scope, Scope::Cluster);
+    }
+
+    #[test]
+    fn test_cluster_groups_freshness() {
+        let groups = ClusterGroups::new(vec![
+            ("apps".to_string(), "v1".to_string()),
+            ("batch".to_string(), "v1".to_string()),
+        ]);
+
+        // Should be fresh with default TTL
+        assert!(groups.is_fresh(Duration::from_secs(60)));
+
+        // Should be fresh with 1 second TTL (just created)
+        assert!(groups.is_fresh(Duration::from_secs(1)));
+
+        // Should not be fresh with 0 TTL
+        assert!(!groups.is_fresh(Duration::from_secs(0)));
+    }
+
+    #[test]
+    fn test_cached_group_freshness() {
+        let group = CachedGroup::new(
+            "cert-manager.io".to_string(),
+            "v1".to_string(),
+            vec![sample_cached_resource("Certificate", "cert-manager.io", "v1")],
+        );
+
+        // Should be fresh with default TTL
+        assert!(group.is_fresh(Duration::from_secs(60)));
+
+        // Should not be fresh with 0 TTL
+        assert!(!group.is_fresh(Duration::from_secs(0)));
+    }
+
+    #[test]
+    fn test_save_and_load_group() {
+        let (cache, _temp_dir) = test_cache();
+
+        let resources = vec![
+            sample_cached_resource("Certificate", "cert-manager.io", "v1"),
+            sample_cached_resource("Issuer", "cert-manager.io", "v1"),
+        ];
+
+        // Save the group
+        cache
+            .save_group("cert-manager.io", "v1", &resources)
+            .expect("Failed to save group");
+
+        // Load it back
+        let loaded = cache
+            .load_group("cert-manager.io", "v1")
+            .expect("Failed to load group");
+
+        assert_eq!(loaded.group, "cert-manager.io");
+        assert_eq!(loaded.version, "v1");
+        assert_eq!(loaded.resources.len(), 2);
+        assert_eq!(loaded.resources[0].kind, "Certificate");
+        assert_eq!(loaded.resources[1].kind, "Issuer");
+    }
+
+    #[test]
+    fn test_save_and_load_cluster_groups() {
+        let (cache, _temp_dir) = test_cache();
+
+        let groups = vec![
+            ("apps".to_string(), "v1".to_string()),
+            ("cert-manager.io".to_string(), "v1".to_string()),
+            ("".to_string(), "v1".to_string()), // core API
+        ];
+
+        // Save cluster groups
+        cache
+            .save_cluster_groups("test-cluster", &groups)
+            .expect("Failed to save cluster groups");
+
+        // Load them back
+        let loaded = cache
+            .load_cluster_groups("test-cluster")
+            .expect("Failed to load cluster groups");
+
+        assert_eq!(loaded.len(), 3);
+        assert!(loaded.contains(&("apps".to_string(), "v1".to_string())));
+        assert!(loaded.contains(&("cert-manager.io".to_string(), "v1".to_string())));
+    }
+
+    #[test]
+    fn test_check_groups_all_cached() {
+        let (cache, _temp_dir) = test_cache();
+
+        // Save some groups
+        cache
+            .save_group("apps", "v1", &[sample_cached_resource("Deployment", "apps", "v1")])
+            .unwrap();
+        cache
+            .save_group("batch", "v1", &[sample_cached_resource("Job", "batch", "v1")])
+            .unwrap();
+
+        // Check groups - all should be cached
+        let api_groups = vec![
+            ("apps".to_string(), "v1".to_string()),
+            ("batch".to_string(), "v1".to_string()),
+        ];
+
+        let (cached, missing) = cache.check_groups(&api_groups);
+
+        assert_eq!(cached.len(), 2);
+        assert!(missing.is_empty());
+    }
+
+    #[test]
+    fn test_check_groups_some_missing() {
+        let (cache, _temp_dir) = test_cache();
+
+        // Save only one group
+        cache
+            .save_group("apps", "v1", &[sample_cached_resource("Deployment", "apps", "v1")])
+            .unwrap();
+
+        // Check groups - one cached, one missing
+        let api_groups = vec![
+            ("apps".to_string(), "v1".to_string()),
+            ("batch".to_string(), "v1".to_string()),
+        ];
+
+        let (cached, missing) = cache.check_groups(&api_groups);
+
+        assert_eq!(cached.len(), 1);
+        assert_eq!(cached[0].group, "apps");
+        assert_eq!(missing.len(), 1);
+        assert_eq!(missing[0], ("batch".to_string(), "v1".to_string()));
+    }
+
+    #[test]
+    fn test_check_groups_all_missing() {
+        let (cache, _temp_dir) = test_cache();
+
+        // Don't save anything
+        let api_groups = vec![
+            ("apps".to_string(), "v1".to_string()),
+            ("batch".to_string(), "v1".to_string()),
+        ];
+
+        let (cached, missing) = cache.check_groups(&api_groups);
+
+        assert!(cached.is_empty());
+        assert_eq!(missing.len(), 2);
+    }
+
+    #[test]
+    fn test_clear_cluster() {
+        let (cache, _temp_dir) = test_cache();
+
+        // Save cluster groups
+        cache
+            .save_cluster_groups("test-cluster", &[("apps".to_string(), "v1".to_string())])
+            .unwrap();
+
+        // Verify it exists
+        assert!(cache.load_cluster_groups("test-cluster").is_some());
+
+        // Clear it
+        cache.clear("test-cluster").unwrap();
+
+        // Verify it's gone
+        assert!(cache.load_cluster_groups("test-cluster").is_none());
+    }
+
+    #[test]
+    fn test_clear_all() {
+        let (cache, _temp_dir) = test_cache();
+
+        // Save some data
+        cache
+            .save_cluster_groups("cluster1", &[("apps".to_string(), "v1".to_string())])
+            .unwrap();
+        cache
+            .save_group("apps", "v1", &[sample_cached_resource("Deployment", "apps", "v1")])
+            .unwrap();
+
+        // Clear all
+        cache.clear_all().unwrap();
+
+        // Verify everything is gone
+        assert!(cache.load_cluster_groups("cluster1").is_none());
+        assert!(cache.load_group("apps", "v1").is_none());
+    }
+
+    #[test]
+    fn test_cluster_name_sanitization() {
+        let (cache, _temp_dir) = test_cache();
+
+        // Cluster name with special characters
+        let cluster_name = "arn:aws:eks:us-west-2:123456789:cluster/my-cluster";
+
+        cache
+            .save_cluster_groups(cluster_name, &[("apps".to_string(), "v1".to_string())])
+            .unwrap();
+
+        // Should be able to load it back
+        let loaded = cache.load_cluster_groups(cluster_name);
+        assert!(loaded.is_some());
+    }
+}
