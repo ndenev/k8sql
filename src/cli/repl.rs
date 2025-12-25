@@ -672,6 +672,7 @@ pub async fn run_repl(mut session: K8sSessionContext, pool: Arc<K8sClientPool>) 
     let config = rustyline::Config::builder()
         .auto_add_history(true)
         .max_history_size(1000)?
+        .history_ignore_dups(true)?
         .tab_stop(4)
         .build();
 
