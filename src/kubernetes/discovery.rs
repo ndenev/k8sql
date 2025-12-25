@@ -146,14 +146,6 @@ impl ResourceRegistry {
         resources.sort_by(|a, b| a.table_name.cmp(&b.table_name));
         resources
     }
-
-    /// Merge another registry into this one
-    /// Resources from the other registry are added using the normal add() logic
-    pub fn merge(&mut self, other: ResourceRegistry) {
-        for info in other.by_table_name.into_values() {
-            self.add(info);
-        }
-    }
 }
 
 /// Build a registry with just core resources using k8s-openapi types (no discovery, instant startup)
@@ -278,190 +270,35 @@ pub fn build_core_registry() -> ResourceRegistry {
     registry
 }
 
-/// Discover all available resources on a Kubernetes cluster (including CRDs)
-/// Uses parallel API group fetching for faster discovery.
-///
-/// Returns (ResourceRegistry, api_groups) where api_groups can be used for fingerprinting.
-///
-/// Note: This function queries the discovery API which can be slow with many clusters.
-/// For fast startup, use `build_core_registry()` which provides instant access to core K8s resources.
-pub async fn discover_resources(
-    client: &Client,
-) -> Result<(ResourceRegistry, Vec<(String, String)>)> {
-    use futures::future::join_all;
-    use kube::discovery::oneshot;
-
-    let mut registry = ResourceRegistry::new();
-    let mut api_groups: Vec<(String, String)> = Vec::new();
-
-    // Step 1: Get all API groups (single API call)
+/// Get CRD API groups only (single API call)
+/// Returns (group_name, version) pairs for non-core groups only
+/// Core resources come from k8s-openapi at compile time, so we skip them
+pub async fn get_crd_api_groups(client: &Client) -> Result<Vec<(String, String)>> {
     let t0 = std::time::Instant::now();
-    let core_groups = client.list_core_api_versions().await?;
-    tracing::debug!("list_core_api_versions: {:?}", t0.elapsed());
-
-    let t1 = std::time::Instant::now();
     let api_group_list = client.list_api_groups().await?;
     tracing::debug!(
-        "list_api_groups: {:?} ({} groups)",
-        t1.elapsed(),
+        "get_crd_api_groups: list_api_groups {:?} ({} groups)",
+        t0.elapsed(),
         api_group_list.groups.len()
     );
 
-    // Collect all (group, version) pairs for fingerprinting
-    // Core API (v1)
-    for version in &core_groups.versions {
-        api_groups.push(("".to_string(), version.clone()));
-    }
-
-    // Other API groups
+    let mut api_groups: Vec<(String, String)> = Vec::new();
     for group in &api_group_list.groups {
-        if let Some(pref) = group.preferred_version.as_ref() {
-            api_groups.push((group.name.clone(), pref.version.clone()));
-        } else if let Some(first) = group.versions.first() {
-            api_groups.push((group.name.clone(), first.version.clone()));
-        }
-    }
-
-    // Step 2: Fetch resources for each group in parallel
-    // Build list of group versions to fetch
-    let mut group_versions: Vec<String> = Vec::new();
-
-    // Core API versions
-    for version in &core_groups.versions {
-        group_versions.push(version.clone());
-    }
-
-    // Other API group versions
-    for group in &api_group_list.groups {
-        let gv = if let Some(pref) = group.preferred_version.as_ref() {
-            &pref.group_version
-        } else if let Some(first) = group.versions.first() {
-            &first.group_version
-        } else {
+        // Skip core groups - these come from k8s-openapi
+        if matches!(
+            group.name.as_str(),
+            "apps"
+                | "batch"
+                | "networking.k8s.io"
+                | "policy"
+                | "rbac.authorization.k8s.io"
+                | "storage.k8s.io"
+                | "autoscaling"
+                | "coordination.k8s.io"
+        ) {
             continue;
-        };
-        group_versions.push(gv.clone());
-    }
-
-    // Fetch all groups in parallel using oneshot discovery
-    // Group by group name for efficient discovery
-    let mut group_names: Vec<&str> = api_group_list
-        .groups
-        .iter()
-        .map(|g| g.name.as_str())
-        .collect();
-    group_names.push(""); // Core API
-
-    let t2 = std::time::Instant::now();
-    let num_groups = group_names.len();
-    let futures: Vec<_> = group_names
-        .iter()
-        .map(|&group_name| {
-            let client = client.clone();
-            let group = group_name.to_string();
-            async move {
-                let t = std::time::Instant::now();
-                let result = if group.is_empty() {
-                    // Core API - use pinned_kind for well-known resources
-                    // or we can use the Discovery approach
-                    oneshot::group(&client, "").await
-                } else {
-                    oneshot::group(&client, &group).await
-                };
-                let elapsed = t.elapsed();
-                (group, result, elapsed)
-            }
-        })
-        .collect();
-
-    let results = join_all(futures).await;
-    tracing::debug!("oneshot::group x{}: {:?} total", num_groups, t2.elapsed());
-
-    // Log slowest groups
-    let mut timings: Vec<_> = results.iter().map(|(g, _, t)| (g.as_str(), *t)).collect();
-    timings.sort_by(|a, b| b.1.cmp(&a.1));
-    for (group, elapsed) in timings.iter().take(5) {
-        tracing::debug!(
-            "  slowest: {} {:?}",
-            if group.is_empty() { "core" } else { group },
-            elapsed
-        );
-    }
-
-    // Process results
-    for (group_name, result, _elapsed) in results {
-        let group = match result {
-            Ok(g) => g,
-            Err(e) => {
-                tracing::debug!(group = %group_name, error = %e, "Failed to discover API group");
-                continue;
-            }
-        };
-
-        for (ar, caps) in group.recommended_resources() {
-            // Skip subresources (e.g., pods/log, pods/exec)
-            if ar.plural.contains('/') {
-                continue;
-            }
-
-            // Determine table name (plural, lowercase)
-            let table_name = ar.plural.to_lowercase();
-
-            // Mark as core if from a standard K8s API group
-            let is_core = matches!(
-                ar.group.as_str(),
-                "" | "apps"
-                    | "batch"
-                    | "networking.k8s.io"
-                    | "policy"
-                    | "rbac.authorization.k8s.io"
-                    | "storage.k8s.io"
-                    | "autoscaling"
-                    | "coordination.k8s.io"
-            );
-
-            // Use lowercase kind as a basic alias
-            let aliases = vec![ar.kind.to_lowercase()];
-
-            let info = ResourceInfo {
-                api_resource: ar.clone(),
-                capabilities: caps.clone(),
-                table_name,
-                aliases,
-                is_core,
-                group: ar.group.clone(),
-                version: ar.version.clone(),
-            };
-
-            registry.add(info);
         }
-    }
 
-    Ok((registry, api_groups))
-}
-
-/// Get API groups list (fast, 2 API calls)
-/// Returns (group_name, version) pairs
-pub async fn get_api_groups(client: &Client) -> Result<Vec<(String, String)>> {
-    let mut api_groups: Vec<(String, String)> = Vec::new();
-
-    // Core API (v1)
-    let t0 = std::time::Instant::now();
-    let core_groups = client.list_core_api_versions().await?;
-    tracing::debug!("get_api_groups: list_core_api_versions {:?}", t0.elapsed());
-    for version in &core_groups.versions {
-        api_groups.push(("".to_string(), version.clone()));
-    }
-
-    // Other API groups
-    let t1 = std::time::Instant::now();
-    let api_group_list = client.list_api_groups().await?;
-    tracing::debug!(
-        "get_api_groups: list_api_groups {:?} ({} groups)",
-        t1.elapsed(),
-        api_group_list.groups.len()
-    );
-    for group in &api_group_list.groups {
         if let Some(pref) = group.preferred_version.as_ref() {
             api_groups.push((group.name.clone(), pref.version.clone()));
         } else if let Some(first) = group.versions.first() {
