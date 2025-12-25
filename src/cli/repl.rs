@@ -399,6 +399,16 @@ impl Completer for SqlHelper {
                     }
                 }
 
+                // SQL functions (json_get_str, COUNT, etc.) - useful in SELECT expressions
+                for func in &cache.functions {
+                    if func.to_lowercase().starts_with(&prefix_lower) {
+                        matches.push(Pair {
+                            display: func.clone(),
+                            replacement: func.clone(),
+                        });
+                    }
+                }
+
                 // Also suggest common JSON path prefixes
                 for path in &["metadata.", "spec.", "status.", "labels."] {
                     if path.starts_with(&prefix_lower) {
