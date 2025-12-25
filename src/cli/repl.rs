@@ -21,7 +21,7 @@ use tokio::sync::broadcast;
 use crate::config::{self, Config};
 use crate::datafusion_integration::K8sSessionContext;
 use crate::kubernetes::K8sClientPool;
-use crate::output::QueryResult;
+use crate::output::{QueryResult, MAX_JSON_COLUMN_WIDTH, WIDE_COLUMNS, truncate_value, show_tables_result, show_databases_result};
 use crate::progress::ProgressUpdate;
 
 // SQL keywords for completion
@@ -519,22 +519,6 @@ fn create_spinner(msg: &str) -> ProgressBar {
     pb
 }
 
-/// Maximum width for JSON columns (spec, status, labels, annotations, data)
-const MAX_JSON_COLUMN_WIDTH: usize = 60;
-
-/// Columns that should have width limits in table mode
-const WIDE_COLUMNS: &[&str] = &["spec", "status", "labels", "annotations", "data"];
-
-/// Truncate a string to max_len chars, adding "..." if truncated
-fn truncate_value(s: &str, max_len: usize) -> Cow<'_, str> {
-    if s.chars().count() <= max_len {
-        Cow::Borrowed(s)
-    } else {
-        let truncated: String = s.chars().take(max_len.saturating_sub(3)).collect();
-        Cow::Owned(format!("{}...", truncated))
-    }
-}
-
 fn format_table(result: &QueryResult) -> String {
     let mut table = Table::new();
     table.load_preset(UTF8_FULL_CONDENSED);
@@ -856,10 +840,7 @@ pub async fn run_repl(mut session: K8sSessionContext, pool: Arc<K8sClientPool>) 
                 if lower.trim().trim_end_matches(';') == "show tables" {
                     let mut tables = session.list_tables_with_aliases().await;
                     tables.sort_by(|a, b| a.0.cmp(&b.0));
-                    let result = QueryResult {
-                        columns: vec!["table_name".to_string(), "aliases".to_string()],
-                        rows: tables.into_iter().map(|(name, aliases)| vec![name, aliases]).collect(),
-                    };
+                    let result = show_tables_result(tables);
                     if expanded {
                         print!("{}", format_expanded(&result));
                     } else {
@@ -882,22 +863,7 @@ pub async fn run_repl(mut session: K8sSessionContext, pool: Arc<K8sClientPool>) 
                 if lower.trim().trim_end_matches(';') == "show databases" {
                     let contexts = pool.list_contexts().unwrap_or_default();
                     let current_contexts = pool.current_contexts().await;
-                    let result = QueryResult {
-                        columns: vec!["database".to_string(), "selected".to_string()],
-                        rows: contexts
-                            .iter()
-                            .map(|ctx| {
-                                vec![
-                                    ctx.clone(),
-                                    if current_contexts.contains(ctx) {
-                                        "*".to_string()
-                                    } else {
-                                        String::new()
-                                    },
-                                ]
-                            })
-                            .collect(),
-                    };
+                    let result = show_databases_result(contexts, &current_contexts);
                     if expanded {
                         print!("{}", format_expanded(&result));
                     } else {

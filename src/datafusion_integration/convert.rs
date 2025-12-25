@@ -271,8 +271,8 @@ mod tests {
             Some("42".to_string())
         );
         assert_eq!(
-            format_json_value(&serde_json::json!(3.14)),
-            Some("3.14".to_string())
+            format_json_value(&serde_json::json!(3.25)),
+            Some("3.25".to_string())
         );
     }
 

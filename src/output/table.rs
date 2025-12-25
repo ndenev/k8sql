@@ -6,13 +6,13 @@ use comfy_table::{Table, presets::ASCII_BORDERS_ONLY_CONDENSED};
 use super::QueryResult;
 
 /// Maximum width for JSON columns (spec, status, labels, annotations, data)
-const MAX_JSON_COLUMN_WIDTH: usize = 60;
+pub const MAX_JSON_COLUMN_WIDTH: usize = 60;
 
 /// Columns that should have width limits in table mode
-const WIDE_COLUMNS: &[&str] = &["spec", "status", "labels", "annotations", "data"];
+pub const WIDE_COLUMNS: &[&str] = &["spec", "status", "labels", "annotations", "data"];
 
 /// Truncate a string to max_len chars, adding "..." if truncated
-fn truncate_value(s: &str, max_len: usize) -> Cow<'_, str> {
+pub fn truncate_value(s: &str, max_len: usize) -> Cow<'_, str> {
     if s.chars().count() <= max_len {
         Cow::Borrowed(s)
     } else {

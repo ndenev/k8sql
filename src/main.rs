@@ -155,10 +155,7 @@ async fn run_batch(args: &Args) -> Result<()> {
         if normalized == "SHOW TABLES" {
             let mut tables = session.list_tables_with_aliases().await;
             tables.sort_by(|a, b| a.0.cmp(&b.0));
-            let result = output::QueryResult {
-                columns: vec!["table_name".to_string(), "aliases".to_string()],
-                rows: tables.into_iter().map(|(name, aliases)| vec![name, aliases]).collect(),
-            };
+            let result = output::show_tables_result(tables);
             println!("{}", result.format(&args.output, args.no_headers));
             continue;
         }
@@ -167,22 +164,7 @@ async fn run_batch(args: &Args) -> Result<()> {
         if normalized == "SHOW DATABASES" {
             let contexts = pool.list_contexts().unwrap_or_default();
             let current_contexts = pool.current_contexts().await;
-            let result = output::QueryResult {
-                columns: vec!["database".to_string(), "selected".to_string()],
-                rows: contexts
-                    .iter()
-                    .map(|ctx| {
-                        vec![
-                            ctx.clone(),
-                            if current_contexts.contains(ctx) {
-                                "*".to_string()
-                            } else {
-                                String::new()
-                            },
-                        ]
-                    })
-                    .collect(),
-            };
+            let result = output::show_databases_result(contexts, &current_contexts);
             println!("{}", result.format(&args.output, args.no_headers));
             continue;
         }

@@ -5,7 +5,7 @@ mod yaml;
 
 pub use csv::CsvFormatter;
 pub use json::JsonFormatter;
-pub use table::TableFormatter;
+pub use table::{TableFormatter, MAX_JSON_COLUMN_WIDTH, WIDE_COLUMNS, truncate_value};
 pub use yaml::YamlFormatter;
 
 use crate::cli::OutputFormat;
@@ -40,6 +40,34 @@ impl QueryResult {
                 serde_json::Value::Object(obj)
             })
             .collect()
+    }
+}
+
+/// Create a QueryResult for SHOW TABLES output
+/// Takes a sorted list of (table_name, aliases) tuples
+pub fn show_tables_result(tables: Vec<(String, String)>) -> QueryResult {
+    QueryResult {
+        columns: vec!["table_name".to_string(), "aliases".to_string()],
+        rows: tables.into_iter().map(|(name, aliases)| vec![name, aliases]).collect(),
+    }
+}
+
+/// Create a QueryResult for SHOW DATABASES output
+/// Takes a list of context names and which ones are currently selected
+pub fn show_databases_result(contexts: Vec<String>, current_contexts: &[String]) -> QueryResult {
+    QueryResult {
+        columns: vec!["database".to_string(), "selected".to_string()],
+        rows: contexts
+            .into_iter()
+            .map(|ctx| {
+                let selected = if current_contexts.contains(&ctx) {
+                    "*".to_string()
+                } else {
+                    String::new()
+                };
+                vec![ctx, selected]
+            })
+            .collect(),
     }
 }
 
