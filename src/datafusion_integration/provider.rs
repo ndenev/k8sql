@@ -195,47 +195,24 @@ impl K8sTableProvider {
         }
     }
 
-    /// Extract a label selector from labels['key'] = 'value' pattern (native map access)
-    /// or json_get_str(labels, 'key') = 'value' pattern (legacy)
+    /// Extract a label selector from labels->>'key' = 'value' pattern
+    /// (labels->>'key' becomes json_get_str(labels, 'key'))
     fn extract_label_selector(
         &self,
         binary: &datafusion::logical_expr::BinaryExpr,
         op: &str,
     ) -> Option<String> {
-        // Debug: log the expression structure
         debug!(
             left = ?binary.left,
             right = ?binary.right,
             "Analyzing binary expression for label selector"
         );
 
-        // Try native map access: get_field(labels, 'key') pattern
-        // DataFusion represents labels['key'] as ScalarFunction { name: "get_field", args: [Column("labels"), Literal("key")] }
+        // Handle json_get_str(labels, 'key') = 'value' pattern
         if let Expr::ScalarFunction(func) = binary.left.as_ref() {
             let func_name = func.name();
             debug!(func_name = %func_name, args_len = func.args.len(), "Found ScalarFunction on left side");
 
-            // Handle get_field for native map access (labels['key'])
-            if func_name == "get_field"
-                && func.args.len() >= 2
-                && let Expr::Column(col) = &func.args[0]
-                && col.name == "labels"
-            {
-                // Second arg should be the label key as a literal
-                if let Expr::Literal(key_lit, _) = &func.args[1]
-                    && let datafusion::common::ScalarValue::Utf8(Some(key)) = key_lit
-                {
-                    // Right side should be the value literal
-                    if let Expr::Literal(val_lit, _) = binary.right.as_ref()
-                        && let datafusion::common::ScalarValue::Utf8(Some(value)) = val_lit
-                    {
-                        debug!(key = %key, value = %value, "Extracted label selector via get_field");
-                        return Some(format!("{}{}{}", key, op, value));
-                    }
-                }
-            }
-
-            // Legacy: handle json_get_str for backward compatibility
             if func_name == "json_get_str"
                 && func.args.len() >= 2
                 && let Expr::Column(col) = &func.args[0]
@@ -283,8 +260,7 @@ impl TableProvider for K8sTableProvider {
         // - namespace = 'x' -> Uses namespaced API
         // - _cluster = 'x' -> Queries specific cluster
         // - _cluster IN (...) / NOT IN (...) -> Queries specific clusters
-        // - labels['key'] = 'value' -> K8s label selector (native map access via get_field)
-        // - json_get_str(labels, 'key') = 'value' -> K8s label selector (legacy)
+        // - labels->>'key' = 'value' -> K8s label selector (via json_get_str)
         // Other filters will be handled by DataFusion
         Ok(filters
             .iter()
@@ -303,10 +279,10 @@ impl TableProvider for K8sTableProvider {
                     {
                         return TableProviderFilterPushDown::Exact;
                     }
-                    // Check for labels['key'] pattern (native map access via get_field or json_get_str)
+                    // Check for labels->>'key' pattern (json_get_str)
                     if let Expr::ScalarFunction(func) = binary.left.as_ref() {
                         let func_name = func.name();
-                        if (func_name == "get_field" || func_name == "json_get_str")
+                        if func_name == "json_get_str"
                             && !func.args.is_empty()
                             && let Expr::Column(col) = &func.args[0]
                             && col.name == "labels"

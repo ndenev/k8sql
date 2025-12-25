@@ -6,15 +6,15 @@
 //! This module converts Kubernetes API JSON responses into Arrow RecordBatches
 //! suitable for DataFusion query processing. Key features:
 //!
-//! - Labels and annotations use native Arrow Map<Utf8, Utf8> types
-//! - Spec and status columns are stored as UTF8 JSON strings
+//! - All columns are stored as UTF8 strings for PostgreSQL wire protocol compatibility
+//! - Labels, annotations, spec, and status are stored as JSON strings
 //! - Access nested fields using json_get_* functions or PostgreSQL operators (->>, ->)
-//! - Other columns (name, namespace, etc.) are simple Utf8 strings
+//! - Example: SELECT labels->>'app' FROM pods WHERE labels->>'app' = 'nginx'
 
 use std::sync::Arc;
 
-use datafusion::arrow::array::{ArrayRef, MapBuilder, RecordBatch, StringBuilder};
-use datafusion::arrow::datatypes::{DataType, Field, Fields, Schema, SchemaRef};
+use datafusion::arrow::array::{ArrayRef, RecordBatch, StringBuilder};
+use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::error::Result;
 
 use crate::kubernetes::discovery::{ColumnDef, ResourceInfo, generate_schema};
@@ -26,26 +26,11 @@ use crate::kubernetes::discovery::{ColumnDef, ResourceInfo, generate_schema};
 // Example: SELECT json_get_str(status, 'phase') as phase FROM pods
 
 /// Convert our ColumnDef schema to Arrow Schema for TableProvider
+/// All columns are stored as Utf8 strings (including labels/annotations as JSON)
 pub fn to_arrow_schema(columns: &[ColumnDef]) -> SchemaRef {
     let fields: Vec<Field> = columns
         .iter()
-        .map(|col| {
-            let data_type = match col.name.as_str() {
-                "labels" | "annotations" => {
-                    let entries_field = Field::new(
-                        "entries",
-                        DataType::Struct(Fields::from(vec![
-                            Field::new("keys", DataType::Utf8, false),
-                            Field::new("values", DataType::Utf8, true),
-                        ])),
-                        false,
-                    );
-                    DataType::Map(Arc::new(entries_field), false)
-                }
-                _ => DataType::Utf8,
-            };
-            Field::new(&col.name, data_type, true)
-        })
+        .map(|col| Field::new(&col.name, DataType::Utf8, true))
         .collect();
 
     Arc::new(Schema::new(fields))
@@ -89,57 +74,12 @@ fn build_column_array(
     resources: &[serde_json::Value],
 ) -> Result<(ArrayRef, Field)> {
     match col.name.as_str() {
-        // Labels and annotations use native Map<Utf8, Utf8>
-        "labels" | "annotations" => build_map_column(col, resources),
-
         // Special case: _cluster is injected, not from JSON
         "_cluster" => build_cluster_column(cluster, resources.len()),
 
-        // All other columns are simple strings (including spec/status as JSON)
+        // All other columns are strings (including labels/annotations/spec/status as JSON)
         _ => build_string_column(col, resources),
     }
-}
-
-/// Build a Map<Utf8, Utf8> column for labels/annotations
-fn build_map_column(col: &ColumnDef, resources: &[serde_json::Value]) -> Result<(ArrayRef, Field)> {
-    let mut builder = MapBuilder::new(None, StringBuilder::new(), StringBuilder::new());
-
-    for resource in resources {
-        let json_value = get_nested_value(resource, col.json_path.as_deref().unwrap_or(&col.name));
-        if let serde_json::Value::Object(map) = json_value {
-            for (key, value) in map {
-                builder.keys().append_value(&key);
-                match value {
-                    serde_json::Value::String(s) => builder.values().append_value(&s),
-                    serde_json::Value::Null => builder.values().append_null(),
-                    other => builder.values().append_value(other.to_string()),
-                }
-            }
-            builder.append(true)?;
-        } else {
-            // Null or non-object: append empty map
-            builder.append(true)?;
-        }
-    }
-
-    let array = Arc::new(builder.finish()) as ArrayRef;
-    let field = Field::new(
-        &col.name,
-        DataType::Map(
-            Arc::new(Field::new(
-                "entries",
-                DataType::Struct(Fields::from(vec![
-                    Field::new("keys", DataType::Utf8, false),
-                    Field::new("values", DataType::Utf8, true),
-                ])),
-                false,
-            )),
-            false,
-        ),
-        true,
-    );
-
-    Ok((array, field))
 }
 
 /// Build the _cluster column (constant value for all rows)

@@ -259,19 +259,16 @@ impl K8sClientPool {
             if pattern.contains('*') || pattern.contains('?') {
                 // Use simple glob matching
                 for ctx in &all_contexts {
-                    if Self::glob_match(pattern, ctx) {
-                        if !matched_contexts.contains(ctx) {
-                            matched_contexts.push(ctx.clone());
-                        }
+                    if Self::glob_match(pattern, ctx) && !matched_contexts.contains(ctx) {
+                        matched_contexts.push(ctx.clone());
                     }
                 }
             } else {
                 // Exact match
-                if all_contexts.contains(&pattern.to_string()) {
-                    if !matched_contexts.contains(&pattern.to_string()) {
-                        matched_contexts.push(pattern.to_string());
-                    }
-                } else {
+                let pattern_str = pattern.to_string();
+                if all_contexts.contains(&pattern_str) && !matched_contexts.contains(&pattern_str) {
+                    matched_contexts.push(pattern_str);
+                } else if !all_contexts.contains(&pattern.to_string()) {
                     return Err(anyhow!("Context '{}' not found", pattern));
                 }
             }
