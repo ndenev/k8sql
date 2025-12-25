@@ -1,4 +1,4 @@
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use kube::api::DynamicObject;
 use kube::config::{KubeConfigOptions, Kubeconfig};
 use kube::{Api, Client, Config, api::ListParams};
@@ -425,13 +425,15 @@ impl K8sClientPool {
                 ..Default::default()
             },
         )
-        .await?;
+        .await
+        .with_context(|| format!("Failed to load kubeconfig for context '{}'", context))?;
 
         // Set timeouts for reliability
         config.connect_timeout = Some(CONNECT_TIMEOUT);
         config.read_timeout = Some(READ_TIMEOUT);
 
-        let client = Client::try_from(config)?;
+        let client = Client::try_from(config)
+            .with_context(|| format!("Failed to create client for context '{}'", context))?;
 
         // Report connected
         self.progress
@@ -554,18 +556,27 @@ impl K8sClientPool {
         // Ensure we have clients and discovered resources for all contexts IN PARALLEL
         let discovery_futures: Vec<_> = matched_contexts
             .iter()
-            .map(|ctx| async move {
-                self.get_or_create_client(ctx).await?;
-                self.discover_resources_for_context(ctx, true).await?;
-                Ok::<_, anyhow::Error>(())
+            .map(|ctx| {
+                let ctx = ctx.clone();
+                async move {
+                    self.get_or_create_client(&ctx)
+                        .await
+                        .with_context(|| format!("Failed to connect to cluster '{}'", ctx))?;
+                    self.discover_resources_for_context(&ctx, true)
+                        .await
+                        .with_context(|| format!("Failed to discover resources for cluster '{}'", ctx))?;
+                    Ok::<_, anyhow::Error>(())
+                }
             })
             .collect();
 
         let results = futures::future::join_all(discovery_futures).await;
 
-        // Check for any errors
-        for result in results {
-            result?;
+        // Check for any errors - collect all failures
+        let errors: Vec<_> = results.into_iter().filter_map(|r| r.err()).collect();
+        if !errors.is_empty() {
+            // Return first error (with context info now included)
+            return Err(errors.into_iter().next().unwrap());
         }
 
         // Update current contexts
