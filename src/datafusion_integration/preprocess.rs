@@ -26,8 +26,10 @@ static ANNOTATION_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
 /// This fixes DataFusion's incorrect parsing of col->>'key' = 'val' as col->>('key' = 'val')
 static JSON_ARROW_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
     // Match: identifier->>'key' followed by comparison operator
-    // The identifier can include dots for nested access like spec.containers
-    Regex::new(r#"(\w+)\s*->>\s*'([^']+)'\s*(=|!=|<>|<=|>=|<|>)"#).unwrap()
+    // The identifier can be:
+    // - simple: status, spec
+    // - qualified: p.status, pods.status, t.spec
+    Regex::new(r#"((?:\w+\.)?\w+)\s*->>\s*'([^']+)'\s*(=|!=|<>|<=|>=|<|>)"#).unwrap()
 });
 
 /// Preprocess SQL to convert k8sql-specific syntax to standard SQL
@@ -175,5 +177,37 @@ mod tests {
         let sql = "SELECT status->>'phase' FROM pods";
         let result = preprocess_sql(sql);
         assert_eq!(sql, result);
+    }
+
+    #[test]
+    fn test_json_arrow_qualified_identifier() {
+        // Table alias qualified: p.status->>'phase' = 'Running'
+        let sql = "SELECT * FROM pods p WHERE p.status->>'phase' = 'Running'";
+        let result = preprocess_sql(sql);
+        assert_eq!(
+            result,
+            "SELECT * FROM pods p WHERE (p.status->>'phase') = 'Running'"
+        );
+    }
+
+    #[test]
+    fn test_json_arrow_qualified_identifier_full_table() {
+        // Full table name qualified: pods.status->>'phase' = 'Running'
+        let sql = "SELECT * FROM pods WHERE pods.status->>'phase' = 'Running'";
+        let result = preprocess_sql(sql);
+        assert_eq!(
+            result,
+            "SELECT * FROM pods WHERE (pods.status->>'phase') = 'Running'"
+        );
+    }
+
+    #[test]
+    fn test_json_arrow_qualified_multiple() {
+        let sql = "SELECT * FROM pods p JOIN nodes n ON p.spec->>'nodeName' = n.name WHERE p.status->>'phase' != 'Running'";
+        let result = preprocess_sql(sql);
+        assert_eq!(
+            result,
+            "SELECT * FROM pods p JOIN nodes n ON (p.spec->>'nodeName') = n.name WHERE (p.status->>'phase') != 'Running'"
+        );
     }
 }

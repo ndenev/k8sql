@@ -279,14 +279,24 @@ impl TableProvider for K8sTableProvider {
                     {
                         return TableProviderFilterPushDown::Exact;
                     }
-                    // Check for labels->>'key' pattern (json_get_str)
+                    // Check for labels->>'key' = 'value' or != 'value' pattern (json_get_str)
+                    // Only push down equality/inequality with literal RHS
                     if let Expr::ScalarFunction(func) = binary.left.as_ref() {
                         let func_name = func.name();
                         if func_name == "json_get_str"
                             && !func.args.is_empty()
                             && let Expr::Column(col) = &func.args[0]
                             && col.name == "labels"
+                            && (binary.op == Operator::Eq || binary.op == Operator::NotEq)
+                            && matches!(binary.right.as_ref(), Expr::Literal(..))
                         {
+                            // != needs Inexact to ensure SQL NULL semantics:
+                            // K8s treats key!=value as "not equal OR missing"
+                            // SQL treats NULL != 'value' as NULL (excluded from results)
+                            // By returning Inexact, DataFusion re-applies the filter
+                            if binary.op == Operator::NotEq {
+                                return TableProviderFilterPushDown::Inexact;
+                            }
                             return TableProviderFilterPushDown::Exact;
                         }
                     }
