@@ -27,30 +27,8 @@ use crate::output::{
 };
 use crate::progress::ProgressUpdate;
 
-// SQL keywords for completion
-const KEYWORDS: &[&str] = &[
-    "SELECT",
-    "FROM",
-    "WHERE",
-    "ORDER",
-    "BY",
-    "LIMIT",
-    "AND",
-    "OR",
-    "SHOW",
-    "TABLES",
-    "DATABASES",
-    "DESCRIBE",
-    "USE",
-    "ASC",
-    "DESC",
-    "IN",
-    "LIKE",
-    "NOT",
-    "NULL",
-    "TRUE",
-    "FALSE",
-];
+// SQL keywords from sqlparser (comprehensive list)
+use datafusion::sql::sqlparser::keywords::ALL_KEYWORDS;
 
 // Common operators for WHERE clauses
 const OPERATORS: &[&str] = &["=", "!=", "<>", "<", ">", "<=", ">=", "LIKE", "IN", "NOT"];
@@ -151,7 +129,7 @@ struct SqlHelper {
 impl SqlHelper {
     fn new(cache: Arc<RwLock<CompletionCache>>) -> Self {
         // Pre-compile keyword regexes once at startup
-        let keyword_patterns: Vec<_> = KEYWORDS
+        let keyword_patterns: Vec<_> = ALL_KEYWORDS
             .iter()
             .filter_map(|&kw| {
                 regex::RegexBuilder::new(&format!(r"\b{}\b", regex::escape(kw)))
@@ -438,7 +416,7 @@ impl Completer for SqlHelper {
 
             CompletionContext::General => {
                 // Keywords (uppercase)
-                for &kw in KEYWORDS {
+                for &kw in ALL_KEYWORDS {
                     if kw.starts_with(&prefix_upper) {
                         matches.push(Pair {
                             display: kw.to_string(),
