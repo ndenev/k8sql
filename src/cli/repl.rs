@@ -18,6 +18,7 @@ use std::sync::{Arc, RwLock};
 use std::time::Instant;
 use tokio::sync::broadcast;
 
+use crate::config::Config;
 use crate::datafusion_integration::K8sSessionContext;
 use crate::kubernetes::K8sClientPool;
 use crate::output::QueryResult;
@@ -802,6 +803,17 @@ pub async fn run_repl(mut session: K8sSessionContext, pool: Arc<K8sClientPool>) 
                         {
                             *cache_guard = new_cache;
                         }
+                        // Save selected contexts to config for persistence
+                        if let Err(e) = Config::load()
+                            .unwrap_or_default()
+                            .set_selected_contexts(contexts)
+                        {
+                            println!(
+                                "{} Could not save context selection: {}",
+                                style("Warning:").yellow(),
+                                style(e).yellow()
+                            );
+                        }
                     }
                     println!();
                     continue;
@@ -830,7 +842,7 @@ pub async fn run_repl(mut session: K8sSessionContext, pool: Arc<K8sClientPool>) 
                     let contexts = pool.list_contexts().unwrap_or_default();
                     let current_contexts = pool.current_contexts().await;
                     let result = QueryResult {
-                        columns: vec!["database".to_string(), "current".to_string()],
+                        columns: vec!["database".to_string(), "selected".to_string()],
                         rows: contexts
                             .iter()
                             .map(|ctx| {

@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
 mod cli;
+mod config;
 mod daemon;
 mod datafusion_integration;
 mod kubernetes;
@@ -92,7 +93,7 @@ async fn run_batch(args: &Args) -> Result<()> {
             let contexts = pool.list_contexts().unwrap_or_default();
             let current_contexts = pool.current_contexts().await;
             let result = output::QueryResult {
-                columns: vec!["database".to_string(), "current".to_string()],
+                columns: vec!["database".to_string(), "selected".to_string()],
                 rows: contexts
                     .iter()
                     .map(|ctx| {
@@ -129,6 +130,13 @@ async fn run_interactive(args: &Args) -> Result<()> {
     use indicatif::{ProgressBar, ProgressStyle};
     use progress::ProgressUpdate;
 
+    // Load saved config (for persistent context selection)
+    let saved_config = config::Config::load().ok();
+    let saved_contexts = saved_config
+        .as_ref()
+        .map(|c| c.selected_contexts.clone())
+        .unwrap_or_default();
+
     // Create a spinner for startup with elapsed time
     let spinner = ProgressBar::new_spinner();
     spinner.set_style(
@@ -141,8 +149,10 @@ async fn run_interactive(args: &Args) -> Result<()> {
     spinner.enable_steady_tick(std::time::Duration::from_millis(80));
 
     // Create pool (fast, no I/O) and subscribe to progress BEFORE initialization
+    // If CLI specifies context, use that; otherwise use first saved context or default
+    let initial_context = args.context.as_deref().or_else(|| saved_contexts.first().map(|s| s.as_str()));
     let pool = Arc::new(K8sClientPool::new(
-        args.context.as_deref(),
+        initial_context,
         &args.namespace,
     )?);
     let mut progress_rx = pool.progress().subscribe();
@@ -184,7 +194,20 @@ async fn run_interactive(args: &Args) -> Result<()> {
 
     spinner.finish_and_clear();
 
-    let session = session_result?;
+    let mut session = session_result?;
+
+    // If CLI didn't specify context and we have saved contexts with multiple entries,
+    // switch to all saved contexts now (we only initialized with the first one)
+    if args.context.is_none() && saved_contexts.len() > 1 {
+        let context_spec = saved_contexts.join(", ");
+        if let Err(e) = pool.switch_context(&context_spec).await {
+            // Non-fatal: just warn and continue with initial context
+            eprintln!("Warning: Could not restore saved contexts: {}", e);
+        } else {
+            // Refresh tables for multi-context
+            let _ = session.refresh_tables().await;
+        }
+    }
 
     cli::repl::run_repl(session, pool).await
 }

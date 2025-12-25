@@ -483,16 +483,18 @@ USE <cluster>        - Switch to cluster(s) - see below
 
 ### Multi-Cluster USE
 
+> **Note:** Multi-cluster `USE` is a k8sql extension to SQL. Traditional SQL databases only support single-database `USE` statements. This extension is designed for the Kubernetes multi-cluster use case.
+
 The `USE` command supports multiple clusters and glob patterns:
 
 ```sql
--- Single cluster (traditional)
+-- Single cluster (traditional SQL behavior)
 USE prod-us;
 
--- Multiple clusters (comma-separated)
+-- Multiple clusters (k8sql extension, comma-separated)
 USE prod-us, prod-eu, staging;
 
--- Glob patterns
+-- Glob patterns (k8sql extension)
 USE prod-*;           -- matches prod-us, prod-eu, prod-asia, etc.
 USE *-staging;        -- matches app-staging, db-staging, etc.
 USE prod-?;           -- matches prod-1, prod-2, etc. (? = single char)
@@ -501,12 +503,15 @@ USE prod-?;           -- matches prod-1, prod-2, etc. (? = single char)
 USE prod-*, staging;
 ```
 
-After `USE`, queries without a `_cluster` filter will run against all active contexts. `SHOW DATABASES` displays all active contexts marked with `*`.
+After `USE`, queries without a `_cluster` filter will run against all selected contexts. `SHOW DATABASES` displays selected contexts in the `selected` column.
+
+**Persistent Selection:** Your context selection is automatically saved to `~/.config/k8sql/config.toml` and restored on next startup. This means you can close k8sql, reopen it, and continue working with the same cluster selection.
 
 This is useful for:
 - Excluding problematic clusters that always timeout
 - Working with a subset of your many clusters
 - Quickly switching between environment sets (all prod, all staging, etc.)
+- Maintaining consistent multi-cluster workflows across sessions
 
 ## Daemon Mode
 

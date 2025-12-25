@@ -43,7 +43,7 @@ impl ShowDatabasesHook {
                 FieldFormat::Text,
             ),
             FieldInfo::new(
-                "current".to_string(),
+                "selected".to_string(),
                 None,
                 None,
                 Type::VARCHAR,
@@ -99,7 +99,7 @@ impl QueryHook for ShowDatabasesHook {
                 // Return a dummy logical plan for extended query protocol
                 let schema = Arc::new(Schema::new(vec![
                     Field::new("database", DataType::Utf8, false),
-                    Field::new("current", DataType::Utf8, false),
+                    Field::new("selected", DataType::Utf8, false),
                 ]));
                 let result = schema
                     .to_dfschema()
