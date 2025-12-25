@@ -148,6 +148,24 @@ impl ResourceRegistry {
     }
 }
 
+/// Check if an API group is a core Kubernetes group (not a CRD)
+///
+/// Core groups are:
+/// 1. Groups we have static k8s-openapi types for (apps, batch, etc.)
+/// 2. All *.k8s.io groups (core K8s APIs like authorization.k8s.io, events.k8s.io)
+pub fn is_core_api_group(group: &str) -> bool {
+    // Empty string is core/v1
+    if group.is_empty() {
+        return true;
+    }
+    // All *.k8s.io groups are core Kubernetes APIs
+    if group.ends_with(".k8s.io") {
+        return true;
+    }
+    // These are the short names without .k8s.io suffix
+    matches!(group, "apps" | "batch" | "policy" | "autoscaling")
+}
+
 /// Build a registry with just core resources using k8s-openapi types (no discovery, instant startup)
 ///
 /// This uses compile-time type information from k8s-openapi, so it automatically
@@ -284,18 +302,8 @@ pub async fn get_crd_api_groups(client: &Client) -> Result<Vec<(String, String)>
 
     let mut api_groups: Vec<(String, String)> = Vec::new();
     for group in &api_group_list.groups {
-        // Skip core groups - these come from k8s-openapi
-        if matches!(
-            group.name.as_str(),
-            "apps"
-                | "batch"
-                | "networking.k8s.io"
-                | "policy"
-                | "rbac.authorization.k8s.io"
-                | "storage.k8s.io"
-                | "autoscaling"
-                | "coordination.k8s.io"
-        ) {
+        // Skip core K8s API groups - we have static types for these
+        if is_core_api_group(&group.name) {
             continue;
         }
 

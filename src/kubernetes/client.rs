@@ -163,25 +163,48 @@ impl K8sClientPool {
     /// Returns the number of CRDs loaded
     ///
     /// Strategy:
-    /// 1. Get CRD API groups from cluster (single API call - skips core resources)
-    /// 2. Check which groups are cached vs missing
-    /// 3. Load cached groups, discover only missing groups in parallel
-    /// 4. Save newly discovered groups to cache
+    /// 1. Try to load saved cluster groups from cache (no API call)
+    /// 2. If cache is fresh and complete, use it directly
+    /// 3. Otherwise, call list_api_groups() to get current groups
+    /// 4. Load cached groups, discover only missing groups in parallel
     async fn load_crds_with_cache(
         &self,
         context: &str,
         client: &Client,
         registry: &mut ResourceRegistry,
     ) -> Result<usize> {
-        // Step 1: Get CRD API groups only (single API call)
-        // Core resources come from k8s-openapi, so we skip list_core_api_versions
+        // Step 1: Try to load from cache first (no API call)
+        if let Some(cached_crd_groups) = self.resource_cache.load_cluster_groups(context) {
+            let (cached_groups, missing_groups) =
+                self.resource_cache.check_groups(&cached_crd_groups);
+
+            // If all groups are cached, load directly without any API calls
+            if missing_groups.is_empty() {
+                let mut count = 0;
+                for cached_group in &cached_groups {
+                    for resource in &cached_group.resources {
+                        registry.add(resource.clone().into());
+                        count += 1;
+                    }
+                }
+                info!(
+                    context = %context,
+                    cached = cached_groups.len(),
+                    "Loaded all CRDs from cache (no API calls)"
+                );
+                return Ok(count);
+            }
+            // Some groups missing - fall through to API call
+        }
+
+        // Step 2: Get CRD API groups from cluster (single API call)
         let crd_groups = super::discovery::get_crd_api_groups(client).await?;
 
         if crd_groups.is_empty() {
             return Ok(0);
         }
 
-        // Step 2: Check which groups are cached vs missing
+        // Step 3: Check which groups are cached vs missing
         let (cached_groups, missing_groups) = self.resource_cache.check_groups(&crd_groups);
 
         let cached_count = cached_groups.len();
