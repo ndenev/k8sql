@@ -285,6 +285,7 @@ impl K8sClientPool {
     }
 
     /// Force rediscover all CRDs from the cluster
+    /// Gets fresh list of API groups but uses cached group data when available
     async fn discover_all_crds(
         &self,
         context: &str,
@@ -298,34 +299,65 @@ impl K8sClientPool {
             return Ok(0);
         }
 
-        // Discover all CRD groups in parallel
-        let discovered = super::discovery::discover_groups(client, &crd_groups).await?;
+        // Check which groups are cached vs missing (shared cache across clusters)
+        let (cached_groups, missing_groups) = self.resource_cache.check_groups(&crd_groups);
 
-        // Save each group to cache and add to registry
+        let cached_count = cached_groups.len();
+        let missing_count = missing_groups.len();
+
+        // Load cached groups into registry
         let mut crd_count = 0;
-        for ((group, version), resources) in &discovered {
-            // Convert to cached format
-            let cached_resources: Vec<CachedResourceInfo> =
-                resources.iter().map(CachedResourceInfo::from).collect();
-
-            // Save to cache
-            if let Err(e) = self
-                .resource_cache
-                .save_group(group, version, &cached_resources)
-            {
-                warn!(
-                    context = %context,
-                    group = %group,
-                    error = %e,
-                    "Failed to cache API group"
-                );
-            }
-
-            // Add to registry
-            for info in resources {
-                registry.add(info.clone());
+        for cached_group in &cached_groups {
+            for resource in &cached_group.resources {
+                registry.add(resource.clone().into());
                 crd_count += 1;
             }
+        }
+
+        // Discover only missing groups in parallel (if any)
+        if !missing_groups.is_empty() {
+            info!(
+                context = %context,
+                cached = cached_count,
+                missing = missing_count,
+                "Force refresh: loading CRDs (cached: {}, discovering: {})",
+                cached_count,
+                missing_count
+            );
+
+            let discovered = super::discovery::discover_groups(client, &missing_groups).await?;
+
+            // Save and add discovered groups
+            for ((group, version), resources) in &discovered {
+                // Convert to cached format
+                let cached_resources: Vec<CachedResourceInfo> =
+                    resources.iter().map(CachedResourceInfo::from).collect();
+
+                // Save to cache
+                if let Err(e) = self
+                    .resource_cache
+                    .save_group(group, version, &cached_resources)
+                {
+                    warn!(
+                        context = %context,
+                        group = %group,
+                        error = %e,
+                        "Failed to cache API group"
+                    );
+                }
+
+                // Add to registry
+                for info in resources {
+                    registry.add(info.clone());
+                    crd_count += 1;
+                }
+            }
+        } else {
+            info!(
+                context = %context,
+                cached = cached_count,
+                "Force refresh: all CRDs loaded from shared cache"
+            );
         }
 
         // Save cluster groups list
@@ -335,13 +367,6 @@ impl K8sClientPool {
         {
             warn!(context = %context, error = %e, "Failed to save cluster groups");
         }
-
-        info!(
-            context = %context,
-            crd_count = crd_count,
-            groups = discovered.len(),
-            "Discovered CRDs from cluster"
-        );
 
         Ok(crd_count)
     }
