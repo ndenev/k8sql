@@ -4,6 +4,7 @@
 //! Local cache for discovered Kubernetes resources (CRDs)
 //!
 //! Caches CRD discovery results to enable fast startup on subsequent runs.
+//! Uses fingerprint-based caching so clusters with identical CRDs share cache entries.
 //! Core K8s resources are always loaded from k8s-openapi (instant).
 
 use anyhow::{Context, Result};
@@ -12,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 
-use super::discovery::{ResourceInfo, ResourceRegistry};
+use super::discovery::ResourceInfo;
 
 /// Default cache TTL (24 hours)
 const DEFAULT_CACHE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
@@ -83,36 +84,27 @@ impl From<CachedResourceInfo> for ResourceInfo {
     }
 }
 
-/// Cached registry with metadata
+/// Cluster API groups list (which groups this cluster has)
 #[derive(Debug, Serialize, Deserialize)]
-pub struct CachedRegistry {
-    /// When this cache was created
-    pub created_at: u64, // Unix timestamp
-    /// The cached resources (CRDs only, core resources are not cached)
-    pub resources: Vec<CachedResourceInfo>,
+pub struct ClusterGroups {
+    /// List of (group, version) pairs
+    pub groups: Vec<(String, String)>,
+    /// When this was cached
+    pub created_at: u64,
 }
 
-impl CachedRegistry {
-    /// Create a new cached registry from discovered resources
-    /// Only includes non-core resources (CRDs)
-    pub fn from_registry(registry: &ResourceRegistry) -> Self {
-        let resources: Vec<CachedResourceInfo> = registry
-            .list_tables()
-            .into_iter()
-            .filter(|info| !info.is_core) // Only cache CRDs
-            .map(CachedResourceInfo::from)
-            .collect();
-
+impl ClusterGroups {
+    pub fn new(groups: Vec<(String, String)>) -> Self {
         Self {
+            groups,
             created_at: SystemTime::now()
                 .duration_since(SystemTime::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs(),
-            resources,
         }
     }
 
-    /// Check if this cache is still fresh
+    #[allow(dead_code)]
     pub fn is_fresh(&self, ttl: Duration) -> bool {
         let now = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
@@ -121,29 +113,83 @@ impl CachedRegistry {
         let age = now.saturating_sub(self.created_at);
         age < ttl.as_secs()
     }
+}
 
-    /// Convert back to ResourceRegistry (CRDs only)
-    pub fn to_registry(&self) -> ResourceRegistry {
-        let mut registry = ResourceRegistry::new();
-        for cached in &self.resources {
-            registry.add(cached.clone().into());
+/// Cached resources for a single API group
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CachedGroup {
+    /// API group name (empty string for core)
+    pub group: String,
+    /// API version
+    pub version: String,
+    /// When this was cached
+    pub created_at: u64,
+    /// Resources in this group
+    pub resources: Vec<CachedResourceInfo>,
+}
+
+impl CachedGroup {
+    pub fn new(group: String, version: String, resources: Vec<CachedResourceInfo>) -> Self {
+        Self {
+            group,
+            version,
+            created_at: SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+            resources,
         }
-        registry
+    }
+
+    pub fn is_fresh(&self, ttl: Duration) -> bool {
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let age = now.saturating_sub(self.created_at);
+        age < ttl.as_secs()
     }
 }
 
-/// Resource cache manager
+/// Compute a cache key for an API group
+pub fn group_cache_key(group: &str, version: &str) -> String {
+    // Sanitize group name for filesystem (replace dots with underscores)
+    let safe_group: String = if group.is_empty() {
+        "core".to_string()
+    } else {
+        group
+            .chars()
+            .map(|c| if c.is_alphanumeric() || c == '-' { c } else { '_' })
+            .collect()
+    };
+    format!("{}_{}", safe_group, version)
+}
+
+/// Resource cache manager with per-API-group caching
+///
+/// Cache structure:
+/// ```
+/// ~/.cache/k8sql/
+///   groups/
+///     <group>_<version>.json   # Resources for this API group (shared across clusters)
+///   clusters/
+///     <cluster>.json           # List of (group, version) pairs this cluster has
+/// ```
+///
+/// This enables efficient incremental updates:
+/// - If a cluster adds one new CRD, only that API group needs to be discovered
+/// - Common CRDs (cert-manager, istio, etc.) are shared across clusters
 pub struct ResourceCache {
-    cache_dir: PathBuf,
+    base_dir: PathBuf,
     ttl: Duration,
 }
 
 impl ResourceCache {
     /// Create a new cache manager
     pub fn new() -> Result<Self> {
-        let cache_dir = Self::default_cache_dir()?;
+        let base_dir = Self::default_cache_dir()?;
         Ok(Self {
-            cache_dir,
+            base_dir,
             ttl: DEFAULT_CACHE_TTL,
         })
     }
@@ -153,59 +199,126 @@ impl ResourceCache {
         let cache_base = dirs::cache_dir()
             .or_else(|| dirs::home_dir().map(|h| h.join(".cache")))
             .context("Could not determine cache directory")?;
-        Ok(cache_base.join("k8sql").join("clusters"))
+        Ok(cache_base.join("k8sql"))
     }
 
-    /// Get the cache file path for a cluster
-    fn cache_path(&self, cluster: &str) -> PathBuf {
-        // Sanitize cluster name for filesystem
+    /// Get the clusters directory
+    fn clusters_dir(&self) -> PathBuf {
+        self.base_dir.join("clusters")
+    }
+
+    /// Get the groups directory
+    fn groups_dir(&self) -> PathBuf {
+        self.base_dir.join("groups")
+    }
+
+    /// Get the cluster mapping file path
+    fn cluster_path(&self, cluster: &str) -> PathBuf {
         let safe_name: String = cluster
             .chars()
             .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
             .collect();
-        self.cache_dir.join(format!("{}.json", safe_name))
+        self.clusters_dir().join(format!("{}.json", safe_name))
     }
 
-    /// Ensure cache directory exists
-    fn ensure_cache_dir(&self) -> Result<()> {
-        if !self.cache_dir.exists() {
-            std::fs::create_dir_all(&self.cache_dir)
-                .context("Failed to create cache directory")?;
-        }
+    /// Get the group cache file path
+    fn group_path(&self, group: &str, version: &str) -> PathBuf {
+        let key = group_cache_key(group, version);
+        self.groups_dir().join(format!("{}.json", key))
+    }
+
+    /// Ensure cache directories exist
+    fn ensure_dirs(&self) -> Result<()> {
+        std::fs::create_dir_all(self.clusters_dir())
+            .context("Failed to create clusters cache directory")?;
+        std::fs::create_dir_all(self.groups_dir())
+            .context("Failed to create groups cache directory")?;
         Ok(())
     }
 
-    /// Load cached CRDs for a cluster
-    /// Returns None if cache doesn't exist or is stale
-    pub fn load(&self, cluster: &str) -> Option<CachedRegistry> {
-        let path = self.cache_path(cluster);
+    /// Load the list of API groups for a cluster (if cached and fresh)
+    #[allow(dead_code)]
+    pub fn load_cluster_groups(&self, cluster: &str) -> Option<Vec<(String, String)>> {
+        let path = self.cluster_path(cluster);
         if !path.exists() {
             return None;
         }
 
         let content = std::fs::read_to_string(&path).ok()?;
-        let cached: CachedRegistry = serde_json::from_str(&content).ok()?;
+        let cluster_groups: ClusterGroups = serde_json::from_str(&content).ok()?;
 
-        if cached.is_fresh(self.ttl) {
-            Some(cached)
+        if cluster_groups.is_fresh(self.ttl) {
+            Some(cluster_groups.groups)
         } else {
-            // Cache is stale, remove it
             let _ = std::fs::remove_file(&path);
             None
         }
     }
 
-    /// Save CRDs to cache for a cluster
-    pub fn save(&self, cluster: &str, registry: &ResourceRegistry) -> Result<()> {
-        self.ensure_cache_dir()?;
+    /// Load a single API group's resources (if cached and fresh)
+    pub fn load_group(&self, group: &str, version: &str) -> Option<CachedGroup> {
+        let path = self.group_path(group, version);
+        if !path.exists() {
+            return None;
+        }
 
-        let cached = CachedRegistry::from_registry(registry);
-        let content = serde_json::to_string_pretty(&cached)
-            .context("Failed to serialize cache")?;
+        let content = std::fs::read_to_string(&path).ok()?;
+        let cached: CachedGroup = serde_json::from_str(&content).ok()?;
 
-        let path = self.cache_path(cluster);
+        if cached.is_fresh(self.ttl) {
+            Some(cached)
+        } else {
+            let _ = std::fs::remove_file(&path);
+            None
+        }
+    }
+
+    /// Check which API groups are missing from cache
+    /// Returns (cached_groups, missing_groups)
+    pub fn check_groups(
+        &self,
+        api_groups: &[(String, String)],
+    ) -> (Vec<CachedGroup>, Vec<(String, String)>) {
+        let mut cached = Vec::new();
+        let mut missing = Vec::new();
+
+        for (group, version) in api_groups {
+            if let Some(cached_group) = self.load_group(group, version) {
+                cached.push(cached_group);
+            } else {
+                missing.push((group.clone(), version.clone()));
+            }
+        }
+
+        (cached, missing)
+    }
+
+    /// Save the list of API groups for a cluster
+    pub fn save_cluster_groups(&self, cluster: &str, groups: &[(String, String)]) -> Result<()> {
+        self.ensure_dirs()?;
+
+        let cluster_groups = ClusterGroups::new(groups.to_vec());
+        let content = serde_json::to_string_pretty(&cluster_groups)
+            .context("Failed to serialize cluster groups")?;
+
+        let path = self.cluster_path(cluster);
         std::fs::write(&path, content)
-            .with_context(|| format!("Failed to write cache to {:?}", path))?;
+            .with_context(|| format!("Failed to write cluster groups to {:?}", path))?;
+
+        Ok(())
+    }
+
+    /// Save a single API group's resources
+    pub fn save_group(&self, group: &str, version: &str, resources: &[CachedResourceInfo]) -> Result<()> {
+        self.ensure_dirs()?;
+
+        let cached = CachedGroup::new(group.to_string(), version.to_string(), resources.to_vec());
+        let content = serde_json::to_string_pretty(&cached)
+            .context("Failed to serialize group cache")?;
+
+        let path = self.group_path(group, version);
+        std::fs::write(&path, content)
+            .with_context(|| format!("Failed to write group cache to {:?}", path))?;
 
         Ok(())
     }
@@ -213,7 +326,7 @@ impl ResourceCache {
     /// Clear cache for a specific cluster
     #[allow(dead_code)]
     pub fn clear(&self, cluster: &str) -> Result<()> {
-        let path = self.cache_path(cluster);
+        let path = self.cluster_path(cluster);
         if path.exists() {
             std::fs::remove_file(&path)?;
         }
@@ -223,8 +336,8 @@ impl ResourceCache {
     /// Clear all cached data
     #[allow(dead_code)]
     pub fn clear_all(&self) -> Result<()> {
-        if self.cache_dir.exists() {
-            std::fs::remove_dir_all(&self.cache_dir)?;
+        if self.base_dir.exists() {
+            std::fs::remove_dir_all(&self.base_dir)?;
         }
         Ok(())
     }

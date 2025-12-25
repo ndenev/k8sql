@@ -8,7 +8,7 @@
 
 use anyhow::Result;
 use kube::Client;
-use kube::discovery::{ApiCapabilities, ApiResource, Discovery, Scope};
+use kube::discovery::{ApiCapabilities, ApiResource, Scope};
 use std::collections::HashMap;
 
 /// Column definition for schema
@@ -267,19 +267,98 @@ pub fn build_core_registry() -> ResourceRegistry {
 }
 
 /// Discover all available resources on a Kubernetes cluster (including CRDs)
-/// 
+/// Uses parallel API group fetching for faster discovery.
+///
+/// Returns (ResourceRegistry, api_groups) where api_groups can be used for fingerprinting.
+///
 /// Note: This function queries the discovery API which can be slow with many clusters.
 /// For fast startup, use `build_core_registry()` which provides instant access to core K8s resources.
-/// This function is kept for potential future CRD discovery support.
-#[allow(dead_code)]
-pub async fn discover_resources(client: &Client) -> Result<ResourceRegistry> {
+pub async fn discover_resources(client: &Client) -> Result<(ResourceRegistry, Vec<(String, String)>)> {
+    use futures::future::join_all;
+    use kube::discovery::oneshot;
+
     let mut registry = ResourceRegistry::new();
+    let mut api_groups: Vec<(String, String)> = Vec::new();
 
-    // Run discovery
-    let discovery = Discovery::new(client.clone()).run().await?;
+    // Step 1: Get all API groups (single API call)
+    let core_groups = client.list_core_api_versions().await?;
+    let api_group_list = client.list_api_groups().await?;
 
-    for group in discovery.groups() {
-        // Get the preferred version's resources
+    // Collect all (group, version) pairs for fingerprinting
+    // Core API (v1)
+    for version in &core_groups.versions {
+        api_groups.push(("".to_string(), version.clone()));
+    }
+
+    // Other API groups
+    for group in &api_group_list.groups {
+        if let Some(pref) = group.preferred_version.as_ref() {
+            api_groups.push((group.name.clone(), pref.version.clone()));
+        } else if let Some(first) = group.versions.first() {
+            api_groups.push((group.name.clone(), first.version.clone()));
+        }
+    }
+
+    // Step 2: Fetch resources for each group in parallel
+    // Build list of group versions to fetch
+    let mut group_versions: Vec<String> = Vec::new();
+
+    // Core API versions
+    for version in &core_groups.versions {
+        group_versions.push(version.clone());
+    }
+
+    // Other API group versions
+    for group in &api_group_list.groups {
+        let gv = if let Some(pref) = group.preferred_version.as_ref() {
+            &pref.group_version
+        } else if let Some(first) = group.versions.first() {
+            &first.group_version
+        } else {
+            continue;
+        };
+        group_versions.push(gv.clone());
+    }
+
+    // Fetch all groups in parallel using oneshot discovery
+    // Group by group name for efficient discovery
+    let mut group_names: Vec<&str> = api_group_list
+        .groups
+        .iter()
+        .map(|g| g.name.as_str())
+        .collect();
+    group_names.push(""); // Core API
+
+    let futures: Vec<_> = group_names
+        .iter()
+        .map(|&group_name| {
+            let client = client.clone();
+            let group = group_name.to_string();
+            async move {
+                let result = if group.is_empty() {
+                    // Core API - use pinned_kind for well-known resources
+                    // or we can use the Discovery approach
+                    oneshot::group(&client, "").await
+                } else {
+                    oneshot::group(&client, &group).await
+                };
+                (group, result)
+            }
+        })
+        .collect();
+
+    let results = join_all(futures).await;
+
+    // Process results
+    for (group_name, result) in results {
+        let group = match result {
+            Ok(g) => g,
+            Err(e) => {
+                tracing::debug!(group = %group_name, error = %e, "Failed to discover API group");
+                continue;
+            }
+        };
+
         for (ar, caps) in group.recommended_resources() {
             // Skip subresources (e.g., pods/log, pods/exec)
             if ar.plural.contains('/') {
@@ -319,7 +398,112 @@ pub async fn discover_resources(client: &Client) -> Result<ResourceRegistry> {
         }
     }
 
-    Ok(registry)
+    Ok((registry, api_groups))
+}
+
+/// Get API groups list (fast, 2 API calls)
+/// Returns (group_name, version) pairs
+pub async fn get_api_groups(client: &Client) -> Result<Vec<(String, String)>> {
+    let mut api_groups: Vec<(String, String)> = Vec::new();
+
+    // Core API (v1)
+    let core_groups = client.list_core_api_versions().await?;
+    for version in &core_groups.versions {
+        api_groups.push(("".to_string(), version.clone()));
+    }
+
+    // Other API groups
+    let api_group_list = client.list_api_groups().await?;
+    for group in &api_group_list.groups {
+        if let Some(pref) = group.preferred_version.as_ref() {
+            api_groups.push((group.name.clone(), pref.version.clone()));
+        } else if let Some(first) = group.versions.first() {
+            api_groups.push((group.name.clone(), first.version.clone()));
+        }
+    }
+
+    Ok(api_groups)
+}
+
+/// Discover resources for specific API groups only (parallel)
+/// Returns a map of (group, version) -> Vec<ResourceInfo>
+pub async fn discover_groups(
+    client: &Client,
+    groups: &[(String, String)],
+) -> Result<std::collections::HashMap<(String, String), Vec<ResourceInfo>>> {
+    use futures::future::join_all;
+    use kube::discovery::oneshot;
+
+    let futures: Vec<_> = groups
+        .iter()
+        .map(|(group_name, version)| {
+            let client = client.clone();
+            let group = group_name.clone();
+            let ver = version.clone();
+            async move {
+                let result = oneshot::group(&client, &group).await;
+                ((group, ver), result)
+            }
+        })
+        .collect();
+
+    let results = join_all(futures).await;
+
+    let mut discovered: std::collections::HashMap<(String, String), Vec<ResourceInfo>> =
+        std::collections::HashMap::new();
+
+    for ((group_name, version), result) in results {
+        let group = match result {
+            Ok(g) => g,
+            Err(e) => {
+                tracing::debug!(group = %group_name, error = %e, "Failed to discover API group");
+                continue;
+            }
+        };
+
+        let mut resources = Vec::new();
+        for (ar, caps) in group.recommended_resources() {
+            // Skip subresources (e.g., pods/log, pods/exec)
+            if ar.plural.contains('/') {
+                continue;
+            }
+
+            // Determine table name (plural, lowercase)
+            let table_name = ar.plural.to_lowercase();
+
+            // Mark as core if from a standard K8s API group
+            let is_core = matches!(
+                ar.group.as_str(),
+                "" | "apps"
+                    | "batch"
+                    | "networking.k8s.io"
+                    | "policy"
+                    | "rbac.authorization.k8s.io"
+                    | "storage.k8s.io"
+                    | "autoscaling"
+                    | "coordination.k8s.io"
+            );
+
+            // Use lowercase kind as a basic alias
+            let aliases = vec![ar.kind.to_lowercase()];
+
+            let info = ResourceInfo {
+                api_resource: ar.clone(),
+                capabilities: caps.clone(),
+                table_name,
+                aliases,
+                is_core,
+                group: ar.group.clone(),
+                version: ar.version.clone(),
+            };
+
+            resources.push(info);
+        }
+
+        discovered.insert((group_name, version), resources);
+    }
+
+    Ok(discovered)
 }
 
 /// Generate a PostgreSQL-style schema for a discovered resource

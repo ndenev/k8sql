@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
-use super::cache::ResourceCache;
+use super::cache::{CachedResourceInfo, ResourceCache};
 use super::discovery::{ResourceInfo, ResourceRegistry};
 use crate::progress::ProgressHandle;
 use crate::sql::ApiFilters;
@@ -109,7 +109,10 @@ impl K8sClientPool {
     ///
     /// Strategy:
     /// 1. Core resources: Always instant from k8s-openapi (no I/O)
-    /// 2. CRDs: Load from local disk cache if fresh, otherwise discover from cluster
+    /// 2. CRDs: Try fingerprint-based cache lookup first
+    ///    a. If cluster has cached fingerprint, load CRDs by that fingerprint (no API calls)
+    ///    b. If fingerprint cache hit from another cluster, reuse it (2 API calls for fingerprint)
+    ///    c. Otherwise, run parallel discovery and cache by fingerprint
     async fn discover_resources_for_context(&self, context: &str, force: bool) -> Result<()> {
         // Check if already in memory and not expired
         if !force {
@@ -132,25 +135,14 @@ impl K8sClientPool {
         let mut registry = super::discovery::build_core_registry();
         let core_count = registry.list_tables().len();
 
-        // Step 2: Try to load CRDs from local disk cache
+        // Step 2: Load CRDs with per-API-group caching
         let crd_count = if !force {
-            if let Some(cached_crds) = self.resource_cache.load(context) {
-                let crd_registry = cached_crds.to_registry();
-                let count = crd_registry.list_tables().len();
-                info!(
-                    context = %context,
-                    crd_count = count,
-                    "Loaded CRDs from cache"
-                );
-                registry.merge(crd_registry);
-                count
-            } else {
-                // Cache miss - discover CRDs from cluster
-                self.discover_and_cache_crds(context, &client, &mut registry).await?
-            }
+            self.load_crds_with_cache(context, &client, &mut registry)
+                .await?
         } else {
-            // Force refresh - discover CRDs from cluster
-            self.discover_and_cache_crds(context, &client, &mut registry).await?
+            // Force refresh - discover all CRDs from cluster
+            self.discover_all_crds(context, &client, &mut registry)
+                .await?
         };
 
         let table_count = core_count + crd_count;
@@ -167,39 +159,188 @@ impl K8sClientPool {
         Ok(())
     }
 
-    /// Discover CRDs from the cluster and save to local cache
-    async fn discover_and_cache_crds(
+    /// Load CRDs using per-API-group caching
+    /// Returns the number of CRDs loaded
+    ///
+    /// Strategy:
+    /// 1. Check if we have cached API groups list for this cluster
+    /// 2. If yes, check which groups are cached vs missing
+    /// 3. Load cached groups, discover only missing groups in parallel
+    /// 4. Save newly discovered groups to cache
+    async fn load_crds_with_cache(
         &self,
         context: &str,
         client: &Client,
         registry: &mut ResourceRegistry,
     ) -> Result<usize> {
-        // Run full discovery to find CRDs
-        let discovered = super::discovery::discover_resources(client).await?;
+        // Step 1: Get current API groups from cluster (fast, 2 API calls)
+        let api_groups = super::discovery::get_api_groups(client).await?;
 
-        // Filter to only non-core resources (CRDs)
-        let crd_count = discovered
-            .list_tables()
+        // Filter to non-core groups only (core resources come from k8s-openapi)
+        let crd_groups: Vec<_> = api_groups
             .iter()
-            .filter(|info| !info.is_core)
-            .count();
+            .filter(|(group, _)| {
+                !matches!(
+                    group.as_str(),
+                    "" | "apps"
+                        | "batch"
+                        | "networking.k8s.io"
+                        | "policy"
+                        | "rbac.authorization.k8s.io"
+                        | "storage.k8s.io"
+                        | "autoscaling"
+                        | "coordination.k8s.io"
+                )
+            })
+            .cloned()
+            .collect();
 
-        if crd_count > 0 {
+        if crd_groups.is_empty() {
+            // No CRD groups, just save cluster groups and return
+            if let Err(e) = self.resource_cache.save_cluster_groups(context, &api_groups) {
+                warn!(context = %context, error = %e, "Failed to save cluster groups");
+            }
+            return Ok(0);
+        }
+
+        // Step 2: Check which groups are cached vs missing
+        let (cached_groups, missing_groups) = self.resource_cache.check_groups(&crd_groups);
+
+        let cached_count = cached_groups.len();
+        let missing_count = missing_groups.len();
+
+        // Step 3: Load cached groups into registry
+        for cached_group in &cached_groups {
+            for resource in &cached_group.resources {
+                registry.add(resource.clone().into());
+            }
+        }
+
+        // Step 4: Discover missing groups in parallel (if any)
+        let discovered_count = if !missing_groups.is_empty() {
             info!(
                 context = %context,
-                crd_count = crd_count,
-                "Discovered CRDs from cluster"
+                cached = cached_count,
+                missing = missing_count,
+                "Loading CRDs (cached: {}, discovering: {})",
+                cached_count,
+                missing_count
             );
 
-            // Save CRDs to local cache for next startup
-            if let Err(e) = self.resource_cache.save(context, &discovered) {
+            let discovered = super::discovery::discover_groups(client, &missing_groups).await?;
+
+            // Save and add discovered groups
+            let mut count = 0;
+            for ((group, version), resources) in &discovered {
+                // Convert to cached format
+                let cached_resources: Vec<CachedResourceInfo> =
+                    resources.iter().map(CachedResourceInfo::from).collect();
+
+                // Save to cache
+                if let Err(e) = self.resource_cache.save_group(group, version, &cached_resources) {
+                    warn!(
+                        context = %context,
+                        group = %group,
+                        error = %e,
+                        "Failed to cache API group"
+                    );
+                }
+
+                // Add to registry
+                for info in resources {
+                    registry.add(info.clone());
+                    count += 1;
+                }
+            }
+            count
+        } else {
+            info!(
+                context = %context,
+                cached = cached_count,
+                "Loaded all CRDs from cache"
+            );
+            0
+        };
+
+        // Step 5: Save cluster groups list for next time
+        if let Err(e) = self.resource_cache.save_cluster_groups(context, &api_groups) {
+            warn!(context = %context, error = %e, "Failed to save cluster groups");
+        }
+
+        // Total CRD count
+        let crd_count = cached_groups.iter().map(|g| g.resources.len()).sum::<usize>() + discovered_count;
+
+        Ok(crd_count)
+    }
+
+    /// Force rediscover all CRDs from the cluster
+    async fn discover_all_crds(
+        &self,
+        context: &str,
+        client: &Client,
+        registry: &mut ResourceRegistry,
+    ) -> Result<usize> {
+        // Run full parallel discovery
+        let (discovered, api_groups) = super::discovery::discover_resources(client).await?;
+
+        // Filter to non-core groups
+        let crd_groups: Vec<_> = api_groups
+            .iter()
+            .filter(|(group, _)| {
+                !matches!(
+                    group.as_str(),
+                    "" | "apps"
+                        | "batch"
+                        | "networking.k8s.io"
+                        | "policy"
+                        | "rbac.authorization.k8s.io"
+                        | "storage.k8s.io"
+                        | "autoscaling"
+                        | "coordination.k8s.io"
+                )
+            })
+            .cloned()
+            .collect();
+
+        // Group resources by API group for caching
+        let mut by_group: std::collections::HashMap<(String, String), Vec<CachedResourceInfo>> =
+            std::collections::HashMap::new();
+
+        let mut crd_count = 0;
+        for info in discovered.list_tables() {
+            if !info.is_core {
+                let key = (info.group.clone(), info.version.clone());
+                by_group
+                    .entry(key)
+                    .or_default()
+                    .push(CachedResourceInfo::from(info));
+                crd_count += 1;
+            }
+        }
+
+        // Save each group to cache
+        for ((group, version), resources) in &by_group {
+            if let Err(e) = self.resource_cache.save_group(group, version, resources) {
                 warn!(
                     context = %context,
+                    group = %group,
                     error = %e,
-                    "Failed to cache CRDs (will rediscover next time)"
+                    "Failed to cache API group"
                 );
             }
         }
+
+        // Save cluster groups list
+        if let Err(e) = self.resource_cache.save_cluster_groups(context, &crd_groups) {
+            warn!(context = %context, error = %e, "Failed to save cluster groups");
+        }
+
+        info!(
+            context = %context,
+            crd_count = crd_count,
+            groups = by_group.len(),
+            "Discovered CRDs from cluster (parallel)"
+        );
 
         // Merge discovered resources into registry
         registry.merge(discovered);
