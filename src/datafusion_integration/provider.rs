@@ -321,7 +321,7 @@ impl TableProvider for K8sTableProvider {
         // Build API filters with label selector
         let api_filters = ApiFilters {
             label_selector,
-            field_selector: None, // TODO: Add field selector support for status.phase etc.
+            field_selector: None, // K8s field selectors have limited supported fields per resource
         };
 
         // Determine which cluster(s) to query based on filter
