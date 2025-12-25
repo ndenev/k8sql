@@ -211,9 +211,10 @@ async fn run_interactive(args: &Args) -> Result<()> {
 
     // If CLI didn't specify context and we have saved contexts with multiple entries,
     // switch to all saved contexts now (we only initialized with the first one)
+    // Use force_refresh=false to leverage cache for fast startup
     if args.context.is_none() && saved_contexts.len() > 1 {
         let context_spec = saved_contexts.join(", ");
-        if let Err(e) = pool.switch_context(&context_spec).await {
+        if let Err(e) = pool.switch_context(&context_spec, false).await {
             // Non-fatal: just warn and continue with initial context
             eprintln!("Warning: Could not restore saved contexts: {}", e);
         } else {

@@ -762,11 +762,12 @@ pub async fn run_repl(mut session: K8sSessionContext, pool: Arc<K8sClientPool>) 
                     let mut progress_rx = pool.progress().subscribe();
 
                     // Run switch_context with progress updates
+                    // Use force_refresh=true since user explicitly wants to switch (get fresh data)
                     let switch_result = {
                         let pool = Arc::clone(&pool);
                         let context_spec = context_spec.to_string();
                         let mut switch_handle =
-                            Box::pin(async move { pool.switch_context(&context_spec).await });
+                            Box::pin(async move { pool.switch_context(&context_spec, true).await });
 
                         loop {
                             tokio::select! {

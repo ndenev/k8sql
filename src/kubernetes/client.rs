@@ -513,7 +513,9 @@ impl K8sClientPool {
 
     /// Switch to one or more contexts
     /// Supports: "context1" or "context1, context2, context3" or glob patterns like "prod-*"
-    pub async fn switch_context(&self, context_spec: &str) -> Result<()> {
+    /// If `force_refresh` is true, bypasses cache and does full discovery (use for explicit USE commands)
+    /// If false, uses cached discovery results when available (use for startup restore)
+    pub async fn switch_context(&self, context_spec: &str, force_refresh: bool) -> Result<()> {
         let all_contexts: Vec<String> = self
             .kubeconfig
             .contexts
@@ -562,7 +564,7 @@ impl K8sClientPool {
                     self.get_or_create_client(&ctx)
                         .await
                         .with_context(|| format!("Failed to connect to cluster '{}'", ctx))?;
-                    self.discover_resources_for_context(&ctx, true)
+                    self.discover_resources_for_context(&ctx, force_refresh)
                         .await
                         .with_context(|| format!("Failed to discover resources for cluster '{}'", ctx))?;
                     Ok::<_, anyhow::Error>(())
