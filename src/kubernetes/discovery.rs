@@ -146,6 +146,14 @@ impl ResourceRegistry {
         resources.sort_by(|a, b| a.table_name.cmp(&b.table_name));
         resources
     }
+
+    /// Merge another registry into this one
+    /// Resources from the other registry are added using the normal add() logic
+    pub fn merge(&mut self, other: ResourceRegistry) {
+        for info in other.by_table_name.into_values() {
+            self.add(info);
+        }
+    }
 }
 
 /// Build a registry with just core resources using k8s-openapi types (no discovery, instant startup)

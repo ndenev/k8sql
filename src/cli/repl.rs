@@ -619,6 +619,10 @@ fn print_help() {
         "  {}  - Switch to cluster(s): USE prod, USE prod-*, USE c1, c2, c3",
         cmd_style.apply_to("USE <pattern>")
     );
+    println!(
+        "  {}  - Rediscover CRDs from cluster (updates cache)",
+        cmd_style.apply_to("REFRESH TABLES")
+    );
     println!();
     println!("{}", help_style.apply_to("Examples:"));
     println!(
@@ -797,6 +801,27 @@ pub async fn run_repl(mut session: K8sSessionContext, pool: Arc<K8sClientPool>) 
                             && let Ok(mut cache_guard) = cache.write()
                         {
                             *cache_guard = new_cache;
+                        }
+                    }
+                    println!();
+                    continue;
+                }
+
+                // Handle REFRESH TABLES (force rediscovery of CRDs)
+                if lower.trim().trim_end_matches(';') == "refresh tables" {
+                    let spinner = create_spinner("Refreshing tables (rediscovering CRDs)...");
+
+                    match pool.refresh_tables().await {
+                        Ok(count) => {
+                            spinner.finish_and_clear();
+                            println!(
+                                "{}",
+                                style(format!("Refreshed {} tables", count)).green()
+                            );
+                        }
+                        Err(e) => {
+                            spinner.finish_and_clear();
+                            println!("{}", style(format!("Error: {}", e)).red());
                         }
                     }
                     println!();

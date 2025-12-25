@@ -6,8 +6,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
+use super::cache::ResourceCache;
 use super::discovery::{ResourceInfo, ResourceRegistry};
 use crate::progress::ProgressHandle;
 use crate::sql::ApiFilters;
@@ -60,6 +61,8 @@ pub struct K8sClientPool {
     current_contexts: Arc<RwLock<Vec<String>>>,
     /// Progress reporter for query status updates
     progress: ProgressHandle,
+    /// Local disk cache for CRD discovery results
+    resource_cache: ResourceCache,
 }
 
 impl K8sClientPool {
@@ -87,6 +90,7 @@ impl K8sClientPool {
             registries: Arc::new(RwLock::new(HashMap::new())),
             current_contexts: Arc::new(RwLock::new(vec![context_name])),
             progress: crate::progress::create_progress_handle(),
+            resource_cache: ResourceCache::new()?,
         })
     }
 
@@ -101,12 +105,13 @@ impl K8sClientPool {
     }
 
     /// Discover all available resources for a context
-    /// If force is true, always rediscover even if cached
-    /// 
-    /// Uses pre-built core resource registry for instant startup.
-    /// CRD discovery can be done lazily on-demand if needed.
+    /// If force is true, always rediscover CRDs even if cached
+    ///
+    /// Strategy:
+    /// 1. Core resources: Always instant from k8s-openapi (no I/O)
+    /// 2. CRDs: Load from local disk cache if fresh, otherwise discover from cluster
     async fn discover_resources_for_context(&self, context: &str, force: bool) -> Result<()> {
-        // Check if already discovered and not expired
+        // Check if already in memory and not expired
         if !force {
             let registries = self.registries.read().await;
             if let Some(cached) = registries.get(context)
@@ -117,16 +122,38 @@ impl K8sClientPool {
         }
 
         // Ensure client is ready (validates connection)
-        let _client = self.get_or_create_client(context).await?;
+        let client = self.get_or_create_client(context).await?;
 
         // Report discovering
         self.progress.discovering(context);
         let start = std::time::Instant::now();
 
-        // Use pre-built core registry instead of querying discovery API
-        // This is instant and covers all standard K8s resources
-        let registry = super::discovery::build_core_registry();
-        let table_count = registry.list_tables().len();
+        // Step 1: Build core registry (instant, no I/O)
+        let mut registry = super::discovery::build_core_registry();
+        let core_count = registry.list_tables().len();
+
+        // Step 2: Try to load CRDs from local disk cache
+        let crd_count = if !force {
+            if let Some(cached_crds) = self.resource_cache.load(context) {
+                let crd_registry = cached_crds.to_registry();
+                let count = crd_registry.list_tables().len();
+                info!(
+                    context = %context,
+                    crd_count = count,
+                    "Loaded CRDs from cache"
+                );
+                registry.merge(crd_registry);
+                count
+            } else {
+                // Cache miss - discover CRDs from cluster
+                self.discover_and_cache_crds(context, &client, &mut registry).await?
+            }
+        } else {
+            // Force refresh - discover CRDs from cluster
+            self.discover_and_cache_crds(context, &client, &mut registry).await?
+        };
+
+        let table_count = core_count + crd_count;
 
         // Report discovery complete
         self.progress
@@ -138,6 +165,46 @@ impl K8sClientPool {
         }
 
         Ok(())
+    }
+
+    /// Discover CRDs from the cluster and save to local cache
+    async fn discover_and_cache_crds(
+        &self,
+        context: &str,
+        client: &Client,
+        registry: &mut ResourceRegistry,
+    ) -> Result<usize> {
+        // Run full discovery to find CRDs
+        let discovered = super::discovery::discover_resources(client).await?;
+
+        // Filter to only non-core resources (CRDs)
+        let crd_count = discovered
+            .list_tables()
+            .iter()
+            .filter(|info| !info.is_core)
+            .count();
+
+        if crd_count > 0 {
+            info!(
+                context = %context,
+                crd_count = crd_count,
+                "Discovered CRDs from cluster"
+            );
+
+            // Save CRDs to local cache for next startup
+            if let Err(e) = self.resource_cache.save(context, &discovered) {
+                warn!(
+                    context = %context,
+                    error = %e,
+                    "Failed to cache CRDs (will rediscover next time)"
+                );
+            }
+        }
+
+        // Merge discovered resources into registry
+        registry.merge(discovered);
+
+        Ok(crd_count)
     }
 
     /// Get the resource registry for the current context
@@ -263,6 +330,26 @@ impl K8sClientPool {
     /// Get the progress reporter handle for subscribing to updates
     pub fn progress(&self) -> &ProgressHandle {
         &self.progress
+    }
+
+    /// Force refresh of resource tables (rediscover CRDs from cluster)
+    /// This clears the local cache and rediscovers all resources
+    pub async fn refresh_tables(&self) -> Result<usize> {
+        let contexts = self.current_contexts().await;
+        let mut total_tables = 0;
+
+        for context in &contexts {
+            // Force rediscovery (will update cache)
+            self.discover_resources_for_context(context, true).await?;
+
+            // Count tables
+            let registries = self.registries.read().await;
+            if let Some(cached) = registries.get(context) {
+                total_tables += cached.registry.list_tables().len();
+            }
+        }
+
+        Ok(total_tables)
     }
 
     /// Switch to one or more contexts
