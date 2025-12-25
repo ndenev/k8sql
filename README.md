@@ -281,6 +281,18 @@ WITH container_images AS (
 )
 SELECT * FROM container_images WHERE image LIKE '%nginx%'
 
+-- Split container images into name and tag
+WITH container_images AS (
+    SELECT _cluster, namespace, name as pod_name,
+           json_get_str(UNNEST(json_get_array(spec, 'containers')), 'image') as image
+    FROM pods
+)
+SELECT
+    _cluster, namespace, pod_name,
+    split_part(image, ':', 1) as image_name,
+    COALESCE(NULLIF(split_part(image, ':', 2), ''), 'latest') as tag
+FROM container_images
+
 -- Images grouped by namespace
 SELECT namespace,
        json_get_str(UNNEST(json_get_array(spec, 'containers')), 'image') as image
