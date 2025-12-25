@@ -9,16 +9,17 @@ use regex::Regex;
 use std::sync::LazyLock;
 
 /// Regex to match `labels.key = 'value'` or `labels.key = "value"` patterns
-/// Also matches labels.key != 'value' for inequality
+/// Also matches labels.key != 'value' for inequality and LIKE/ILIKE for patterns
 static LABEL_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
     // Match: labels.IDENTIFIER operator 'value' or "value"
-    // Operators: =, !=, <>
-    Regex::new(r#"labels\.([a-zA-Z0-9_.\-/]+)\s*(=|!=|<>)\s*('[^']*'|"[^"]*")"#).unwrap()
+    // Operators: =, !=, <>, LIKE, ILIKE, NOT LIKE, NOT ILIKE
+    Regex::new(r#"(?i)labels\.([a-zA-Z0-9_.\-/]+)\s*(=|!=|<>|NOT\s+ILIKE|NOT\s+LIKE|ILIKE|LIKE)\s*('[^']*'|"[^"]*")"#).unwrap()
 });
 
 /// Regex to match `annotations.key = 'value'` patterns
+/// Also matches LIKE/ILIKE for patterns
 static ANNOTATION_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"annotations\.([a-zA-Z0-9_.\-/]+)\s*(=|!=|<>)\s*('[^']*'|"[^"]*")"#).unwrap()
+    Regex::new(r#"(?i)annotations\.([a-zA-Z0-9_.\-/]+)\s*(=|!=|<>|NOT\s+ILIKE|NOT\s+LIKE|ILIKE|LIKE)\s*('[^']*'|"[^"]*")"#).unwrap()
 });
 
 /// Regex to fix ->> operator precedence when followed by comparison operators
@@ -29,7 +30,8 @@ static JSON_ARROW_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
     // The identifier can be:
     // - simple: status, spec
     // - qualified: p.status, pods.status, t.spec
-    Regex::new(r#"((?:\w+\.)?\w+)\s*->>\s*'([^']+)'\s*(=|!=|<>|<=|>=|<|>)"#).unwrap()
+    // Operators: =, !=, <>, <=, >=, <, >, LIKE, ILIKE, NOT LIKE, NOT ILIKE
+    Regex::new(r#"(?i)((?:\w+\.)?\w+)\s*->>\s*'([^']+)'\s*(=|!=|<>|<=|>=|<|>|NOT\s+ILIKE|NOT\s+LIKE|ILIKE|LIKE)"#).unwrap()
 });
 
 /// Preprocess SQL to convert k8sql-specific syntax to standard SQL
@@ -208,6 +210,87 @@ mod tests {
         assert_eq!(
             result,
             "SELECT * FROM pods p JOIN nodes n ON (p.spec->>'nodeName') = n.name WHERE (p.status->>'phase') != 'Running'"
+        );
+    }
+
+    #[test]
+    fn test_label_like() {
+        let sql = "SELECT * FROM pods WHERE labels.app LIKE 'nginx%'";
+        let result = preprocess_sql(sql);
+        assert_eq!(
+            result,
+            "SELECT * FROM pods WHERE json_get_str(labels, 'app') LIKE 'nginx%'"
+        );
+    }
+
+    #[test]
+    fn test_label_ilike() {
+        let sql = "SELECT * FROM pods WHERE labels.app ILIKE 'Nginx%'";
+        let result = preprocess_sql(sql);
+        assert_eq!(
+            result,
+            "SELECT * FROM pods WHERE json_get_str(labels, 'app') ILIKE 'Nginx%'"
+        );
+    }
+
+    #[test]
+    fn test_label_not_like() {
+        let sql = "SELECT * FROM pods WHERE labels.app NOT LIKE 'test%'";
+        let result = preprocess_sql(sql);
+        assert_eq!(
+            result,
+            "SELECT * FROM pods WHERE json_get_str(labels, 'app') NOT LIKE 'test%'"
+        );
+    }
+
+    #[test]
+    fn test_label_like_case_insensitive_keyword() {
+        // SQL keywords should be case-insensitive
+        let sql = "SELECT * FROM pods WHERE labels.app like 'nginx%'";
+        let result = preprocess_sql(sql);
+        assert_eq!(
+            result,
+            "SELECT * FROM pods WHERE json_get_str(labels, 'app') like 'nginx%'"
+        );
+    }
+
+    #[test]
+    fn test_annotation_like() {
+        let sql = "SELECT * FROM pods WHERE annotations.description LIKE '%important%'";
+        let result = preprocess_sql(sql);
+        assert_eq!(
+            result,
+            "SELECT * FROM pods WHERE json_get_str(annotations, 'description') LIKE '%important%'"
+        );
+    }
+
+    #[test]
+    fn test_json_arrow_like() {
+        let sql = "SELECT * FROM pods WHERE status->>'phase' LIKE 'Run%'";
+        let result = preprocess_sql(sql);
+        assert_eq!(
+            result,
+            "SELECT * FROM pods WHERE (status->>'phase') LIKE 'Run%'"
+        );
+    }
+
+    #[test]
+    fn test_json_arrow_ilike() {
+        let sql = "SELECT * FROM pods WHERE status->>'phase' ILIKE 'running'";
+        let result = preprocess_sql(sql);
+        assert_eq!(
+            result,
+            "SELECT * FROM pods WHERE (status->>'phase') ILIKE 'running'"
+        );
+    }
+
+    #[test]
+    fn test_json_arrow_not_like() {
+        let sql = "SELECT * FROM pods WHERE status->>'phase' NOT LIKE 'Fail%'";
+        let result = preprocess_sql(sql);
+        assert_eq!(
+            result,
+            "SELECT * FROM pods WHERE (status->>'phase') NOT LIKE 'Fail%'"
         );
     }
 }
