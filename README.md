@@ -273,11 +273,13 @@ FROM pods
 WHERE namespace = 'kube-system'
 ORDER BY image
 
--- Find pods using a specific image
-SELECT name, namespace,
-       json_get_str(UNNEST(json_get_array(spec, 'containers')), 'image') as image
-FROM pods
-WHERE json_get_str(UNNEST(json_get_array(spec, 'containers')), 'image') LIKE '%nginx%'
+-- Find pods using a specific image (use CTE to filter on UNNEST results)
+WITH container_images AS (
+    SELECT _cluster, namespace, name as pod_name,
+           json_get_str(UNNEST(json_get_array(spec, 'containers')), 'image') as image
+    FROM pods
+)
+SELECT * FROM container_images WHERE image LIKE '%nginx%'
 
 -- Images grouped by namespace
 SELECT namespace,
