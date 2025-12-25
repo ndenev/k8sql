@@ -473,6 +473,36 @@ pub fn generate_schema(info: &ResourceInfo) -> Vec<ColumnDef> {
             json_path: Some("metadata.annotations".to_string()),
             description: "Resource annotations".to_string(),
         },
+        ColumnDef {
+            name: "owner_references".to_string(),
+            data_type: "jsonb".to_string(),
+            json_path: Some("metadata.ownerReferences".to_string()),
+            description: "Owner references for tracking resource ownership".to_string(),
+        },
+        ColumnDef {
+            name: "generation".to_string(),
+            data_type: "integer".to_string(),
+            json_path: Some("metadata.generation".to_string()),
+            description: "Spec change counter".to_string(),
+        },
+        ColumnDef {
+            name: "resource_version".to_string(),
+            data_type: "text".to_string(),
+            json_path: Some("metadata.resourceVersion".to_string()),
+            description: "Version for optimistic concurrency".to_string(),
+        },
+        ColumnDef {
+            name: "deletion_timestamp".to_string(),
+            data_type: "timestamp".to_string(),
+            json_path: Some("metadata.deletionTimestamp".to_string()),
+            description: "When deletion was requested (null if not deleting)".to_string(),
+        },
+        ColumnDef {
+            name: "finalizers".to_string(),
+            data_type: "jsonb".to_string(),
+            json_path: Some("metadata.finalizers".to_string()),
+            description: "Finalizers blocking deletion".to_string(),
+        },
     ];
 
     // Add resource-specific columns based on type

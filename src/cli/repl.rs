@@ -30,8 +30,129 @@ use crate::progress::ProgressUpdate;
 // SQL keywords from sqlparser (comprehensive list)
 use datafusion::sql::sqlparser::keywords::ALL_KEYWORDS;
 
-// Common operators for WHERE clauses
-const OPERATORS: &[&str] = &["=", "!=", "<>", "<", ">", "<=", ">=", "LIKE", "IN", "NOT"];
+// For extracting function signatures
+use datafusion::logical_expr::{Signature, TypeSignature};
+
+// Comparison operators for WHERE clause completion
+// (LIKE, IN, NOT, AND, OR etc. are already in ALL_KEYWORDS)
+const COMPARISON_OPERATORS: &[&str] = &["=", "!=", "<>", "<", ">", "<=", ">="];
+
+/// Format a function signature for display as a hint
+fn format_signature(name: &str, sig: &Signature) -> String {
+    // If we have parameter names, use them
+    if let Some(ref names) = sig.parameter_names {
+        let params = names.join(", ");
+        return format!("{}({})", name, params);
+    }
+
+    // Otherwise format from TypeSignature
+    let params = match &sig.type_signature {
+        TypeSignature::Exact(types) => {
+            let type_strs: Vec<String> = types.iter().map(format_data_type).collect();
+            type_strs.join(", ")
+        }
+        TypeSignature::Uniform(n, types) => {
+            let type_str = if types.len() == 1 {
+                format_data_type(&types[0])
+            } else {
+                types
+                    .iter()
+                    .map(format_data_type)
+                    .collect::<Vec<_>>()
+                    .join("|")
+            };
+            // Generate n parameter placeholders
+            (0..*n)
+                .map(|i| format!("arg{}: {}", i + 1, type_str))
+                .collect::<Vec<_>>()
+                .join(", ")
+        }
+        TypeSignature::Variadic(types) => {
+            let type_str = types
+                .iter()
+                .map(format_data_type)
+                .collect::<Vec<_>>()
+                .join("|");
+            format!("{}...", type_str)
+        }
+        TypeSignature::VariadicAny => "expr, path...".to_string(),
+        TypeSignature::Any(n) => {
+            // n arguments of any type
+            (0..*n)
+                .map(|i| format!("arg{}", i + 1))
+                .collect::<Vec<_>>()
+                .join(", ")
+        }
+        TypeSignature::Comparable(n) => (0..*n)
+            .map(|i| format!("arg{}", i + 1))
+            .collect::<Vec<_>>()
+            .join(", "),
+        TypeSignature::OneOf(sigs) => {
+            // Show first signature as representative
+            if let Some(first) = sigs.first() {
+                format_type_signature(first)
+            } else {
+                "...".to_string()
+            }
+        }
+        TypeSignature::Coercible(coercions) => {
+            let type_strs: Vec<String> = coercions
+                .iter()
+                .map(|c| format!("{:?}", c.desired_type()))
+                .collect();
+            type_strs.join(", ")
+        }
+        TypeSignature::Nullary => String::new(),
+        // Type class signatures with arity
+        TypeSignature::Numeric(n) => (0..*n)
+            .map(|i| format!("num{}", i + 1))
+            .collect::<Vec<_>>()
+            .join(", "),
+        TypeSignature::String(n) => (0..*n)
+            .map(|i| format!("str{}", i + 1))
+            .collect::<Vec<_>>()
+            .join(", "),
+        _ => "...".to_string(),
+    };
+
+    format!("{}({})", name, params)
+}
+
+/// Format a TypeSignature (helper for OneOf)
+fn format_type_signature(ts: &TypeSignature) -> String {
+    match ts {
+        TypeSignature::Exact(types) => types
+            .iter()
+            .map(format_data_type)
+            .collect::<Vec<_>>()
+            .join(", "),
+        TypeSignature::Any(n) => (0..*n)
+            .map(|i| format!("arg{}", i + 1))
+            .collect::<Vec<_>>()
+            .join(", "),
+        _ => "...".to_string(),
+    }
+}
+
+/// Format a DataType for display (abbreviated)
+fn format_data_type(dt: &datafusion::arrow::datatypes::DataType) -> String {
+    use datafusion::arrow::datatypes::DataType;
+    match dt {
+        DataType::Utf8 | DataType::LargeUtf8 => "String".to_string(),
+        DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 => "Int".to_string(),
+        DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64 => {
+            "UInt".to_string()
+        }
+        DataType::Float16 | DataType::Float32 | DataType::Float64 => "Float".to_string(),
+        DataType::Boolean => "Bool".to_string(),
+        DataType::Date32 | DataType::Date64 => "Date".to_string(),
+        DataType::Timestamp(_, _) => "Timestamp".to_string(),
+        DataType::Null => "Null".to_string(),
+        DataType::List(_) | DataType::LargeList(_) => "List".to_string(),
+        DataType::Struct(_) => "Struct".to_string(),
+        _ => format!("{:?}", dt),
+    }
+}
 
 /// Cached completion data populated from Kubernetes cluster
 #[derive(Default)]
@@ -48,6 +169,8 @@ pub struct CompletionCache {
     pub contexts: Vec<String>,
     /// Registered SQL functions (scalar, aggregate, window)
     pub functions: Vec<String>,
+    /// Function signatures for hints (function_name -> formatted signature)
+    pub function_signatures: HashMap<String, String>,
 }
 
 impl CompletionCache {
@@ -110,10 +233,27 @@ impl CompletionCache {
             }
         }
 
-        // Get registered SQL functions (scalar, aggregate, window)
+        // Get registered SQL functions (scalar, aggregate, window) and their signatures
         let mut functions: Vec<String> = session.list_functions().into_iter().collect();
         functions.sort();
+
+        // Extract signatures for each function
+        let mut function_signatures = HashMap::new();
+        for func_name in &functions {
+            // Try to get signature from UDF, UDAF, or UDWF
+            let sig = session
+                .get_udf_signature(func_name)
+                .or_else(|| session.get_udaf_signature(func_name))
+                .or_else(|| session.get_udwf_signature(func_name));
+
+            if let Some(sig) = sig {
+                let formatted = format_signature(func_name, &sig);
+                function_signatures.insert(func_name.clone(), formatted);
+            }
+        }
+
         cache.functions = functions;
+        cache.function_signatures = function_signatures;
 
         cache.tables.sort();
         Ok(cache)
@@ -159,7 +299,48 @@ impl Helper for SqlHelper {}
 impl Hinter for SqlHelper {
     type Hint = String;
 
-    fn hint(&self, _line: &str, _pos: usize, _ctx: &Context<'_>) -> Option<Self::Hint> {
+    fn hint(&self, line: &str, pos: usize, _ctx: &Context<'_>) -> Option<Self::Hint> {
+        // Only show hints for the portion up to cursor
+        let line_to_cursor = &line[..pos];
+
+        // Check if we just typed a function name followed by '('
+        // Look for pattern: word( at the end
+        if let Some(paren_pos) = line_to_cursor.rfind('(') {
+            // Get the word before the opening paren
+            let before_paren = &line_to_cursor[..paren_pos];
+            let func_name = before_paren
+                .rsplit(|c: char| c.is_whitespace() || c == ',')
+                .next()?;
+
+            if func_name.is_empty() {
+                return None;
+            }
+
+            // Check if cursor is right after the '(' or within the function call
+            let after_paren = &line_to_cursor[paren_pos + 1..];
+
+            // Only show hint if we're still typing arguments (no closing paren yet)
+            if after_paren.contains(')') {
+                return None;
+            }
+
+            // Look up the function signature
+            let cache = self.cache.read().ok()?;
+            let func_lower = func_name.to_lowercase();
+
+            if let Some(signature) = cache.function_signatures.get(&func_lower) {
+                // Extract just the parameters part from the signature
+                // signature is like "func_name(param1, param2)"
+                if let Some(start) = signature.find('(') {
+                    let params = &signature[start..];
+                    // Only show if user hasn't typed much yet
+                    if after_paren.trim().is_empty() {
+                        return Some(format!(" ← {}", params));
+                    }
+                }
+            }
+        }
+
         None
     }
 }
@@ -248,7 +429,7 @@ impl SqlHelper {
                     let last_upper = last_token.to_uppercase();
 
                     // If last token is not already an operator or keyword, suggest operators
-                    let is_operator = OPERATORS.iter().any(|op| last_upper == *op);
+                    let is_operator = COMPARISON_OPERATORS.iter().any(|op| last_upper == *op);
                     let is_keyword = [
                         "AND", "OR", "WHERE", "NOT", "IN", "LIKE", "IS", "NULL", "BETWEEN",
                     ]
@@ -421,7 +602,7 @@ impl Completer for SqlHelper {
             }
 
             CompletionContext::Operator => {
-                for &op in OPERATORS {
+                for &op in COMPARISON_OPERATORS {
                     if op.starts_with(&prefix_upper) || op.starts_with(&prefix_lower) {
                         matches.push(Pair {
                             display: op.to_string(),

@@ -207,6 +207,27 @@ impl K8sSessionContext {
 
         functions
     }
+
+    /// Get the signature for a scalar UDF by name
+    pub fn get_udf_signature(&self, name: &str) -> Option<datafusion::logical_expr::Signature> {
+        self.ctx.udf(name).ok().map(|udf| udf.signature().clone())
+    }
+
+    /// Get the signature for an aggregate UDF by name
+    pub fn get_udaf_signature(&self, name: &str) -> Option<datafusion::logical_expr::Signature> {
+        self.ctx
+            .udaf(name)
+            .ok()
+            .map(|udaf| udaf.signature().clone())
+    }
+
+    /// Get the signature for a window UDF by name
+    pub fn get_udwf_signature(&self, name: &str) -> Option<datafusion::logical_expr::Signature> {
+        self.ctx
+            .udwf(name)
+            .ok()
+            .map(|udwf| udwf.signature().clone())
+    }
 }
 
 /// Convert an Arrow array value at a given index to a string
