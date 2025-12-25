@@ -21,7 +21,10 @@ use tokio::sync::broadcast;
 use crate::config::{self, Config};
 use crate::datafusion_integration::K8sSessionContext;
 use crate::kubernetes::K8sClientPool;
-use crate::output::{QueryResult, MAX_JSON_COLUMN_WIDTH, WIDE_COLUMNS, truncate_value, show_tables_result, show_databases_result};
+use crate::output::{
+    MAX_JSON_COLUMN_WIDTH, QueryResult, WIDE_COLUMNS, show_databases_result, show_tables_result,
+    truncate_value,
+};
 use crate::progress::ProgressUpdate;
 
 // SQL keywords for completion

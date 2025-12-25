@@ -5,7 +5,7 @@ mod yaml;
 
 pub use csv::CsvFormatter;
 pub use json::JsonFormatter;
-pub use table::{TableFormatter, MAX_JSON_COLUMN_WIDTH, WIDE_COLUMNS, truncate_value};
+pub use table::{MAX_JSON_COLUMN_WIDTH, TableFormatter, WIDE_COLUMNS, truncate_value};
 pub use yaml::YamlFormatter;
 
 use crate::cli::OutputFormat;
@@ -48,7 +48,10 @@ impl QueryResult {
 pub fn show_tables_result(tables: Vec<(String, String)>) -> QueryResult {
     QueryResult {
         columns: vec!["table_name".to_string(), "aliases".to_string()],
-        rows: tables.into_iter().map(|(name, aliases)| vec![name, aliases]).collect(),
+        rows: tables
+            .into_iter()
+            .map(|(name, aliases)| vec![name, aliases])
+            .collect(),
     }
 }
 
