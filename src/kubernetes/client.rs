@@ -566,7 +566,9 @@ impl K8sClientPool {
                         .with_context(|| format!("Failed to connect to cluster '{}'", ctx))?;
                     self.discover_resources_for_context(&ctx, force_refresh)
                         .await
-                        .with_context(|| format!("Failed to discover resources for cluster '{}'", ctx))?;
+                        .with_context(|| {
+                            format!("Failed to discover resources for cluster '{}'", ctx)
+                        })?;
                     Ok::<_, anyhow::Error>(())
                 }
             })

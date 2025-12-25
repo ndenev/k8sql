@@ -163,11 +163,11 @@ async fn run_interactive(args: &Args) -> Result<()> {
 
     // Create pool (fast, no I/O) and subscribe to progress BEFORE initialization
     // If CLI specifies context, use that; otherwise use first saved context or default
-    let initial_context = args.context.as_deref().or_else(|| saved_contexts.first().map(|s| s.as_str()));
-    let pool = Arc::new(K8sClientPool::new(
-        initial_context,
-        &args.namespace,
-    )?);
+    let initial_context = args
+        .context
+        .as_deref()
+        .or_else(|| saved_contexts.first().map(|s| s.as_str()));
+    let pool = Arc::new(K8sClientPool::new(initial_context, &args.namespace)?);
     let mut progress_rx = pool.progress().subscribe();
 
     // Initialize pool and create session with progress updates
