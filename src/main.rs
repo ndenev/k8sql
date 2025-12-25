@@ -129,12 +129,12 @@ async fn run_interactive(args: &Args) -> Result<()> {
     use indicatif::{ProgressBar, ProgressStyle};
     use progress::ProgressUpdate;
 
-    // Create a spinner for startup
+    // Create a spinner for startup with elapsed time
     let spinner = ProgressBar::new_spinner();
     spinner.set_style(
         ProgressStyle::default_spinner()
             .tick_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏")
-            .template("{spinner:.cyan} {msg}")
+            .template("{spinner:.cyan} {msg} {elapsed:.dim}")
             .unwrap(),
     );
     spinner.set_message("Connecting to Kubernetes...");

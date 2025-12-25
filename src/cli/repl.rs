@@ -510,7 +510,7 @@ fn create_spinner(msg: &str) -> ProgressBar {
     pb.set_style(
         ProgressStyle::default_spinner()
             .tick_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏")
-            .template("{spinner:.cyan} {msg}")
+            .template("{spinner:.cyan} {msg} {elapsed:.dim}")
             .unwrap(),
     );
     pb.set_message(msg.to_string());

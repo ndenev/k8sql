@@ -148,51 +148,124 @@ impl ResourceRegistry {
     }
 }
 
-/// Core resources that we have static types for
-/// These get priority handling and optimized schemas
-const CORE_RESOURCES: &[(&str, &[&str])] = &[
-    ("pods", &["pod"]),
-    ("services", &["service", "svc"]),
-    ("deployments", &["deployment", "deploy"]),
-    ("configmaps", &["configmap", "cm"]),
-    ("secrets", &["secret"]),
-    ("nodes", &["node"]),
-    ("namespaces", &["namespace", "ns"]),
-    ("ingresses", &["ingress", "ing"]),
-    ("jobs", &["job"]),
-    ("cronjobs", &["cronjob", "cj"]),
-    ("statefulsets", &["statefulset", "sts"]),
-    ("daemonsets", &["daemonset", "ds"]),
-    (
-        "persistentvolumeclaims",
-        &["persistentvolumeclaim", "pvc", "pvcs"],
-    ),
-    ("persistentvolumes", &["persistentvolume", "pv", "pvs"]),
-    ("replicasets", &["replicaset", "rs"]),
-    ("events", &["event", "ev"]),
-    ("serviceaccounts", &["serviceaccount", "sa"]),
-    ("endpoints", &["endpoint", "ep"]),
-    ("resourcequotas", &["resourcequota", "quota"]),
-    ("limitranges", &["limitrange", "limits"]),
-    (
-        "horizontalpodautoscalers",
-        &["horizontalpodautoscaler", "hpa"],
-    ),
-    ("poddisruptionbudgets", &["poddisruptionbudget", "pdb"]),
-    ("networkpolicies", &["networkpolicy", "netpol"]),
-    ("storageclasses", &["storageclass", "sc"]),
-    ("roles", &["role"]),
-    ("rolebindings", &["rolebinding"]),
-    ("clusterroles", &["clusterrole"]),
-    ("clusterrolebindings", &["clusterrolebinding"]),
-];
+/// Build a registry with just core resources using k8s-openapi types (no discovery, instant startup)
+///
+/// This uses compile-time type information from k8s-openapi, so it automatically
+/// stays in sync with the Kubernetes API version we're building against.
+pub fn build_core_registry() -> ResourceRegistry {
+    use k8s_openapi::api::{
+        apps::v1::{DaemonSet, Deployment, ReplicaSet, StatefulSet},
+        autoscaling::v2::HorizontalPodAutoscaler,
+        batch::v1::{CronJob, Job},
+        core::v1::{
+            ConfigMap, Endpoints, Event, LimitRange, Namespace, Node, PersistentVolume,
+            PersistentVolumeClaim, Pod, ResourceQuota, Secret, Service, ServiceAccount,
+        },
+        networking::v1::{Ingress, NetworkPolicy},
+        policy::v1::PodDisruptionBudget,
+        rbac::v1::{ClusterRole, ClusterRoleBinding, Role, RoleBinding},
+        storage::v1::StorageClass,
+    };
+    use kube::Resource;
 
-/// Discover all available resources on a Kubernetes cluster
-pub async fn discover_resources(client: &Client) -> Result<ResourceRegistry> {
     let mut registry = ResourceRegistry::new();
 
-    // Build a set of known core resource names for quick lookup
-    let core_names: HashMap<&str, &[&str]> = CORE_RESOURCES.iter().cloned().collect();
+    // Helper macro to add a resource type with aliases
+    // Uses compile-time type info from k8s-openapi via kube::Resource trait
+    // We explicitly specify namespaced since the Resource trait's Scope is an associated type
+    macro_rules! add_resource {
+        ($type:ty, namespaced, [$($alias:expr),* $(,)?]) => {{
+            add_resource!(@inner $type, Scope::Namespaced, [$($alias),*])
+        }};
+        ($type:ty, cluster, [$($alias:expr),* $(,)?]) => {{
+            add_resource!(@inner $type, Scope::Cluster, [$($alias),*])
+        }};
+        (@inner $type:ty, $scope:expr, [$($alias:expr),* $(,)?]) => {{
+            let ar = ApiResource {
+                group: <$type>::group(&()).to_string(),
+                version: <$type>::version(&()).to_string(),
+                api_version: <$type>::api_version(&()).to_string(),
+                kind: <$type>::kind(&()).to_string(),
+                plural: <$type>::plural(&()).to_string(),
+            };
+            let caps = ApiCapabilities {
+                scope: $scope,
+                subresources: vec![],
+                operations: vec![],
+            };
+            let table_name = <$type>::plural(&()).to_string();
+            let info = ResourceInfo {
+                api_resource: ar,
+                capabilities: caps,
+                table_name: table_name.clone(),
+                aliases: vec![$($alias.to_string()),*],
+                is_core: true,
+                group: <$type>::group(&()).to_string(),
+                version: <$type>::version(&()).to_string(),
+            };
+            registry.add(info);
+        }};
+    }
+
+    // Core API (v1) - namespaced resources
+    add_resource!(Pod, namespaced, ["pod", "po"]);
+    add_resource!(Service, namespaced, ["service", "svc"]);
+    add_resource!(ConfigMap, namespaced, ["configmap", "cm"]);
+    add_resource!(Secret, namespaced, ["secret"]);
+    add_resource!(Event, namespaced, ["event", "ev"]);
+    add_resource!(ServiceAccount, namespaced, ["serviceaccount", "sa"]);
+    add_resource!(Endpoints, namespaced, ["endpoint", "ep"]);
+    add_resource!(PersistentVolumeClaim, namespaced, ["persistentvolumeclaim", "pvc"]);
+    add_resource!(ResourceQuota, namespaced, ["resourcequota", "quota"]);
+    add_resource!(LimitRange, namespaced, ["limitrange", "limits"]);
+
+    // Core API (v1) - cluster-scoped resources
+    add_resource!(Node, cluster, ["node", "no"]);
+    add_resource!(Namespace, cluster, ["namespace", "ns"]);
+    add_resource!(PersistentVolume, cluster, ["persistentvolume", "pv"]);
+
+    // Apps API (apps/v1)
+    add_resource!(Deployment, namespaced, ["deployment", "deploy"]);
+    add_resource!(StatefulSet, namespaced, ["statefulset", "sts"]);
+    add_resource!(DaemonSet, namespaced, ["daemonset", "ds"]);
+    add_resource!(ReplicaSet, namespaced, ["replicaset", "rs"]);
+
+    // Batch API (batch/v1)
+    add_resource!(Job, namespaced, ["job"]);
+    add_resource!(CronJob, namespaced, ["cronjob", "cj"]);
+
+    // Networking API (networking.k8s.io/v1)
+    add_resource!(Ingress, namespaced, ["ingress", "ing"]);
+    add_resource!(NetworkPolicy, namespaced, ["networkpolicy", "netpol"]);
+
+    // Autoscaling API (autoscaling/v2)
+    add_resource!(HorizontalPodAutoscaler, namespaced, ["horizontalpodautoscaler", "hpa"]);
+
+    // Policy API (policy/v1)
+    add_resource!(PodDisruptionBudget, namespaced, ["poddisruptionbudget", "pdb"]);
+
+    // Storage API (storage.k8s.io/v1) - cluster-scoped
+    add_resource!(StorageClass, cluster, ["storageclass", "sc"]);
+
+    // RBAC API (rbac.authorization.k8s.io/v1) - namespaced
+    add_resource!(Role, namespaced, ["role"]);
+    add_resource!(RoleBinding, namespaced, ["rolebinding"]);
+
+    // RBAC API (rbac.authorization.k8s.io/v1) - cluster-scoped
+    add_resource!(ClusterRole, cluster, ["clusterrole"]);
+    add_resource!(ClusterRoleBinding, cluster, ["clusterrolebinding"]);
+
+    registry
+}
+
+/// Discover all available resources on a Kubernetes cluster (including CRDs)
+/// 
+/// Note: This function queries the discovery API which can be slow with many clusters.
+/// For fast startup, use `build_core_registry()` which provides instant access to core K8s resources.
+/// This function is kept for potential future CRD discovery support.
+#[allow(dead_code)]
+pub async fn discover_resources(client: &Client) -> Result<ResourceRegistry> {
+    let mut registry = ResourceRegistry::new();
 
     // Run discovery
     let discovery = Discovery::new(client.clone()).run().await?;
@@ -208,9 +281,8 @@ pub async fn discover_resources(client: &Client) -> Result<ResourceRegistry> {
             // Determine table name (plural, lowercase)
             let table_name = ar.plural.to_lowercase();
 
-            // Check if this is a core resource we know about
-            // A resource is only "core" if its name matches AND it's from a standard K8s API group
-            let is_standard_group = matches!(
+            // Mark as core if from a standard K8s API group
+            let is_core = matches!(
                 ar.group.as_str(),
                 "" | "apps"
                     | "batch"
@@ -221,19 +293,9 @@ pub async fn discover_resources(client: &Client) -> Result<ResourceRegistry> {
                     | "autoscaling"
                     | "coordination.k8s.io"
             );
-            let (is_core, aliases) = if is_standard_group {
-                if let Some(known_aliases) = core_names.get(table_name.as_str()) {
-                    (true, known_aliases.iter().map(|s| s.to_string()).collect())
-                } else {
-                    // Standard group but not in our known list - not core
-                    let aliases = vec![ar.kind.to_lowercase()];
-                    (false, aliases)
-                }
-            } else {
-                // Non-standard group (CRDs, metrics, etc.) - never core
-                let aliases = vec![ar.kind.to_lowercase()];
-                (false, aliases)
-            };
+
+            // Use lowercase kind as a basic alias
+            let aliases = vec![ar.kind.to_lowercase()];
 
             let info = ResourceInfo {
                 api_resource: ar.clone(),

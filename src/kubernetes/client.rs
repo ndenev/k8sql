@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 use tracing::{debug, warn};
 
-use super::discovery::{ResourceInfo, ResourceRegistry, discover_resources};
+use super::discovery::{ResourceInfo, ResourceRegistry};
 use crate::progress::ProgressHandle;
 use crate::sql::ApiFilters;
 
@@ -102,6 +102,9 @@ impl K8sClientPool {
 
     /// Discover all available resources for a context
     /// If force is true, always rediscover even if cached
+    /// 
+    /// Uses pre-built core resource registry for instant startup.
+    /// CRD discovery can be done lazily on-demand if needed.
     async fn discover_resources_for_context(&self, context: &str, force: bool) -> Result<()> {
         // Check if already discovered and not expired
         if !force {
@@ -113,13 +116,16 @@ impl K8sClientPool {
             }
         }
 
-        let client = self.get_or_create_client(context).await?;
+        // Ensure client is ready (validates connection)
+        let _client = self.get_or_create_client(context).await?;
 
         // Report discovering
         self.progress.discovering(context);
         let start = std::time::Instant::now();
 
-        let registry = discover_resources(&client).await?;
+        // Use pre-built core registry instead of querying discovery API
+        // This is instant and covers all standard K8s resources
+        let registry = super::discovery::build_core_registry();
         let table_count = registry.list_tables().len();
 
         // Report discovery complete
