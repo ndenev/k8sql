@@ -17,7 +17,6 @@ use datafusion::logical_expr::{Operator, TableProviderFilterPushDown};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::Expr;
 use futures::stream::{self, StreamExt};
-use tokio::sync::RwLock;
 use tracing::{debug, info};
 
 /// Maximum number of clusters to query concurrently
@@ -51,8 +50,6 @@ pub struct K8sTableProvider {
     pool: Arc<K8sClientPool>,
     /// Arrow schema for this table
     schema: SchemaRef,
-    /// Current cluster context (None = use pool's current)
-    cluster: Arc<RwLock<Option<String>>>,
 }
 
 impl K8sTableProvider {
@@ -64,14 +61,7 @@ impl K8sTableProvider {
             resource_info,
             pool,
             schema,
-            cluster: Arc::new(RwLock::new(None)),
         }
-    }
-
-    /// Set the cluster context for queries
-    #[allow(dead_code)]
-    pub async fn set_cluster(&self, cluster: Option<String>) {
-        *self.cluster.write().await = cluster;
     }
 
     /// Extract namespace filter from DataFusion expressions if possible

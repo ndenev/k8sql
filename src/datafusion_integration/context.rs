@@ -27,6 +27,12 @@ pub struct K8sSessionContext {
 impl K8sSessionContext {
     /// Create a new K8sSessionContext with all discovered K8s resources registered as tables
     pub async fn new(pool: Arc<K8sClientPool>) -> anyhow::Result<Self> {
+        let ctx = Self::create_session_context(&pool).await?;
+        Ok(Self { ctx, pool })
+    }
+
+    /// Create and configure a SessionContext with all K8s tables registered
+    async fn create_session_context(pool: &Arc<K8sClientPool>) -> anyhow::Result<SessionContext> {
         // Get the current Kubernetes context name for the catalog
         let cluster_name = pool
             .current_context()
@@ -46,20 +52,19 @@ impl K8sSessionContext {
         let registry = pool.get_registry(None).await?;
 
         for info in registry.list_tables() {
-            let provider = K8sTableProvider::new(info.clone(), Arc::clone(&pool));
+            let provider = K8sTableProvider::new(info.clone(), Arc::clone(pool));
 
             // Register with the primary table name
             ctx.register_table(&info.table_name, Arc::new(provider))?;
 
-            // Also register aliases
+            // Also register aliases (ignore conflicts)
             for alias in &info.aliases {
-                let provider = K8sTableProvider::new(info.clone(), Arc::clone(&pool));
-                // Ignore errors for aliases (might conflict)
-                let _ = ctx.register_table(alias, Arc::new(provider));
+                let alias_provider = K8sTableProvider::new(info.clone(), Arc::clone(pool));
+                let _ = ctx.register_table(alias, Arc::new(alias_provider));
             }
         }
 
-        Ok(Self { ctx, pool })
+        Ok(ctx)
     }
 
     /// Execute a SQL query and return the results as Arrow RecordBatches
@@ -111,35 +116,7 @@ impl K8sSessionContext {
 
     /// Refresh the registered tables (call after context switch)
     pub async fn refresh_tables(&mut self) -> anyhow::Result<()> {
-        // Get the current Kubernetes context name for the catalog
-        let cluster_name = self
-            .pool
-            .current_context()
-            .await
-            .unwrap_or_else(|_| "k8s".to_string());
-
-        // Create a new context and re-register all tables
-        let config = SessionConfig::new()
-            .with_information_schema(true)
-            .with_default_catalog_and_schema(&cluster_name, "default");
-        let mut new_ctx = SessionContext::new_with_config(config);
-
-        // Register JSON functions
-        datafusion_functions_json::register_all(&mut new_ctx)?;
-
-        let registry = self.pool.get_registry(None).await?;
-
-        for info in registry.list_tables() {
-            let provider = K8sTableProvider::new(info.clone(), Arc::clone(&self.pool));
-            new_ctx.register_table(&info.table_name, Arc::new(provider))?;
-
-            for alias in &info.aliases {
-                let provider = K8sTableProvider::new(info.clone(), Arc::clone(&self.pool));
-                let _ = new_ctx.register_table(alias, Arc::new(provider));
-            }
-        }
-
-        self.ctx = new_ctx;
+        self.ctx = Self::create_session_context(&self.pool).await?;
         Ok(())
     }
 

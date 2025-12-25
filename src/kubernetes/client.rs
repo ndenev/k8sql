@@ -297,46 +297,44 @@ impl K8sClientPool {
     }
 
     /// Simple glob pattern matching (supports * and ?)
+    /// Uses an efficient iterative algorithm without allocations
     fn glob_match(pattern: &str, text: &str) -> bool {
-        let mut pattern_chars = pattern.chars().peekable();
-        let mut text_chars = text.chars().peekable();
+        let pattern: Vec<char> = pattern.chars().collect();
+        let text: Vec<char> = text.chars().collect();
 
-        while let Some(p) = pattern_chars.next() {
-            match p {
-                '*' => {
-                    // * matches zero or more characters
-                    if pattern_chars.peek().is_none() {
-                        return true; // trailing * matches everything
-                    }
-                    // Try matching the rest of the pattern at each position
-                    let remaining_pattern: String = pattern_chars.collect();
-                    let mut remaining_text = String::new();
-                    while text_chars.peek().is_some() {
-                        remaining_text.push(text_chars.next().unwrap());
-                        let text_suffix: String = text_chars.clone().collect();
-                        if Self::glob_match(&remaining_pattern, &text_suffix) {
-                            return true;
-                        }
-                    }
-                    return Self::glob_match(&remaining_pattern, "");
-                }
-                '?' => {
-                    // ? matches exactly one character
-                    if text_chars.next().is_none() {
-                        return false;
-                    }
-                }
-                c => {
-                    // Literal character must match
-                    if text_chars.next() != Some(c) {
-                        return false;
-                    }
-                }
+        let mut pi = 0; // pattern index
+        let mut ti = 0; // text index
+        let mut star_pi = None; // position of last '*' in pattern
+        let mut star_ti = 0; // position in text when we saw last '*'
+
+        while ti < text.len() {
+            if pi < pattern.len() && (pattern[pi] == '?' || pattern[pi] == text[ti]) {
+                // Character match or '?' wildcard
+                pi += 1;
+                ti += 1;
+            } else if pi < pattern.len() && pattern[pi] == '*' {
+                // '*' wildcard - remember position and try matching zero chars
+                star_pi = Some(pi);
+                star_ti = ti;
+                pi += 1;
+            } else if let Some(sp) = star_pi {
+                // Mismatch, but we have a previous '*' - backtrack
+                // Try matching one more character with the '*'
+                pi = sp + 1;
+                star_ti += 1;
+                ti = star_ti;
+            } else {
+                // Mismatch and no '*' to backtrack to
+                return false;
             }
         }
 
-        // Pattern exhausted - text must also be exhausted
-        text_chars.next().is_none()
+        // Check remaining pattern characters (must all be '*')
+        while pi < pattern.len() && pattern[pi] == '*' {
+            pi += 1;
+        }
+
+        pi == pattern.len()
     }
 
     /// Fetch resources using dynamic discovery

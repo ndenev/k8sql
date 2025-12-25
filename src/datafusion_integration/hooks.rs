@@ -30,9 +30,9 @@ impl ShowDatabasesHook {
         Self { pool }
     }
 
-    fn create_response(&self) -> PgWireResult<Response> {
+    async fn create_response(&self) -> PgWireResult<Response> {
         let contexts = self.pool.list_contexts().unwrap_or_default();
-        let current = futures::executor::block_on(self.pool.current_context()).unwrap_or_default();
+        let current_contexts = self.pool.current_contexts().await;
 
         let fields = vec![
             FieldInfo::new(
@@ -52,10 +52,14 @@ impl ShowDatabasesHook {
         ];
         let fields = Arc::new(fields);
 
-        // Build all rows synchronously
+        // Build all rows
         let mut encoded_rows = Vec::new();
         for ctx in &contexts {
-            let current_marker = if *ctx == current { "*" } else { "" };
+            let current_marker = if current_contexts.contains(ctx) {
+                "*"
+            } else {
+                ""
+            };
             let mut encoder = DataRowEncoder::new(Arc::clone(&fields));
             encoder.encode_field(&Some(ctx.as_str()))?;
             encoder.encode_field(&Some(current_marker))?;
@@ -79,7 +83,7 @@ impl QueryHook for ShowDatabasesHook {
         _client: &mut (dyn ClientInfo + Send + Sync),
     ) -> Option<PgWireResult<Response>> {
         match statement {
-            Statement::ShowDatabases { .. } => Some(self.create_response()),
+            Statement::ShowDatabases { .. } => Some(self.create_response().await),
             _ => None,
         }
     }
@@ -121,7 +125,7 @@ impl QueryHook for ShowDatabasesHook {
         _client: &mut (dyn ClientInfo + Send + Sync),
     ) -> Option<PgWireResult<Response>> {
         match statement {
-            Statement::ShowDatabases { .. } => Some(self.create_response()),
+            Statement::ShowDatabases { .. } => Some(self.create_response().await),
             _ => None,
         }
     }

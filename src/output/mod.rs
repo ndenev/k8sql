@@ -26,13 +26,19 @@ impl QueryResult {
         }
     }
 
-    #[allow(dead_code)]
-    pub fn row_count(&self) -> usize {
-        self.rows.len()
-    }
-
-    #[allow(dead_code)]
-    pub fn is_empty(&self) -> bool {
-        self.rows.is_empty()
+    /// Convert rows to JSON Value objects (used by JSON and YAML formatters)
+    pub(crate) fn to_json_rows(&self) -> Vec<serde_json::Value> {
+        self.rows
+            .iter()
+            .map(|row| {
+                let obj: serde_json::Map<String, serde_json::Value> = self
+                    .columns
+                    .iter()
+                    .zip(row.iter())
+                    .map(|(col, val)| (col.clone(), serde_json::Value::String(val.clone())))
+                    .collect();
+                serde_json::Value::Object(obj)
+            })
+            .collect()
     }
 }
