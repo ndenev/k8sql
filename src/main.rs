@@ -153,11 +153,11 @@ async fn run_batch(args: &Args) -> Result<()> {
 
         // Handle SHOW TABLES specially (clean output without catalog/schema)
         if normalized == "SHOW TABLES" {
-            let mut tables = session.list_tables();
-            tables.sort();
+            let mut tables = session.list_tables_with_aliases().await;
+            tables.sort_by(|a, b| a.0.cmp(&b.0));
             let result = output::QueryResult {
-                columns: vec!["table_name".to_string()],
-                rows: tables.into_iter().map(|t| vec![t]).collect(),
+                columns: vec!["table_name".to_string(), "aliases".to_string()],
+                rows: tables.into_iter().map(|(name, aliases)| vec![name, aliases]).collect(),
             };
             println!("{}", result.format(&args.output, args.no_headers));
             continue;

@@ -143,28 +143,50 @@ impl K8sSessionContext {
         self.ctx
     }
 
-    /// List available tables
+    /// List available tables (primary names only, no aliases)
     #[allow(dead_code)]
     pub fn list_tables(&self) -> Vec<String> {
-        self.ctx
-            .catalog_names()
-            .into_iter()
-            .flat_map(|catalog| {
-                self.ctx
-                    .catalog(&catalog)
-                    .map(|c| {
-                        c.schema_names()
+        // Use blocking runtime to get registry info
+        let pool = Arc::clone(&self.pool);
+        let handle = tokio::runtime::Handle::current();
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                handle.block_on(async {
+                    if let Ok(registry) = pool.get_registry(None).await {
+                        registry
+                            .list_tables()
                             .into_iter()
-                            .flat_map(|schema| {
-                                c.schema(&schema)
-                                    .map(|s| s.table_names())
-                                    .unwrap_or_default()
-                            })
-                            .collect::<Vec<_>>()
-                    })
-                    .unwrap_or_default()
+                            .map(|info| info.table_name.clone())
+                            .collect()
+                    } else {
+                        vec![]
+                    }
+                })
             })
-            .collect()
+            .join()
+            .unwrap_or_default()
+        })
+    }
+
+    /// List available tables with their aliases
+    /// Returns Vec of (table_name, aliases_string)
+    pub async fn list_tables_with_aliases(&self) -> Vec<(String, String)> {
+        if let Ok(registry) = self.pool.get_registry(None).await {
+            registry
+                .list_tables()
+                .into_iter()
+                .map(|info| {
+                    let aliases = if info.aliases.is_empty() {
+                        String::new()
+                    } else {
+                        info.aliases.join(", ")
+                    };
+                    (info.table_name.clone(), aliases)
+                })
+                .collect()
+        } else {
+            vec![]
+        }
     }
 }
 

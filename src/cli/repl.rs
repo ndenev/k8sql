@@ -854,11 +854,11 @@ pub async fn run_repl(mut session: K8sSessionContext, pool: Arc<K8sClientPool>) 
 
                 // Handle SHOW TABLES specially (clean output without catalog/schema noise)
                 if lower.trim().trim_end_matches(';') == "show tables" {
-                    let mut tables = session.list_tables();
-                    tables.sort();
+                    let mut tables = session.list_tables_with_aliases().await;
+                    tables.sort_by(|a, b| a.0.cmp(&b.0));
                     let result = QueryResult {
-                        columns: vec!["table_name".to_string()],
-                        rows: tables.into_iter().map(|t| vec![t]).collect(),
+                        columns: vec!["table_name".to_string(), "aliases".to_string()],
+                        rows: tables.into_iter().map(|(name, aliases)| vec![name, aliases]).collect(),
                     };
                     if expanded {
                         print!("{}", format_expanded(&result));
