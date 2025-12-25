@@ -821,7 +821,6 @@ pub async fn run_repl(mut session: K8sSessionContext, pool: Arc<K8sClientPool>) 
                 };
 
                 spinner.finish_and_clear();
-                let elapsed = start.elapsed();
 
                 match result {
                     Ok(Ok(result)) => {
@@ -833,6 +832,7 @@ pub async fn run_repl(mut session: K8sSessionContext, pool: Arc<K8sClientPool>) 
                             } else {
                                 println!("{}", format_table(&result));
                             }
+                            let elapsed = start.elapsed(); // Capture AFTER formatting
                             println!(
                                 "{}",
                                 style(format!(
