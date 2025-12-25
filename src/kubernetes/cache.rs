@@ -6,6 +6,8 @@
 //! Caches CRD discovery results to enable fast startup on subsequent runs.
 //! Uses fingerprint-based caching so clusters with identical CRDs share cache entries.
 //! Core K8s resources are always loaded from k8s-openapi (instant).
+//!
+//! Cache location: ~/.k8sql/cache/
 
 use anyhow::{Context, Result};
 use kube::discovery::{ApiCapabilities, ApiResource, Scope};
@@ -14,6 +16,7 @@ use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 
 use super::discovery::ResourceInfo;
+use crate::config;
 
 /// Default cache TTL (24 hours)
 const DEFAULT_CACHE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
@@ -200,12 +203,9 @@ impl ResourceCache {
         })
     }
 
-    /// Get the default cache directory
+    /// Get the default cache directory (~/.k8sql/cache/)
     fn default_cache_dir() -> Result<PathBuf> {
-        let cache_base = dirs::cache_dir()
-            .or_else(|| dirs::home_dir().map(|h| h.join(".cache")))
-            .context("Could not determine cache directory")?;
-        Ok(cache_base.join("k8sql"))
+        Ok(config::base_dir()?.join("cache"))
     }
 
     /// Get the clusters directory

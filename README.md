@@ -505,7 +505,7 @@ USE prod-*, staging;
 
 After `USE`, queries without a `_cluster` filter will run against all selected contexts. `SHOW DATABASES` displays selected contexts in the `selected` column.
 
-**Persistent Selection:** Your context selection is automatically saved to `~/.config/k8sql/config.toml` and restored on next startup. This means you can close k8sql, reopen it, and continue working with the same cluster selection.
+**Persistent Selection:** Your context selection is automatically saved to `~/.k8sql/config.json` and restored on next startup. This means you can close k8sql, reopen it, and continue working with the same cluster selection.
 
 This is useful for:
 - Excluding problematic clusters that always timeout

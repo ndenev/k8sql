@@ -18,7 +18,7 @@ use std::sync::{Arc, RwLock};
 use std::time::Instant;
 use tokio::sync::broadcast;
 
-use crate::config::Config;
+use crate::config::{self, Config};
 use crate::datafusion_integration::K8sSessionContext;
 use crate::kubernetes::K8sClientPool;
 use crate::output::QueryResult;
@@ -691,10 +691,10 @@ pub async fn run_repl(mut session: K8sSessionContext, pool: Arc<K8sClientPool>) 
     let mut rl: Editor<SqlHelper, DefaultHistory> = Editor::with_config(config)?;
     rl.set_helper(Some(helper));
 
-    // Load history
-    let history_path = dirs::home_dir()
-        .map(|p| p.join(".k8sql_history"))
-        .unwrap_or_else(|| ".k8sql_history".into());
+    // Load history from ~/.k8sql/history
+    let history_path = config::base_dir()
+        .map(|p| p.join("history"))
+        .unwrap_or_else(|_| ".k8sql_history".into());
     let _ = rl.load_history(&history_path);
 
     print_welcome();

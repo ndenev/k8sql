@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
 mod cli;
-mod config;
+pub mod config;
 mod daemon;
 mod datafusion_integration;
 mod kubernetes;
