@@ -13,6 +13,23 @@ use tokio::sync::broadcast;
 /// Progress update message
 #[derive(Clone, Debug)]
 pub enum ProgressUpdate {
+    // === Connection/Discovery phases ===
+    /// Connecting to a cluster
+    Connecting { cluster: String },
+    /// Connected to a cluster
+    Connected { cluster: String, elapsed_ms: u64 },
+    /// Discovering resources on a cluster
+    Discovering { cluster: String },
+    /// Discovery complete for a cluster
+    DiscoveryComplete {
+        cluster: String,
+        table_count: usize,
+        elapsed_ms: u64,
+    },
+    /// Registering tables
+    RegisteringTables { count: usize },
+
+    // === Query phases ===
     /// Starting to query clusters
     StartingQuery { table: String, cluster_count: usize },
     /// Fetched data from a cluster
@@ -75,6 +92,44 @@ impl ProgressReporter {
             total_rows,
             elapsed_ms,
         });
+    }
+
+    /// Report connecting to a cluster
+    pub fn connecting(&self, cluster: &str) {
+        let _ = self.sender.send(ProgressUpdate::Connecting {
+            cluster: cluster.to_string(),
+        });
+    }
+
+    /// Report connected to a cluster
+    pub fn connected(&self, cluster: &str, elapsed_ms: u64) {
+        let _ = self.sender.send(ProgressUpdate::Connected {
+            cluster: cluster.to_string(),
+            elapsed_ms,
+        });
+    }
+
+    /// Report discovering resources on a cluster
+    pub fn discovering(&self, cluster: &str) {
+        let _ = self.sender.send(ProgressUpdate::Discovering {
+            cluster: cluster.to_string(),
+        });
+    }
+
+    /// Report discovery complete for a cluster
+    pub fn discovery_complete(&self, cluster: &str, table_count: usize, elapsed_ms: u64) {
+        let _ = self.sender.send(ProgressUpdate::DiscoveryComplete {
+            cluster: cluster.to_string(),
+            table_count,
+            elapsed_ms,
+        });
+    }
+
+    /// Report registering tables
+    pub fn registering_tables(&self, count: usize) {
+        let _ = self
+            .sender
+            .send(ProgressUpdate::RegisteringTables { count });
     }
 
     /// Get current progress (done/total)

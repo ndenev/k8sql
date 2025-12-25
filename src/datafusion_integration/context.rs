@@ -50,8 +50,12 @@ impl K8sSessionContext {
 
         // Get the resource registry and register each resource as a table
         let registry = pool.get_registry(None).await?;
+        let tables = registry.list_tables();
 
-        for info in registry.list_tables() {
+        // Report table registration start
+        pool.progress().registering_tables(tables.len());
+
+        for info in tables {
             let provider = K8sTableProvider::new(info.clone(), Arc::clone(pool));
 
             // Register with the primary table name

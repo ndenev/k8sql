@@ -109,7 +109,17 @@ impl K8sClientPool {
         }
 
         let client = self.get_or_create_client(context).await?;
+
+        // Report discovering
+        self.progress.discovering(context);
+        let start = std::time::Instant::now();
+
         let registry = discover_resources(&client).await?;
+        let table_count = registry.list_tables().len();
+
+        // Report discovery complete
+        self.progress
+            .discovery_complete(context, table_count, start.elapsed().as_millis() as u64);
 
         {
             let mut registries = self.registries.write().await;
@@ -168,6 +178,10 @@ impl K8sClientPool {
             return Err(anyhow!("Context '{}' not found in kubeconfig", context));
         }
 
+        // Report connecting
+        self.progress.connecting(context);
+        let start = std::time::Instant::now();
+
         // Create new client with timeouts
         let mut config = Config::from_custom_kubeconfig(
             self.kubeconfig.clone(),
@@ -183,6 +197,10 @@ impl K8sClientPool {
         config.read_timeout = Some(READ_TIMEOUT);
 
         let client = Client::try_from(config)?;
+
+        // Report connected
+        self.progress
+            .connected(context, start.elapsed().as_millis() as u64);
 
         // Cache it
         {
@@ -278,10 +296,21 @@ impl K8sClientPool {
             return Err(anyhow!("No contexts matched pattern '{}'", context_spec));
         }
 
-        // Ensure we have clients and discovered resources for all contexts
-        for ctx in &matched_contexts {
-            self.get_or_create_client(ctx).await?;
-            self.discover_resources_for_context(ctx, true).await?;
+        // Ensure we have clients and discovered resources for all contexts IN PARALLEL
+        let discovery_futures: Vec<_> = matched_contexts
+            .iter()
+            .map(|ctx| async move {
+                self.get_or_create_client(ctx).await?;
+                self.discover_resources_for_context(ctx, true).await?;
+                Ok::<_, anyhow::Error>(())
+            })
+            .collect();
+
+        let results = futures::future::join_all(discovery_futures).await;
+
+        // Check for any errors
+        for result in results {
+            result?;
         }
 
         // Update current contexts

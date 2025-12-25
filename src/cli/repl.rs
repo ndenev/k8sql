@@ -518,10 +518,40 @@ fn create_spinner(msg: &str) -> ProgressBar {
     pb
 }
 
+/// Maximum width for JSON columns (spec, status, labels, annotations, data)
+const MAX_JSON_COLUMN_WIDTH: usize = 60;
+
+/// Columns that should have width limits in table mode
+const WIDE_COLUMNS: &[&str] = &["spec", "status", "labels", "annotations", "data"];
+
+/// Truncate a string to max_len chars, adding "..." if truncated
+fn truncate_value(s: &str, max_len: usize) -> Cow<'_, str> {
+    if s.chars().count() <= max_len {
+        Cow::Borrowed(s)
+    } else {
+        let truncated: String = s.chars().take(max_len.saturating_sub(3)).collect();
+        Cow::Owned(format!("{}...", truncated))
+    }
+}
+
 fn format_table(result: &QueryResult) -> String {
     let mut table = Table::new();
     table.load_preset(UTF8_FULL_CONDENSED);
     table.set_content_arrangement(ContentArrangement::Dynamic);
+
+    // Build a set of column indices that should be truncated
+    let truncate_cols: std::collections::HashSet<usize> = result
+        .columns
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, col)| {
+            if WIDE_COLUMNS.contains(&col.as_str()) {
+                Some(idx)
+            } else {
+                None
+            }
+        })
+        .collect();
 
     // Header row with styling
     let header_cells: Vec<Cell> = result
@@ -531,9 +561,19 @@ fn format_table(result: &QueryResult) -> String {
         .collect();
     table.set_header(header_cells);
 
-    // Data rows
+    // Data rows with truncation for wide columns
     for row in &result.rows {
-        let cells: Vec<Cell> = row.iter().map(Cell::new).collect();
+        let cells: Vec<Cell> = row
+            .iter()
+            .enumerate()
+            .map(|(idx, val)| {
+                if truncate_cols.contains(&idx) {
+                    Cell::new(truncate_value(val, MAX_JSON_COLUMN_WIDTH))
+                } else {
+                    Cell::new(val)
+                }
+            })
+            .collect();
         table.add_row(cells);
     }
 
@@ -697,7 +737,45 @@ pub async fn run_repl(mut session: K8sSessionContext, pool: Arc<K8sClientPool>) 
                 // Handle USE command specially (requires context switch)
                 if is_use_command {
                     let context_spec = input.trim()[4..].trim().trim_end_matches(';');
-                    if let Err(e) = pool.switch_context(context_spec).await {
+
+                    // Show spinner during context switch
+                    let spinner = create_spinner("Switching context...");
+                    let mut progress_rx = pool.progress().subscribe();
+
+                    // Run switch_context with progress updates
+                    let switch_result = {
+                        let pool = Arc::clone(&pool);
+                        let context_spec = context_spec.to_string();
+                        let mut switch_handle =
+                            Box::pin(async move { pool.switch_context(&context_spec).await });
+
+                        loop {
+                            tokio::select! {
+                                biased;
+                                progress = progress_rx.recv() => {
+                                    match progress {
+                                        Ok(ProgressUpdate::Connecting { cluster }) => {
+                                            spinner.set_message(format!("Connecting to {}...", cluster));
+                                        }
+                                        Ok(ProgressUpdate::Discovering { cluster }) => {
+                                            spinner.set_message(format!("Discovering resources on {}...", cluster));
+                                        }
+                                        Ok(ProgressUpdate::DiscoveryComplete { cluster, table_count, .. }) => {
+                                            spinner.set_message(format!("{}: {} tables found", cluster, table_count));
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                                result = &mut switch_handle => {
+                                    break result;
+                                }
+                            }
+                        }
+                    };
+
+                    spinner.finish_and_clear();
+
+                    if let Err(e) = switch_result {
                         println!("{} {}", style("Error:").red().bold(), style(e).red());
                     } else {
                         let contexts = pool.current_contexts().await;
@@ -805,6 +883,12 @@ pub async fn run_repl(mut session: K8sSessionContext, pool: Arc<K8sClientPool>) 
                                 Ok(ProgressUpdate::QueryComplete { total_rows, elapsed_ms: _ }) => {
                                     spinner.set_message(format!("Processing {} rows...", total_rows));
                                 }
+                                // Connection/discovery events - shouldn't happen during query
+                                Ok(ProgressUpdate::Connecting { .. })
+                                | Ok(ProgressUpdate::Connected { .. })
+                                | Ok(ProgressUpdate::Discovering { .. })
+                                | Ok(ProgressUpdate::DiscoveryComplete { .. })
+                                | Ok(ProgressUpdate::RegisteringTables { .. }) => {}
                                 Err(broadcast::error::RecvError::Closed) => {
                                     // Channel closed, wait for query
                                 }
@@ -820,17 +904,25 @@ pub async fn run_repl(mut session: K8sSessionContext, pool: Arc<K8sClientPool>) 
                     }
                 };
 
-                spinner.finish_and_clear();
-
                 match result {
                     Ok(Ok(result)) => {
                         if result.rows.is_empty() {
+                            spinner.finish_and_clear();
                             println!("{}", style("(0 rows)").dim());
                         } else {
-                            if expanded {
-                                print!("{}", format_expanded(&result));
+                            // Show formatting progress for large results
+                            spinner
+                                .set_message(format!("Formatting {} rows...", result.rows.len()));
+                            let output = if expanded {
+                                format_expanded(&result)
                             } else {
-                                println!("{}", format_table(&result));
+                                format_table(&result)
+                            };
+                            spinner.finish_and_clear();
+                            if expanded {
+                                print!("{}", output);
+                            } else {
+                                println!("{}", output);
                             }
                             let elapsed = start.elapsed(); // Capture AFTER formatting
                             println!(
@@ -846,9 +938,11 @@ pub async fn run_repl(mut session: K8sSessionContext, pool: Arc<K8sClientPool>) 
                         }
                     }
                     Ok(Err(e)) => {
+                        spinner.finish_and_clear();
                         println!("{} {}", style("Error:").red().bold(), style(e).red());
                     }
                     Err(e) => {
+                        spinner.finish_and_clear();
                         println!(
                             "{} {}",
                             style("Error:").red().bold(),
