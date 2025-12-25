@@ -24,7 +24,7 @@ datafusion-postgres = "0.13"
 
 # REPL / CLI
 rustyline = { version = "17", features = ["derive"] }
-indicatif = "0.17"
+indicatif = "0.18"
 console = "0.16"
 comfy-table = "7"
 dirs = "6"
