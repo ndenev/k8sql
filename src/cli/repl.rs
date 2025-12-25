@@ -736,6 +736,20 @@ pub async fn run_repl(mut session: K8sSessionContext, pool: Arc<K8sClientPool>) 
                     continue;
                 }
 
+                // Handle backslash shortcuts that translate to SQL
+                let input = if lower == "\\dt" {
+                    "SHOW TABLES".to_string()
+                } else if lower == "\\l" {
+                    "SHOW DATABASES".to_string()
+                } else if lower.starts_with("\\d ") {
+                    // \d <table> -> DESCRIBE <table>
+                    let table = input[3..].trim();
+                    format!("DESCRIBE {}", table)
+                } else {
+                    input.to_string()
+                };
+                let lower = input.to_lowercase();
+
                 // Check if this is a USE command (for cache refresh after success)
                 let is_use_command = lower.starts_with("use ");
 
