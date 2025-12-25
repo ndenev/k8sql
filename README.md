@@ -130,9 +130,22 @@ FROM deployments
 
 -- Labels with special characters (dots, slashes)
 SELECT * FROM pods WHERE labels.app.kubernetes.io/name = 'cert-manager'
+
+-- Pattern matching with LIKE (case-sensitive)
+SELECT * FROM pods WHERE labels.app LIKE 'nginx%'
+
+-- Case-insensitive pattern matching with ILIKE
+SELECT * FROM pods WHERE labels.app ILIKE 'Nginx%'
+
+-- Exclude patterns with NOT LIKE
+SELECT * FROM pods WHERE labels.app NOT LIKE 'test%'
 ```
 
-The `labels.key = 'value'` syntax is automatically converted to `json_get_str(labels, 'key')` and pushed to the Kubernetes API as a label selector for efficient server-side filtering.
+The `labels.key = 'value'` syntax is automatically converted to `json_get_str(labels, 'key')` and pushed to the Kubernetes API as a label selector for efficient server-side filtering. LIKE patterns are evaluated client-side by DataFusion.
+
+**Note:** Label matching follows SQL semantics, not Kubernetes selector semantics. This means:
+- `labels.app != 'nginx'` excludes rows where `labels.app` is NULL (missing label)
+- In Kubernetes selectors, `app!=nginx` would include resources without the `app` label
 
 ### Working with Arrays (UNNEST)
 
