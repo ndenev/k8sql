@@ -851,6 +851,32 @@ pub async fn run_repl(mut session: K8sSessionContext, pool: Arc<K8sClientPool>) 
                     continue;
                 }
 
+                // Handle SHOW TABLES specially (clean output without catalog/schema noise)
+                if lower.trim().trim_end_matches(';') == "show tables" {
+                    let mut tables = session.list_tables();
+                    tables.sort();
+                    let result = QueryResult {
+                        columns: vec!["table_name".to_string()],
+                        rows: tables.into_iter().map(|t| vec![t]).collect(),
+                    };
+                    if expanded {
+                        print!("{}", format_expanded(&result));
+                    } else {
+                        println!("{}", format_table(&result));
+                    }
+                    println!(
+                        "{}",
+                        style(format!(
+                            "{} table{}",
+                            result.rows.len(),
+                            if result.rows.len() == 1 { "" } else { "s" }
+                        ))
+                        .dim()
+                    );
+                    println!();
+                    continue;
+                }
+
                 // Handle SHOW DATABASES specially (list Kubernetes contexts)
                 if lower.trim().trim_end_matches(';') == "show databases" {
                     let contexts = pool.list_contexts().unwrap_or_default();

@@ -20,6 +20,124 @@ use datafusion_postgres::pgwire::error::{PgWireError, PgWireResult};
 
 use crate::kubernetes::K8sClientPool;
 
+/// Hook to handle SHOW TABLES command with clean output
+pub struct ShowTablesHook;
+
+impl ShowTablesHook {
+    pub fn new() -> Self {
+        Self
+    }
+
+    fn create_response(&self, session_context: &SessionContext) -> PgWireResult<Response> {
+        // Get all table names from the session
+        let mut tables: Vec<String> = session_context
+            .catalog_names()
+            .into_iter()
+            .flat_map(|catalog| {
+                session_context
+                    .catalog(&catalog)
+                    .map(|c| {
+                        c.schema_names()
+                            .into_iter()
+                            .flat_map(|schema| {
+                                c.schema(&schema)
+                                    .map(|s| s.table_names())
+                                    .unwrap_or_default()
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default()
+            })
+            .collect();
+        tables.sort();
+
+        let fields = vec![FieldInfo::new(
+            "table_name".to_string(),
+            None,
+            None,
+            Type::VARCHAR,
+            FieldFormat::Text,
+        )];
+        let fields = Arc::new(fields);
+
+        let mut encoded_rows = Vec::new();
+        for table in &tables {
+            let mut encoder = DataRowEncoder::new(Arc::clone(&fields));
+            encoder.encode_field(&Some(table.as_str()))?;
+            encoded_rows.push(encoder.finish());
+        }
+
+        let row_stream = futures::stream::iter(encoded_rows);
+        Ok(Response::Query(QueryResponse::new(
+            fields,
+            Box::pin(row_stream),
+        )))
+    }
+}
+
+impl Default for ShowTablesHook {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait]
+impl QueryHook for ShowTablesHook {
+    async fn handle_simple_query(
+        &self,
+        statement: &Statement,
+        session_context: &SessionContext,
+        _client: &mut (dyn ClientInfo + Send + Sync),
+    ) -> Option<PgWireResult<Response>> {
+        match statement {
+            Statement::ShowTables { .. } => Some(self.create_response(session_context)),
+            _ => None,
+        }
+    }
+
+    async fn handle_extended_parse_query(
+        &self,
+        statement: &Statement,
+        _session_context: &SessionContext,
+        _client: &(dyn ClientInfo + Send + Sync),
+    ) -> Option<PgWireResult<LogicalPlan>> {
+        match statement {
+            Statement::ShowTables { .. } => {
+                let schema = Arc::new(Schema::new(vec![Field::new(
+                    "table_name",
+                    DataType::Utf8,
+                    false,
+                )]));
+                let result = schema
+                    .to_dfschema()
+                    .map(|df_schema| {
+                        LogicalPlan::EmptyRelation(datafusion::logical_expr::EmptyRelation {
+                            produce_one_row: true,
+                            schema: Arc::new(df_schema),
+                        })
+                    })
+                    .map_err(|e| PgWireError::ApiError(Box::new(e)));
+                Some(result)
+            }
+            _ => None,
+        }
+    }
+
+    async fn handle_extended_query(
+        &self,
+        statement: &Statement,
+        _logical_plan: &LogicalPlan,
+        _params: &ParamValues,
+        session_context: &SessionContext,
+        _client: &mut (dyn ClientInfo + Send + Sync),
+    ) -> Option<PgWireResult<Response>> {
+        match statement {
+            Statement::ShowTables { .. } => Some(self.create_response(session_context)),
+            _ => None,
+        }
+    }
+}
+
 /// Hook to handle SHOW DATABASES command by listing Kubernetes contexts
 pub struct ShowDatabasesHook {
     pool: Arc<K8sClientPool>,

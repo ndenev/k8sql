@@ -86,9 +86,22 @@ async fn run_batch(args: &Args) -> Result<()> {
     };
 
     for query_str in queries {
-        // Handle SHOW DATABASES specially
         let normalized = query_str.trim().to_uppercase();
         let normalized = normalized.trim_end_matches(';');
+
+        // Handle SHOW TABLES specially (clean output without catalog/schema)
+        if normalized == "SHOW TABLES" {
+            let mut tables = session.list_tables();
+            tables.sort();
+            let result = output::QueryResult {
+                columns: vec!["table_name".to_string()],
+                rows: tables.into_iter().map(|t| vec![t]).collect(),
+            };
+            println!("{}", result.format(&args.output, args.no_headers));
+            continue;
+        }
+
+        // Handle SHOW DATABASES specially
         if normalized == "SHOW DATABASES" {
             let contexts = pool.list_contexts().unwrap_or_default();
             let current_contexts = pool.current_contexts().await;
