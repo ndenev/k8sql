@@ -5,10 +5,13 @@
 
 use std::sync::Arc;
 
+use std::collections::HashSet;
+
 use datafusion::arrow::array::RecordBatch;
 use datafusion::arrow::util::pretty::pretty_format_batches;
 use datafusion::error::Result as DFResult;
 use datafusion::execution::context::SessionContext;
+use datafusion::execution::FunctionRegistry;
 use datafusion::prelude::SessionConfig;
 
 use crate::kubernetes::K8sClientPool;
@@ -187,6 +190,22 @@ impl K8sSessionContext {
         } else {
             vec![]
         }
+    }
+
+    /// List all registered functions (scalar, aggregate, and window)
+    pub fn list_functions(&self) -> HashSet<String> {
+        let mut functions = HashSet::new();
+        
+        // Scalar functions (json_get_str, etc.)
+        functions.extend(self.ctx.udfs());
+        
+        // Aggregate functions (COUNT, SUM, etc.)
+        functions.extend(self.ctx.udafs());
+        
+        // Window functions (ROW_NUMBER, etc.)
+        functions.extend(self.ctx.udwfs());
+        
+        functions
     }
 }
 

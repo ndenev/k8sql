@@ -46,6 +46,8 @@ pub struct CompletionCache {
     pub namespaces: Vec<String>,
     /// Available kubectl contexts (clusters)
     pub contexts: Vec<String>,
+    /// Registered SQL functions (scalar, aggregate, window)
+    pub functions: Vec<String>,
 }
 
 impl CompletionCache {
@@ -107,6 +109,11 @@ impl CompletionCache {
                 cache.namespaces.sort();
             }
         }
+
+        // Get registered SQL functions (scalar, aggregate, window)
+        let mut functions: Vec<String> = session.list_functions().into_iter().collect();
+        functions.sort();
+        cache.functions = functions;
 
         cache.tables.sort();
         Ok(cache)
@@ -421,6 +428,17 @@ impl Completer for SqlHelper {
                         matches.push(Pair {
                             display: kw.to_string(),
                             replacement: kw.to_string(),
+                        });
+                    }
+                }
+
+                // SQL functions (json_get_str, COUNT, etc.)
+                for func in &cache.functions {
+                    let func_upper = func.to_uppercase();
+                    if func_upper.starts_with(&prefix_upper) || func.starts_with(&prefix_lower) {
+                        matches.push(Pair {
+                            display: func.clone(),
+                            replacement: func.clone(),
                         });
                     }
                 }
