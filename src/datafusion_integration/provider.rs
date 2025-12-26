@@ -196,7 +196,7 @@ impl K8sTableProvider {
     }
 
     /// Extract a label selector from labels->>'key' = 'value' pattern
-    /// (labels->>'key' becomes json_get_str(labels, 'key'))
+    /// (labels->>'key' is internally json_as_text; json_get_str is also supported)
     fn extract_label_selector(
         &self,
         binary: &datafusion::logical_expr::BinaryExpr,
@@ -208,12 +208,13 @@ impl K8sTableProvider {
             "Analyzing binary expression for label selector"
         );
 
-        // Handle json_get_str(labels, 'key') = 'value' pattern
+        // Handle json_get_str(labels, 'key') = 'value' or labels->>'key' = 'value' pattern
+        // Note: ->> is internally represented as json_as_text by datafusion-functions-json
         if let Expr::ScalarFunction(func) = binary.left.as_ref() {
             let func_name = func.name();
             debug!(func_name = %func_name, args_len = func.args.len(), "Found ScalarFunction on left side");
 
-            if func_name == "json_get_str"
+            if (func_name == "json_get_str" || func_name == "json_as_text")
                 && func.args.len() >= 2
                 && let Expr::Column(col) = &func.args[0]
                 && col.name == "labels"
@@ -260,7 +261,7 @@ impl TableProvider for K8sTableProvider {
         // - namespace = 'x' -> Uses namespaced API
         // - _cluster = 'x' -> Queries specific cluster
         // - _cluster IN (...) / NOT IN (...) -> Queries specific clusters
-        // - labels->>'key' = 'value' -> K8s label selector (via json_get_str)
+        // - labels->>'key' = 'value' -> K8s label selector
         // Other filters will be handled by DataFusion
         Ok(filters
             .iter()
@@ -279,11 +280,11 @@ impl TableProvider for K8sTableProvider {
                     {
                         return TableProviderFilterPushDown::Exact;
                     }
-                    // Check for labels->>'key' = 'value' or != 'value' pattern (json_get_str)
-                    // Only push down equality/inequality with literal RHS
+                    // Check for labels->>'key' = 'value' or != 'value' pattern
+                    // Note: ->> is internally represented as json_as_text by datafusion-functions-json
                     if let Expr::ScalarFunction(func) = binary.left.as_ref() {
                         let func_name = func.name();
-                        if func_name == "json_get_str"
+                        if (func_name == "json_get_str" || func_name == "json_as_text")
                             && !func.args.is_empty()
                             && let Expr::Column(col) = &func.args[0]
                             && col.name == "labels"

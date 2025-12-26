@@ -12,9 +12,6 @@ repository = "https://github.com/ndenev/k8sql"
 datafusion = "51"
 datafusion-functions-json = "0.51"
 
-# SQL parser (for AST-based preprocessing)
-sqlparser = { version = "0.59", features = ["visitor"] }
-
 # Kubernetes client
 kube = { version = "2", features = ["runtime", "client", "derive", "rustls-tls", "http-proxy"] }
 k8s-openapi = { version = "0.26", features = ["v1_32"] }
