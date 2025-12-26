@@ -107,7 +107,6 @@ impl ClusterGroups {
         }
     }
 
-    #[allow(dead_code)]
     pub fn is_fresh(&self, ttl: Duration) -> bool {
         let now = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
@@ -249,7 +248,6 @@ impl ResourceCache {
     }
 
     /// Load the list of API groups for a cluster (if cached and fresh)
-    #[allow(dead_code)]
     pub fn load_cluster_groups(&self, cluster: &str) -> Option<Vec<(String, String)>> {
         let path = self.cluster_path(cluster);
         if !path.exists() {

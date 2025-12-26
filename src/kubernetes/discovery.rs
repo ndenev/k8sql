@@ -48,16 +48,6 @@ impl ResourceInfo {
     pub fn is_namespaced(&self) -> bool {
         self.capabilities.scope == Scope::Namespaced
     }
-
-    /// Get the full API group/version string
-    #[allow(dead_code)]
-    pub fn api_version(&self) -> String {
-        if self.group.is_empty() {
-            self.version.clone()
-        } else {
-            format!("{}/{}", self.group, self.version)
-        }
-    }
 }
 
 /// Registry of all discovered resources for a cluster

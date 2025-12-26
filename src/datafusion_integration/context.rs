@@ -8,7 +8,6 @@ use std::sync::Arc;
 use std::collections::HashSet;
 
 use datafusion::arrow::array::RecordBatch;
-use datafusion::arrow::util::pretty::pretty_format_batches;
 use datafusion::error::Result as DFResult;
 use datafusion::execution::FunctionRegistry;
 use datafusion::execution::context::SessionContext;
@@ -121,53 +120,15 @@ impl K8sSessionContext {
         Ok(QueryResult { columns, rows })
     }
 
-    /// Get pretty-printed output (useful for debugging)
-    #[allow(dead_code)]
-    pub async fn execute_sql_pretty(&self, sql: &str) -> anyhow::Result<String> {
-        let batches = self.execute_sql(sql).await?;
-        Ok(pretty_format_batches(&batches)?.to_string())
-    }
-
     /// Refresh the registered tables (call after context switch)
     pub async fn refresh_tables(&mut self) -> anyhow::Result<()> {
         self.ctx = Self::create_session_context(&self.pool).await?;
         Ok(())
     }
 
-    /// Get the underlying K8s client pool
-    #[allow(dead_code)]
-    pub fn pool(&self) -> &Arc<K8sClientPool> {
-        &self.pool
-    }
-
     /// Consume this wrapper and return the underlying DataFusion SessionContext
     pub fn into_session_context(self) -> SessionContext {
         self.ctx
-    }
-
-    /// List available tables (primary names only, no aliases)
-    #[allow(dead_code)]
-    pub fn list_tables(&self) -> Vec<String> {
-        // Use blocking runtime to get registry info
-        let pool = Arc::clone(&self.pool);
-        let handle = tokio::runtime::Handle::current();
-        std::thread::scope(|s| {
-            s.spawn(|| {
-                handle.block_on(async {
-                    if let Ok(registry) = pool.get_registry(None).await {
-                        registry
-                            .list_tables()
-                            .into_iter()
-                            .map(|info| info.table_name.clone())
-                            .collect()
-                    } else {
-                        vec![]
-                    }
-                })
-            })
-            .join()
-            .unwrap_or_default()
-        })
     }
 
     /// List available tables with their aliases
