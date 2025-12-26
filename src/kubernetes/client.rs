@@ -8,10 +8,10 @@ use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
+use super::ApiFilters;
 use super::cache::{CachedResourceInfo, ResourceCache};
 use super::discovery::{ResourceInfo, ResourceRegistry};
 use crate::progress::ProgressHandle;
-use super::ApiFilters;
 
 /// How long to cache discovered resources before auto-refresh
 const REGISTRY_TTL: Duration = Duration::from_secs(300); // 5 minutes

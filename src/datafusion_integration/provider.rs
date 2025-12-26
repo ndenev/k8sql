@@ -23,9 +23,9 @@ use tracing::{debug, info};
 /// Higher values improve performance but increase local resource usage (connections, memory)
 const MAX_CONCURRENT_CLUSTERS: usize = 15;
 
+use crate::kubernetes::ApiFilters;
 use crate::kubernetes::K8sClientPool;
 use crate::kubernetes::discovery::{ResourceInfo, generate_schema};
-use crate::kubernetes::ApiFilters;
 
 use super::convert::{json_to_record_batch, to_arrow_schema};
 
