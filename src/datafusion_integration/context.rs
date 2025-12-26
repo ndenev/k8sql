@@ -252,6 +252,30 @@ fn array_value_to_string(array: &datafusion::arrow::array::ArrayRef, idx: usize)
             let arr = array.as_any().downcast_ref::<BooleanArray>().unwrap();
             arr.value(idx).to_string()
         }
+        DataType::Timestamp(unit, _) => {
+            use datafusion::arrow::array::TimestampMillisecondArray;
+            use datafusion::arrow::datatypes::TimeUnit;
+
+            // We only use Millisecond timestamps, but handle gracefully
+            match unit {
+                TimeUnit::Millisecond => {
+                    let arr = array
+                        .as_any()
+                        .downcast_ref::<TimestampMillisecondArray>()
+                        .unwrap();
+                    let millis = arr.value(idx);
+                    // Format as ISO 8601 / RFC 3339
+                    let secs = millis / 1000;
+                    let nsecs = ((millis % 1000) * 1_000_000) as u32;
+                    if let Some(dt) = chrono::DateTime::from_timestamp(secs, nsecs) {
+                        dt.format("%Y-%m-%dT%H:%M:%SZ").to_string()
+                    } else {
+                        millis.to_string()
+                    }
+                }
+                _ => format!("{:?}", array.slice(idx, 1)),
+            }
+        }
         _ => {
             // For complex types, use the array's formatter
             format!("{:?}", array.slice(idx, 1))

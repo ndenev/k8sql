@@ -98,7 +98,7 @@ k8sql uses Apache DataFusion as its SQL query engine:
 
 - **K8sTableProvider** (`provider.rs`): Implements DataFusion's TableProvider trait. Fetches data from Kubernetes API on scan, extracts and pushes filters (namespace, cluster, label selectors) to the API.
 
-- **JSON to Arrow conversion** (`convert.rs`): Converts K8s JSON resources to Arrow RecordBatches. All columns are UTF8 strings; labels/annotations are stored as JSON strings for pgwire compatibility.
+- **JSON to Arrow conversion** (`convert.rs`): Converts K8s JSON resources to Arrow RecordBatches. Metadata fields use native Arrow types (Timestamp for dates, Int64 for integers); labels/annotations/spec/status are stored as JSON strings.
 
 - **SQL Preprocessing** (`preprocess.rs`): Fixes `->>` operator precedence before DataFusion parsing. Wraps `col->>'key' = 'value'` as `(col->>'key') = 'value'` to work around parser quirks.
 
@@ -131,19 +131,20 @@ Manages connections to multiple Kubernetes clusters:
 
 All resources share a consistent schema:
 
-| Column | Type | Description |
-|--------|------|-------------|
-| `_cluster` | text | Kubernetes context name |
-| `api_version` | text | API version (v1, apps/v1, etc.) |
-| `kind` | text | Resource kind (Pod, Deployment, etc.) |
-| `name` | text | Resource name |
-| `namespace` | text | Namespace (null for cluster-scoped) |
-| `uid` | text | Unique identifier |
-| `created` | timestamp | Creation timestamp |
-| `labels` | text (JSON) | JSON object, access with `labels->>'key'` (PostgreSQL syntax) |
-| `annotations` | text (JSON) | JSON object, access with `annotations->>'key'` |
-| `spec` | json (Utf8) | Resource specification (JSON string) |
-| `status` | json (Utf8) | Resource status (JSON string) |
+| Column | Arrow Type | Description |
+|--------|------------|-------------|
+| `_cluster` | Utf8 | Kubernetes context name |
+| `api_version` | Utf8 | API version (v1, apps/v1, etc.) |
+| `kind` | Utf8 | Resource kind (Pod, Deployment, etc.) |
+| `name` | Utf8 | Resource name |
+| `namespace` | Utf8 | Namespace (null for cluster-scoped) |
+| `uid` | Utf8 | Unique identifier |
+| `created` | Timestamp(ms) | Creation timestamp (native, supports date comparisons) |
+| `generation` | Int64 | Spec change counter (native, supports numeric comparisons) |
+| `labels` | Utf8 (JSON) | JSON object, access with `labels->>'key'` |
+| `annotations` | Utf8 (JSON) | JSON object, access with `annotations->>'key'` |
+| `spec` | Utf8 (JSON) | Resource specification |
+| `status` | Utf8 (JSON) | Resource status |
 
 Special cases:
 - **ConfigMaps/Secrets**: `data` column instead of spec/status

@@ -13,14 +13,12 @@ use std::collections::HashMap;
 
 /// Column definition for schema
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct ColumnDef {
     pub name: String,
-    /// SQL type (text, jsonb, timestamp, integer) - reserved for future typed schema
+    /// Arrow type: text, timestamp, integer
     pub data_type: String,
+    /// JSON path to extract value (e.g., "metadata.name")
     pub json_path: Option<String>,
-    /// Human-readable description - reserved for enhanced DESCRIBE output
-    pub description: String,
 }
 
 /// Information about a discovered Kubernetes resource
@@ -411,87 +409,73 @@ pub fn generate_schema(info: &ResourceInfo) -> Vec<ColumnDef> {
             name: "_cluster".to_string(),
             data_type: "text".to_string(),
             json_path: None,
-            description: "Kubernetes context/cluster name".to_string(),
         },
         // API version and kind - self-describing columns for CRD safety
         ColumnDef {
             name: "api_version".to_string(),
             data_type: "text".to_string(),
             json_path: Some("apiVersion".to_string()),
-            description: "API version (e.g., v1, apps/v1, cert-manager.io/v1)".to_string(),
         },
         ColumnDef {
             name: "kind".to_string(),
             data_type: "text".to_string(),
             json_path: Some("kind".to_string()),
-            description: "Resource kind (e.g., Pod, Deployment, Certificate)".to_string(),
         },
         // Common metadata columns
         ColumnDef {
             name: "name".to_string(),
             data_type: "text".to_string(),
             json_path: Some("metadata.name".to_string()),
-            description: "Resource name".to_string(),
         },
         ColumnDef {
             name: "namespace".to_string(),
             data_type: "text".to_string(),
             json_path: Some("metadata.namespace".to_string()),
-            description: "Namespace (null for cluster-scoped)".to_string(),
         },
         ColumnDef {
             name: "uid".to_string(),
             data_type: "text".to_string(),
             json_path: Some("metadata.uid".to_string()),
-            description: "Unique identifier".to_string(),
         },
         ColumnDef {
             name: "created".to_string(),
             data_type: "timestamp".to_string(),
             json_path: Some("metadata.creationTimestamp".to_string()),
-            description: "Creation timestamp".to_string(),
         },
         ColumnDef {
             name: "labels".to_string(),
-            data_type: "jsonb".to_string(),
+            data_type: "text".to_string(),
             json_path: Some("metadata.labels".to_string()),
-            description: "Resource labels".to_string(),
         },
         ColumnDef {
             name: "annotations".to_string(),
-            data_type: "jsonb".to_string(),
+            data_type: "text".to_string(),
             json_path: Some("metadata.annotations".to_string()),
-            description: "Resource annotations".to_string(),
         },
         ColumnDef {
             name: "owner_references".to_string(),
-            data_type: "jsonb".to_string(),
+            data_type: "text".to_string(),
             json_path: Some("metadata.ownerReferences".to_string()),
-            description: "Owner references for tracking resource ownership".to_string(),
         },
         ColumnDef {
             name: "generation".to_string(),
             data_type: "integer".to_string(),
             json_path: Some("metadata.generation".to_string()),
-            description: "Spec change counter".to_string(),
         },
         ColumnDef {
             name: "resource_version".to_string(),
             data_type: "text".to_string(),
             json_path: Some("metadata.resourceVersion".to_string()),
-            description: "Version for optimistic concurrency".to_string(),
         },
         ColumnDef {
             name: "deletion_timestamp".to_string(),
             data_type: "timestamp".to_string(),
             json_path: Some("metadata.deletionTimestamp".to_string()),
-            description: "When deletion was requested (null if not deleting)".to_string(),
         },
         ColumnDef {
             name: "finalizers".to_string(),
-            data_type: "jsonb".to_string(),
+            data_type: "text".to_string(),
             json_path: Some("metadata.finalizers".to_string()),
-            description: "Finalizers blocking deletion".to_string(),
         },
     ];
 
@@ -501,9 +485,8 @@ pub fn generate_schema(info: &ResourceInfo) -> Vec<ColumnDef> {
         "configmaps" => {
             columns.push(ColumnDef {
                 name: "data".to_string(),
-                data_type: "jsonb".to_string(),
+                data_type: "text".to_string(),
                 json_path: Some("data".to_string()),
-                description: "Configuration data key-value pairs".to_string(),
             });
         }
         "secrets" => {
@@ -511,13 +494,11 @@ pub fn generate_schema(info: &ResourceInfo) -> Vec<ColumnDef> {
                 name: "type".to_string(),
                 data_type: "text".to_string(),
                 json_path: Some("type".to_string()),
-                description: "Secret type (Opaque, kubernetes.io/tls, etc.)".to_string(),
             });
             columns.push(ColumnDef {
                 name: "data".to_string(),
-                data_type: "jsonb".to_string(),
+                data_type: "text".to_string(),
                 json_path: Some("data".to_string()),
-                description: "Secret data (base64 encoded values)".to_string(),
             });
         }
         "events" => {
@@ -527,49 +508,41 @@ pub fn generate_schema(info: &ResourceInfo) -> Vec<ColumnDef> {
                     name: "type".to_string(),
                     data_type: "text".to_string(),
                     json_path: Some("type".to_string()),
-                    description: "Event type (Normal, Warning)".to_string(),
                 },
                 ColumnDef {
                     name: "reason".to_string(),
                     data_type: "text".to_string(),
                     json_path: Some("reason".to_string()),
-                    description: "Short reason for the event".to_string(),
                 },
                 ColumnDef {
                     name: "message".to_string(),
                     data_type: "text".to_string(),
                     json_path: Some("message".to_string()),
-                    description: "Human-readable event message".to_string(),
                 },
                 ColumnDef {
                     name: "count".to_string(),
                     data_type: "integer".to_string(),
                     json_path: Some("count".to_string()),
-                    description: "Number of times this event occurred".to_string(),
                 },
                 ColumnDef {
                     name: "first_timestamp".to_string(),
                     data_type: "timestamp".to_string(),
                     json_path: Some("firstTimestamp".to_string()),
-                    description: "First time the event occurred".to_string(),
                 },
                 ColumnDef {
                     name: "last_timestamp".to_string(),
                     data_type: "timestamp".to_string(),
                     json_path: Some("lastTimestamp".to_string()),
-                    description: "Last time the event occurred".to_string(),
                 },
                 ColumnDef {
                     name: "involved_object".to_string(),
-                    data_type: "jsonb".to_string(),
+                    data_type: "text".to_string(),
                     json_path: Some("involvedObject".to_string()),
-                    description: "Object this event is about".to_string(),
                 },
                 ColumnDef {
                     name: "source".to_string(),
-                    data_type: "jsonb".to_string(),
+                    data_type: "text".to_string(),
                     json_path: Some("source".to_string()),
-                    description: "Component that generated the event".to_string(),
                 },
             ]);
         }
@@ -580,19 +553,16 @@ pub fn generate_schema(info: &ResourceInfo) -> Vec<ColumnDef> {
                     name: "timestamp".to_string(),
                     data_type: "timestamp".to_string(),
                     json_path: Some("timestamp".to_string()),
-                    description: "Time when metrics were collected".to_string(),
                 },
                 ColumnDef {
                     name: "window".to_string(),
                     data_type: "text".to_string(),
                     json_path: Some("window".to_string()),
-                    description: "Time window of the metrics sample".to_string(),
                 },
                 ColumnDef {
                     name: "containers".to_string(),
-                    data_type: "jsonb".to_string(),
+                    data_type: "text".to_string(),
                     json_path: Some("containers".to_string()),
-                    description: "Container metrics (cpu, memory usage per container)".to_string(),
                 },
             ]);
         }
@@ -603,19 +573,16 @@ pub fn generate_schema(info: &ResourceInfo) -> Vec<ColumnDef> {
                     name: "timestamp".to_string(),
                     data_type: "timestamp".to_string(),
                     json_path: Some("timestamp".to_string()),
-                    description: "Time when metrics were collected".to_string(),
                 },
                 ColumnDef {
                     name: "window".to_string(),
                     data_type: "text".to_string(),
                     json_path: Some("window".to_string()),
-                    description: "Time window of the metrics sample".to_string(),
                 },
                 ColumnDef {
                     name: "usage".to_string(),
-                    data_type: "jsonb".to_string(),
+                    data_type: "text".to_string(),
                     json_path: Some("usage".to_string()),
-                    description: "Node resource usage (cpu, memory)".to_string(),
                 },
             ]);
         }
@@ -623,15 +590,13 @@ pub fn generate_schema(info: &ResourceInfo) -> Vec<ColumnDef> {
             // Most resources have spec and status
             columns.push(ColumnDef {
                 name: "spec".to_string(),
-                data_type: "jsonb".to_string(),
+                data_type: "text".to_string(),
                 json_path: Some("spec".to_string()),
-                description: "Resource specification (desired state)".to_string(),
             });
             columns.push(ColumnDef {
                 name: "status".to_string(),
-                data_type: "jsonb".to_string(),
+                data_type: "text".to_string(),
                 json_path: Some("status".to_string()),
-                description: "Resource status (current state)".to_string(),
             });
         }
     }

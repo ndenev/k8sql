@@ -6,15 +6,18 @@
 //! This module converts Kubernetes API JSON responses into Arrow RecordBatches
 //! suitable for DataFusion query processing. Key features:
 //!
-//! - All columns are stored as UTF8 strings for PostgreSQL wire protocol compatibility
+//! - Metadata fields use native Arrow types (Timestamp, Int64) for proper SQL operations
 //! - Labels, annotations, spec, and status are stored as JSON strings
 //! - Access nested fields using json_get_* functions or PostgreSQL operators (->>, ->)
 //! - Example: SELECT labels->>'app' FROM pods WHERE labels->>'app' = 'nginx'
 
 use std::sync::Arc;
 
-use datafusion::arrow::array::{ArrayRef, RecordBatch, StringBuilder};
-use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use chrono::{DateTime, Utc};
+use datafusion::arrow::array::{
+    ArrayRef, Int64Builder, RecordBatch, StringBuilder, TimestampMillisecondBuilder,
+};
+use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use datafusion::error::Result;
 
 use crate::kubernetes::discovery::{ColumnDef, ResourceInfo, generate_schema};
@@ -25,12 +28,23 @@ use crate::kubernetes::discovery::{ColumnDef, ResourceInfo, generate_schema};
 // Use json_get_* functions or PostgreSQL operators (->>, ->) for nested field access.
 // Example: SELECT json_get_str(status, 'phase') as phase FROM pods
 
+/// Map our ColumnDef data_type string to Arrow DataType
+fn column_data_type(data_type: &str) -> DataType {
+    match data_type {
+        // Kubernetes timestamps are always UTC, stored as milliseconds since epoch
+        "timestamp" => DataType::Timestamp(TimeUnit::Millisecond, None),
+        "integer" => DataType::Int64,
+        // text and anything else -> Utf8
+        _ => DataType::Utf8,
+    }
+}
+
 /// Convert our ColumnDef schema to Arrow Schema for TableProvider
-/// All columns are stored as Utf8 strings (including labels/annotations as JSON)
+/// Uses native Arrow types for timestamps and integers
 pub fn to_arrow_schema(columns: &[ColumnDef]) -> SchemaRef {
     let fields: Vec<Field> = columns
         .iter()
-        .map(|col| Field::new(&col.name, DataType::Utf8, true))
+        .map(|col| Field::new(&col.name, column_data_type(&col.data_type), true))
         .collect();
 
     Arc::new(Schema::new(fields))
@@ -77,8 +91,13 @@ fn build_column_array(
         // Special case: _cluster is injected, not from JSON
         "_cluster" => build_cluster_column(cluster, resources.len()),
 
-        // All other columns are strings (including labels/annotations/spec/status as JSON)
-        _ => build_string_column(col, resources),
+        // Dispatch based on data_type
+        _ => match col.data_type.as_str() {
+            "timestamp" => build_timestamp_column(col, resources),
+            "integer" => build_integer_column(col, resources),
+            // text and anything else -> string
+            _ => build_string_column(col, resources),
+        },
     }
 }
 
@@ -109,6 +128,76 @@ fn build_string_column(
 
     let array = Arc::new(builder.finish()) as ArrayRef;
     let field = Field::new(&col.name, DataType::Utf8, true);
+    Ok((array, field))
+}
+
+/// Build a timestamp column by parsing RFC 3339 datetime strings from JSON
+/// Kubernetes uses RFC 3339 format: "2024-01-15T10:30:00Z"
+fn build_timestamp_column(
+    col: &ColumnDef,
+    resources: &[serde_json::Value],
+) -> Result<(ArrayRef, Field)> {
+    let mut builder = TimestampMillisecondBuilder::new();
+
+    for resource in resources {
+        let path = col.json_path.as_deref().unwrap_or(&col.name);
+        let value = get_nested_value(resource, path);
+
+        match value.as_str() {
+            Some(s) => {
+                // Parse RFC 3339 timestamp (Kubernetes format)
+                match DateTime::parse_from_rfc3339(s) {
+                    Ok(dt) => {
+                        let utc: DateTime<Utc> = dt.into();
+                        builder.append_value(utc.timestamp_millis());
+                    }
+                    Err(_) => builder.append_null(),
+                }
+            }
+            None => builder.append_null(),
+        }
+    }
+
+    let array = Arc::new(builder.finish()) as ArrayRef;
+    let data_type = DataType::Timestamp(TimeUnit::Millisecond, None);
+    let field = Field::new(&col.name, data_type, true);
+    Ok((array, field))
+}
+
+/// Build an integer column by extracting numeric values from JSON
+fn build_integer_column(
+    col: &ColumnDef,
+    resources: &[serde_json::Value],
+) -> Result<(ArrayRef, Field)> {
+    let mut builder = Int64Builder::new();
+
+    for resource in resources {
+        let path = col.json_path.as_deref().unwrap_or(&col.name);
+        let value = get_nested_value(resource, path);
+
+        match &value {
+            serde_json::Value::Number(n) => {
+                if let Some(i) = n.as_i64() {
+                    builder.append_value(i);
+                } else if let Some(u) = n.as_u64() {
+                    // Handle unsigned that fits in i64
+                    builder.append_value(u as i64);
+                } else {
+                    builder.append_null();
+                }
+            }
+            serde_json::Value::Null => builder.append_null(),
+            // Try to parse string as integer (shouldn't happen with K8s API)
+            serde_json::Value::String(s) => match s.parse::<i64>() {
+                Ok(i) => builder.append_value(i),
+                Err(_) => builder.append_null(),
+            },
+            _ => builder.append_null(),
+        }
+    }
+
+    let array = Arc::new(builder.finish()) as ArrayRef;
+    let field = Field::new(&col.name, DataType::Int64, true);
     Ok((array, field))
 }
 
@@ -309,19 +398,16 @@ mod tests {
                 name: "_cluster".to_string(),
                 data_type: "text".to_string(),
                 json_path: None,
-                description: "Cluster name".to_string(),
             },
             ColumnDef {
                 name: "name".to_string(),
                 data_type: "text".to_string(),
                 json_path: Some("metadata.name".to_string()),
-                description: "Resource name".to_string(),
             },
             ColumnDef {
                 name: "namespace".to_string(),
                 data_type: "text".to_string(),
                 json_path: Some("metadata.namespace".to_string()),
-                description: "Namespace".to_string(),
             },
         ];
 
@@ -389,7 +475,6 @@ mod tests {
             name: "name".to_string(),
             data_type: "text".to_string(),
             json_path: Some("metadata.name".to_string()),
-            description: "Resource name".to_string(),
         };
 
         let resources = vec![
