@@ -84,7 +84,6 @@ impl K8sSessionContext {
 
     /// Execute a SQL query and return the results as Arrow RecordBatches
     pub async fn execute_sql(&self, sql: &str) -> DFResult<Vec<RecordBatch>> {
-        // Preprocess SQL to handle k8sql-specific syntax (e.g., labels.app = 'value')
         let processed_sql = preprocess_sql(sql);
         let df = self.ctx.sql(&processed_sql).await?;
         df.collect().await
