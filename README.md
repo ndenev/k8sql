@@ -337,19 +337,22 @@ WHERE namespace = 'default'
 
 All Kubernetes resources are exposed with a consistent schema:
 
-| Column | Type | Description |
-|--------|------|-------------|
-| `_cluster` | text | Kubernetes context/cluster name |
-| `api_version` | text | API version (e.g., `v1`, `apps/v1`, `cert-manager.io/v1`) |
-| `kind` | text | Resource kind (e.g., `Pod`, `Deployment`, `Certificate`) |
-| `name` | text | Resource name |
-| `namespace` | text | Namespace (null for cluster-scoped resources) |
-| `uid` | text | Unique identifier |
-| `created` | timestamp | Creation timestamp |
-| `labels` | text (JSON) | Resource labels (access with `labels.key` or `json_get_str(labels, 'key')`) |
-| `annotations` | text (JSON) | Resource annotations (access with `annotations.key` or `json_get_str`) |
-| `spec` | json | Resource specification (desired state) |
-| `status` | json | Resource status (current state) |
+| Column | Type | Arrow Type | Description |
+|--------|------|------------|-------------|
+| `_cluster` | text | Utf8 | Kubernetes context/cluster name |
+| `api_version` | text | Utf8 | API version (e.g., `v1`, `apps/v1`, `cert-manager.io/v1`) |
+| `kind` | text | Utf8 | Resource kind (e.g., `Pod`, `Deployment`, `Certificate`) |
+| `name` | text | Utf8 | Resource name |
+| `namespace` | text | Utf8 | Namespace (null for cluster-scoped resources) |
+| `uid` | text | Utf8 | Unique identifier |
+| `created` | timestamp | Timestamp(ms) | Creation timestamp (supports date comparisons) |
+| `generation` | integer | Int64 | Spec change counter (supports numeric comparisons) |
+| `labels` | text (JSON) | Utf8 | Resource labels (access with `labels.key` or `json_get_str(labels, 'key')`) |
+| `annotations` | text (JSON) | Utf8 | Resource annotations (access with `annotations.key` or `json_get_str`) |
+| `spec` | json | Utf8 | Resource specification (desired state) |
+| `status` | json | Utf8 | Resource status (current state) |
+
+Native Arrow types (`Timestamp`, `Int64`) enable proper SQL comparisons and sorting. JSON columns are stored as UTF-8 strings and accessed via JSON functions.
 
 The `api_version` and `kind` columns are self-describing - they identify exactly what type of resource each row represents. This is especially useful when querying CRDs across multiple clusters that might have different versions installed.
 

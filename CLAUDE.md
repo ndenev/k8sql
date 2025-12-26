@@ -110,6 +110,26 @@ Dynamic resource discovery at startup:
 - Special schemas for ConfigMaps, Secrets, Events, and metrics resources
 - Core resources (v1, apps, batch, etc.) take priority over conflicting names from other API groups
 
+#### ColumnDataType Enum
+
+Schema definitions use a type-safe enum for Arrow data types:
+
+```rust
+pub enum ColumnDataType {
+    Text,       // Arrow Utf8 - strings, JSON blobs
+    Timestamp,  // Arrow Timestamp(ms) - creation/deletion timestamps
+    Integer,    // Arrow Int64 - generation, count fields
+}
+```
+
+Helper constructors simplify schema definition:
+```rust
+ColumnDef::text("name", "metadata.name")
+ColumnDef::timestamp("created", "metadata.creationTimestamp")
+ColumnDef::integer("generation", "metadata.generation")
+ColumnDef::text_raw("_cluster")  // No JSON path (virtual column)
+```
+
 ### K8sClientPool (`src/kubernetes/client.rs`)
 
 Manages connections to multiple Kubernetes clusters:
