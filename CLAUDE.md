@@ -43,7 +43,7 @@ k8sql
 
 # Batch mode - single query
 k8sql -q "SELECT * FROM pods"
-k8sql -q "SELECT name, json_get_str(status, 'phase') as phase FROM pods WHERE namespace = 'kube-system'"
+k8sql -q "SELECT name, status->>'phase' as phase FROM pods WHERE namespace = 'kube-system'"
 
 # Multi-cluster queries
 k8sql -q "SELECT * FROM pods WHERE _cluster = 'prod'"
@@ -70,7 +70,7 @@ src/
 │   ├── context.rs             # K8sSessionContext - DataFusion session setup
 │   ├── provider.rs            # K8sTableProvider - TableProvider implementation
 │   ├── convert.rs             # JSON to Arrow RecordBatch conversion
-│   ├── preprocess.rs          # SQL preprocessing (labels.x → json_get_str)
+│   ├── preprocess.rs          # SQL preprocessing (fixes ->> operator precedence)
 │   └── hooks.rs               # Query hooks for filter extraction
 ├── kubernetes/
 │   ├── mod.rs
@@ -101,7 +101,7 @@ k8sql uses Apache DataFusion as its SQL query engine:
 
 - **JSON to Arrow conversion** (`convert.rs`): Converts K8s JSON resources to Arrow RecordBatches. All columns are UTF8 strings; labels/annotations are stored as JSON strings for pgwire compatibility.
 
-- **SQL Preprocessing** (`preprocess.rs`): Transforms `labels.key` syntax to `json_get_str(labels, 'key')` before DataFusion parsing. This enables both user-friendly dot notation and K8s API label selector pushdown.
+- **SQL Preprocessing** (`preprocess.rs`): Fixes `->>` operator precedence before DataFusion parsing. Wraps `col->>'key' = 'value'` as `(col->>'key') = 'value'` to work around parser quirks.
 
 ### Resource Discovery (`src/kubernetes/discovery.rs`)
 
@@ -141,8 +141,8 @@ All resources share a consistent schema:
 | `namespace` | text | Namespace (null for cluster-scoped) |
 | `uid` | text | Unique identifier |
 | `created` | timestamp | Creation timestamp |
-| `labels` | text (JSON) | JSON object, access with `json_get_str(labels, 'key')` or `labels.key` |
-| `annotations` | text (JSON) | JSON object, access with `json_get_str(annotations, 'key')` or `annotations.key` |
+| `labels` | text (JSON) | JSON object, access with `labels->>'key'` (PostgreSQL syntax) |
+| `annotations` | text (JSON) | JSON object, access with `annotations->>'key'` |
 | `spec` | json (Utf8) | Resource specification (JSON string) |
 | `status` | json (Utf8) | Resource status (JSON string) |
 
@@ -158,25 +158,16 @@ Special cases:
 | SQL Condition | K8s API Optimization |
 |---------------|---------------------|
 | `namespace = 'x'` | Uses namespaced API |
-| `labels.app = 'nginx'` | K8s label selector (preprocessed to json_get_str) |
-| `json_get_str(labels, 'app') = 'nginx'` | Same (explicit JSON access) |
-| `labels.app = 'x' AND labels.env = 'y'` | Combined: `app=x,env=y` |
+| `labels->>'app' = 'nginx'` | K8s label selector |
+| `labels->>'app' = 'x' AND labels->>'env' = 'y'` | Combined: `app=x,env=y` |
 | `_cluster = 'prod'` | Only queries that cluster |
 | `_cluster = '*'` | Queries all clusters in parallel |
 
 ### Client-side (DataFusion):
-- JSON field access (`json_get_str(status, 'phase')`)
+- JSON field access (`status->>'phase'` or `json_get_str(status, 'phase')`)
 - LIKE patterns
 - Complex expressions
 - ORDER BY, LIMIT, GROUP BY
-
-### SQL Preprocessing (`src/datafusion_integration/preprocess.rs`)
-
-Transforms k8sql syntax to DataFusion-compatible SQL:
-- `labels.app = 'value'` → `json_get_str(labels, 'app') = 'value'`
-- `annotations.key = 'value'` → `json_get_str(annotations, 'key') = 'value'`
-
-This enables user-friendly dot-notation while using DataFusion's JSON functions. The TableProvider recognizes `json_get_str(labels, 'key')` patterns for K8s label selector pushdown.
 
 ### JSON Array Access
 
