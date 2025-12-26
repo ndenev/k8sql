@@ -8,7 +8,6 @@ mod datafusion_integration;
 mod kubernetes;
 mod output;
 pub mod progress;
-mod sql;
 
 use anyhow::Result;
 use clap::Parser;

@@ -73,11 +73,10 @@ src/
 │   ├── preprocess.rs          # SQL preprocessing (fixes ->> operator precedence)
 │   └── hooks.rs               # Query hooks for filter extraction
 ├── kubernetes/
-│   ├── mod.rs
+│   ├── mod.rs                 # ApiFilters type for filter pushdown
+│   ├── cache.rs               # Resource discovery cache persistence
 │   ├── client.rs              # K8sClientPool - multi-cluster connection caching
 │   └── discovery.rs           # Dynamic resource discovery and schema generation
-├── sql/
-│   └── mod.rs                 # ApiFilters type for filter pushdown
 ├── output/
 │   ├── mod.rs                 # QueryResult type and format dispatch
 │   ├── table.rs               # Pretty table output
