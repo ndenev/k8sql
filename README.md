@@ -17,7 +17,7 @@ Query Kubernetes clusters using SQL. k8sql exposes Kubernetes resources as datab
 k8sql
 
 # Single query
-k8sql -q "SELECT name, namespace, phase FROM pods"
+k8sql -q "SELECT name, namespace, status->>'phase' as phase FROM pods"
 
 # Output as JSON
 k8sql -q "SELECT * FROM deployments" -o json
@@ -226,17 +226,21 @@ WHERE json_get_int(spec, 'replicas') > 1
 
 ```sql
 -- Compare pods across prod and staging
-SELECT _cluster, name, namespace, phase
+SELECT _cluster, name, namespace, status->>'phase' as phase
 FROM pods
 WHERE _cluster IN ('prod', 'staging') AND namespace = 'default'
 
 -- Find all failing pods across all clusters
-SELECT _cluster, name, namespace, phase
+SELECT _cluster, name, namespace, status->>'phase' as phase
 FROM pods
-WHERE _cluster = '*' AND phase = 'Failed'
+WHERE _cluster = '*' AND status->>'phase' = 'Failed'
 
--- Count deployments per cluster (future feature)
-SELECT _cluster, COUNT(*) FROM deployments WHERE _cluster = '*' GROUP BY _cluster
+-- Count deployments per cluster
+SELECT _cluster, COUNT(*) as count
+FROM deployments
+WHERE _cluster = '*'
+GROUP BY _cluster
+ORDER BY count DESC
 ```
 
 ### Resource-Specific Examples
@@ -280,7 +284,7 @@ FROM certificates
 ### Container Image Queries
 
 ```sql
--- All images used in a namespace
+-- All unique images in a namespace
 SELECT DISTINCT json_get_str(UNNEST(json_get_array(spec, 'containers')), 'image') as image
 FROM pods
 WHERE namespace = 'kube-system'
@@ -294,25 +298,7 @@ WITH container_images AS (
 )
 SELECT * FROM container_images WHERE image LIKE '%nginx%'
 
--- Split container images into name and tag
-WITH container_images AS (
-    SELECT _cluster, namespace, name as pod_name,
-           json_get_str(UNNEST(json_get_array(spec, 'containers')), 'image') as image
-    FROM pods
-)
-SELECT
-    _cluster, namespace, pod_name,
-    split_part(image, ':', 1) as image_name,
-    COALESCE(NULLIF(split_part(image, ':', 2), ''), 'latest') as tag
-FROM container_images
-
--- Images grouped by namespace
-SELECT namespace,
-       json_get_str(UNNEST(json_get_array(spec, 'containers')), 'image') as image
-FROM pods
-ORDER BY namespace, image
-
--- Count pods per image (top 10 most used images)
+-- Top 10 most used images
 SELECT json_get_str(UNNEST(json_get_array(spec, 'containers')), 'image') as image,
        COUNT(*) as count
 FROM pods
@@ -324,13 +310,81 @@ LIMIT 10
 SELECT name, namespace, json_length(json_get_json(spec, 'containers')) as container_count
 FROM pods
 WHERE json_length(json_get_json(spec, 'containers')) > 1
+```
 
--- All container names and their images
-SELECT name as pod, namespace,
-       json_get_str(UNNEST(json_get_array(spec, 'containers')), 'name') as container,
-       json_get_str(UNNEST(json_get_array(spec, 'containers')), 'image') as image
+### Multi-Cluster Admin Queries
+
+Queries useful for administrators managing multiple Kubernetes clusters.
+
+#### Security Audits
+
+```sql
+-- Find privileged pods across all clusters
+SELECT _cluster, namespace, name
 FROM pods
-WHERE namespace = 'default'
+WHERE _cluster = '*'
+  AND json_get_bool(spec, 'containers', 0, 'securityContext', 'privileged') = true
+
+-- Find pods with hostNetwork enabled
+SELECT _cluster, namespace, name
+FROM pods
+WHERE _cluster = '*'
+  AND json_get_bool(spec, 'hostNetwork') = true
+
+-- Find pods running as root (UID 0)
+SELECT _cluster, namespace, name
+FROM pods
+WHERE _cluster = '*'
+  AND json_get_int(spec, 'securityContext', 'runAsUser') = 0
+```
+
+#### Health & Status
+
+```sql
+-- Find unhealthy deployments (ready < desired)
+SELECT _cluster, namespace, name,
+       json_get_int(spec, 'replicas') as desired,
+       json_get_int(status, 'readyReplicas') as ready
+FROM deployments
+WHERE _cluster = '*'
+  AND json_get_int(status, 'readyReplicas') < json_get_int(spec, 'replicas')
+
+-- Find pods in error states
+SELECT _cluster, namespace, name, status->>'phase' as phase
+FROM pods
+WHERE _cluster = '*'
+  AND status->>'phase' IN ('Failed', 'Unknown')
+
+-- Find resources stuck in deletion
+SELECT _cluster, namespace, name, deletion_timestamp
+FROM pods
+WHERE _cluster = '*'
+  AND deletion_timestamp IS NOT NULL
+```
+
+#### Capacity Planning
+
+```sql
+-- Count pods per cluster
+SELECT _cluster, COUNT(*) as pod_count
+FROM pods
+WHERE _cluster = '*'
+GROUP BY _cluster
+ORDER BY pod_count DESC
+
+-- Count nodes per cluster
+SELECT _cluster, COUNT(*) as node_count
+FROM nodes
+WHERE _cluster = '*'
+GROUP BY _cluster
+
+-- Find largest namespaces across all clusters
+SELECT _cluster, namespace, COUNT(*) as pod_count
+FROM pods
+WHERE _cluster = '*'
+GROUP BY _cluster, namespace
+ORDER BY pod_count DESC
+LIMIT 20
 ```
 
 ## Table Schema
