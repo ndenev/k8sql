@@ -20,7 +20,7 @@ use datafusion::arrow::array::{
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use datafusion::error::Result;
 
-use crate::kubernetes::discovery::{ColumnDef, ResourceInfo, generate_schema};
+use crate::kubernetes::discovery::{ColumnDataType, ColumnDef, ResourceInfo, generate_schema};
 
 // NOTE: spec/status columns are stored as UTF8 JSON strings rather than native Arrow structs.
 // This is because DataFusion's query planner needs the schema at planning time, but K8s
@@ -28,14 +28,14 @@ use crate::kubernetes::discovery::{ColumnDef, ResourceInfo, generate_schema};
 // Use json_get_* functions or PostgreSQL operators (->>, ->) for nested field access.
 // Example: SELECT json_get_str(status, 'phase') as phase FROM pods
 
-/// Map our ColumnDef data_type string to Arrow DataType
-fn column_data_type(data_type: &str) -> DataType {
+/// Map ColumnDataType enum to Arrow DataType
+fn column_data_type(data_type: ColumnDataType) -> DataType {
     match data_type {
         // Kubernetes timestamps are always UTC, stored as milliseconds since epoch
-        "timestamp" => DataType::Timestamp(TimeUnit::Millisecond, None),
-        "integer" => DataType::Int64,
-        // text and anything else -> Utf8
-        _ => DataType::Utf8,
+        ColumnDataType::Timestamp => DataType::Timestamp(TimeUnit::Millisecond, None),
+        ColumnDataType::Integer => DataType::Int64,
+        // text -> Utf8
+        ColumnDataType::Text => DataType::Utf8,
     }
 }
 
@@ -44,7 +44,7 @@ fn column_data_type(data_type: &str) -> DataType {
 pub fn to_arrow_schema(columns: &[ColumnDef]) -> SchemaRef {
     let fields: Vec<Field> = columns
         .iter()
-        .map(|col| Field::new(&col.name, column_data_type(&col.data_type), true))
+        .map(|col| Field::new(&col.name, column_data_type(col.data_type), true))
         .collect();
 
     Arc::new(Schema::new(fields))
@@ -92,11 +92,10 @@ fn build_column_array(
         "_cluster" => build_cluster_column(cluster, resources.len()),
 
         // Dispatch based on data_type
-        _ => match col.data_type.as_str() {
-            "timestamp" => build_timestamp_column(col, resources),
-            "integer" => build_integer_column(col, resources),
-            // text and anything else -> string
-            _ => build_string_column(col, resources),
+        _ => match col.data_type {
+            ColumnDataType::Timestamp => build_timestamp_column(col, resources),
+            ColumnDataType::Integer => build_integer_column(col, resources),
+            ColumnDataType::Text => build_string_column(col, resources),
         },
     }
 }
@@ -396,17 +395,17 @@ mod tests {
         let columns = vec![
             ColumnDef {
                 name: "_cluster".to_string(),
-                data_type: "text".to_string(),
+                data_type: ColumnDataType::Text,
                 json_path: None,
             },
             ColumnDef {
                 name: "name".to_string(),
-                data_type: "text".to_string(),
+                data_type: ColumnDataType::Text,
                 json_path: Some("metadata.name".to_string()),
             },
             ColumnDef {
                 name: "namespace".to_string(),
-                data_type: "text".to_string(),
+                data_type: ColumnDataType::Text,
                 json_path: Some("metadata.namespace".to_string()),
             },
         ];
@@ -473,7 +472,7 @@ mod tests {
     fn test_build_string_column() {
         let col = ColumnDef {
             name: "name".to_string(),
-            data_type: "text".to_string(),
+            data_type: ColumnDataType::Text,
             json_path: Some("metadata.name".to_string()),
         };
 

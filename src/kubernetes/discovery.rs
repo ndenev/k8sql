@@ -11,14 +11,63 @@ use kube::Client;
 use kube::discovery::{ApiCapabilities, ApiResource, Scope};
 use std::collections::HashMap;
 
+/// Arrow data type for column schema
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ColumnDataType {
+    /// UTF-8 string (text, JSON blobs)
+    Text,
+    /// Millisecond timestamp
+    Timestamp,
+    /// 64-bit integer
+    Integer,
+}
+
 /// Column definition for schema
 #[derive(Debug, Clone)]
 pub struct ColumnDef {
     pub name: String,
-    /// Arrow type: text, timestamp, integer
-    pub data_type: String,
+    /// Arrow data type
+    pub data_type: ColumnDataType,
     /// JSON path to extract value (e.g., "metadata.name")
     pub json_path: Option<String>,
+}
+
+impl ColumnDef {
+    /// Create a text column with a JSON path
+    fn text(name: &str, json_path: &str) -> Self {
+        Self {
+            name: name.into(),
+            data_type: ColumnDataType::Text,
+            json_path: Some(json_path.into()),
+        }
+    }
+
+    /// Create a text column without a JSON path (uses name as path)
+    fn text_raw(name: &str) -> Self {
+        Self {
+            name: name.into(),
+            data_type: ColumnDataType::Text,
+            json_path: None,
+        }
+    }
+
+    /// Create a timestamp column with a JSON path
+    fn timestamp(name: &str, json_path: &str) -> Self {
+        Self {
+            name: name.into(),
+            data_type: ColumnDataType::Timestamp,
+            json_path: Some(json_path.into()),
+        }
+    }
+
+    /// Create an integer column with a JSON path
+    fn integer(name: &str, json_path: &str) -> Self {
+        Self {
+            name: name.into(),
+            data_type: ColumnDataType::Integer,
+            json_path: Some(json_path.into()),
+        }
+    }
 }
 
 /// Information about a discovered Kubernetes resource
@@ -405,199 +454,67 @@ pub async fn discover_groups(
 pub fn generate_schema(info: &ResourceInfo) -> Vec<ColumnDef> {
     let mut columns = vec![
         // Virtual column for cluster/context name
-        ColumnDef {
-            name: "_cluster".to_string(),
-            data_type: "text".to_string(),
-            json_path: None,
-        },
+        ColumnDef::text_raw("_cluster"),
         // API version and kind - self-describing columns for CRD safety
-        ColumnDef {
-            name: "api_version".to_string(),
-            data_type: "text".to_string(),
-            json_path: Some("apiVersion".to_string()),
-        },
-        ColumnDef {
-            name: "kind".to_string(),
-            data_type: "text".to_string(),
-            json_path: Some("kind".to_string()),
-        },
+        ColumnDef::text("api_version", "apiVersion"),
+        ColumnDef::text("kind", "kind"),
         // Common metadata columns
-        ColumnDef {
-            name: "name".to_string(),
-            data_type: "text".to_string(),
-            json_path: Some("metadata.name".to_string()),
-        },
-        ColumnDef {
-            name: "namespace".to_string(),
-            data_type: "text".to_string(),
-            json_path: Some("metadata.namespace".to_string()),
-        },
-        ColumnDef {
-            name: "uid".to_string(),
-            data_type: "text".to_string(),
-            json_path: Some("metadata.uid".to_string()),
-        },
-        ColumnDef {
-            name: "created".to_string(),
-            data_type: "timestamp".to_string(),
-            json_path: Some("metadata.creationTimestamp".to_string()),
-        },
-        ColumnDef {
-            name: "labels".to_string(),
-            data_type: "text".to_string(),
-            json_path: Some("metadata.labels".to_string()),
-        },
-        ColumnDef {
-            name: "annotations".to_string(),
-            data_type: "text".to_string(),
-            json_path: Some("metadata.annotations".to_string()),
-        },
-        ColumnDef {
-            name: "owner_references".to_string(),
-            data_type: "text".to_string(),
-            json_path: Some("metadata.ownerReferences".to_string()),
-        },
-        ColumnDef {
-            name: "generation".to_string(),
-            data_type: "integer".to_string(),
-            json_path: Some("metadata.generation".to_string()),
-        },
-        ColumnDef {
-            name: "resource_version".to_string(),
-            data_type: "text".to_string(),
-            json_path: Some("metadata.resourceVersion".to_string()),
-        },
-        ColumnDef {
-            name: "deletion_timestamp".to_string(),
-            data_type: "timestamp".to_string(),
-            json_path: Some("metadata.deletionTimestamp".to_string()),
-        },
-        ColumnDef {
-            name: "finalizers".to_string(),
-            data_type: "text".to_string(),
-            json_path: Some("metadata.finalizers".to_string()),
-        },
+        ColumnDef::text("name", "metadata.name"),
+        ColumnDef::text("namespace", "metadata.namespace"),
+        ColumnDef::text("uid", "metadata.uid"),
+        ColumnDef::timestamp("created", "metadata.creationTimestamp"),
+        ColumnDef::text("labels", "metadata.labels"),
+        ColumnDef::text("annotations", "metadata.annotations"),
+        ColumnDef::text("owner_references", "metadata.ownerReferences"),
+        ColumnDef::integer("generation", "metadata.generation"),
+        ColumnDef::text("resource_version", "metadata.resourceVersion"),
+        ColumnDef::timestamp("deletion_timestamp", "metadata.deletionTimestamp"),
+        ColumnDef::text("finalizers", "metadata.finalizers"),
     ];
 
     // Add resource-specific columns based on type
     // ConfigMaps and Secrets use 'data' instead of spec/status
     match info.table_name.as_str() {
         "configmaps" => {
-            columns.push(ColumnDef {
-                name: "data".to_string(),
-                data_type: "text".to_string(),
-                json_path: Some("data".to_string()),
-            });
+            columns.push(ColumnDef::text("data", "data"));
         }
         "secrets" => {
-            columns.push(ColumnDef {
-                name: "type".to_string(),
-                data_type: "text".to_string(),
-                json_path: Some("type".to_string()),
-            });
-            columns.push(ColumnDef {
-                name: "data".to_string(),
-                data_type: "text".to_string(),
-                json_path: Some("data".to_string()),
-            });
+            columns.push(ColumnDef::text("type", "type"));
+            columns.push(ColumnDef::text("data", "data"));
         }
         "events" => {
             // Events have a flat structure, not spec/status
             columns.extend(vec![
-                ColumnDef {
-                    name: "type".to_string(),
-                    data_type: "text".to_string(),
-                    json_path: Some("type".to_string()),
-                },
-                ColumnDef {
-                    name: "reason".to_string(),
-                    data_type: "text".to_string(),
-                    json_path: Some("reason".to_string()),
-                },
-                ColumnDef {
-                    name: "message".to_string(),
-                    data_type: "text".to_string(),
-                    json_path: Some("message".to_string()),
-                },
-                ColumnDef {
-                    name: "count".to_string(),
-                    data_type: "integer".to_string(),
-                    json_path: Some("count".to_string()),
-                },
-                ColumnDef {
-                    name: "first_timestamp".to_string(),
-                    data_type: "timestamp".to_string(),
-                    json_path: Some("firstTimestamp".to_string()),
-                },
-                ColumnDef {
-                    name: "last_timestamp".to_string(),
-                    data_type: "timestamp".to_string(),
-                    json_path: Some("lastTimestamp".to_string()),
-                },
-                ColumnDef {
-                    name: "involved_object".to_string(),
-                    data_type: "text".to_string(),
-                    json_path: Some("involvedObject".to_string()),
-                },
-                ColumnDef {
-                    name: "source".to_string(),
-                    data_type: "text".to_string(),
-                    json_path: Some("source".to_string()),
-                },
+                ColumnDef::text("type", "type"),
+                ColumnDef::text("reason", "reason"),
+                ColumnDef::text("message", "message"),
+                ColumnDef::integer("count", "count"),
+                ColumnDef::timestamp("first_timestamp", "firstTimestamp"),
+                ColumnDef::timestamp("last_timestamp", "lastTimestamp"),
+                ColumnDef::text("involved_object", "involvedObject"),
+                ColumnDef::text("source", "source"),
             ]);
         }
         "podmetrics" => {
             // PodMetrics from metrics.k8s.io - has containers with CPU/memory usage
             columns.extend(vec![
-                ColumnDef {
-                    name: "timestamp".to_string(),
-                    data_type: "timestamp".to_string(),
-                    json_path: Some("timestamp".to_string()),
-                },
-                ColumnDef {
-                    name: "window".to_string(),
-                    data_type: "text".to_string(),
-                    json_path: Some("window".to_string()),
-                },
-                ColumnDef {
-                    name: "containers".to_string(),
-                    data_type: "text".to_string(),
-                    json_path: Some("containers".to_string()),
-                },
+                ColumnDef::timestamp("timestamp", "timestamp"),
+                ColumnDef::text("window", "window"),
+                ColumnDef::text("containers", "containers"),
             ]);
         }
         "nodemetrics" => {
             // NodeMetrics from metrics.k8s.io - has node-level CPU/memory usage
             columns.extend(vec![
-                ColumnDef {
-                    name: "timestamp".to_string(),
-                    data_type: "timestamp".to_string(),
-                    json_path: Some("timestamp".to_string()),
-                },
-                ColumnDef {
-                    name: "window".to_string(),
-                    data_type: "text".to_string(),
-                    json_path: Some("window".to_string()),
-                },
-                ColumnDef {
-                    name: "usage".to_string(),
-                    data_type: "text".to_string(),
-                    json_path: Some("usage".to_string()),
-                },
+                ColumnDef::timestamp("timestamp", "timestamp"),
+                ColumnDef::text("window", "window"),
+                ColumnDef::text("usage", "usage"),
             ]);
         }
         _ => {
             // Most resources have spec and status
-            columns.push(ColumnDef {
-                name: "spec".to_string(),
-                data_type: "text".to_string(),
-                json_path: Some("spec".to_string()),
-            });
-            columns.push(ColumnDef {
-                name: "status".to_string(),
-                data_type: "text".to_string(),
-                json_path: Some("status".to_string()),
-            });
+            columns.push(ColumnDef::text("spec", "spec"));
+            columns.push(ColumnDef::text("status", "status"));
         }
     }
 
