@@ -16,7 +16,7 @@ use datafusion::prelude::SessionConfig;
 use crate::kubernetes::K8sClientPool;
 use crate::output::QueryResult;
 
-use super::preprocess::preprocess_sql;
+use super::preprocess::{preprocess_sql, validate_read_only};
 use super::provider::K8sTableProvider;
 
 /// A wrapper around DataFusion's SessionContext configured for K8s queries
@@ -83,6 +83,10 @@ impl K8sSessionContext {
 
     /// Execute a SQL query and return the results as Arrow RecordBatches
     pub async fn execute_sql(&self, sql: &str) -> DFResult<Vec<RecordBatch>> {
+        // Validate that the statement is read-only before execution
+        validate_read_only(sql)
+            .map_err(|e| datafusion::error::DataFusionError::Plan(e.to_string()))?;
+
         let processed_sql = preprocess_sql(sql);
         let df = self.ctx.sql(&processed_sql).await?;
         df.collect().await
