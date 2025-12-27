@@ -101,49 +101,67 @@ impl K8sTableProvider {
     /// Supports: _cluster = 'x', _cluster = '*', _cluster IN (...), _cluster NOT IN (...)
     fn extract_cluster_filter(&self, filters: &[Expr]) -> ClusterFilter {
         for filter in filters {
-            // Handle _cluster = 'value' or _cluster = '*'
-            if let Expr::BinaryExpr(binary) = filter
-                && let Expr::Column(col) = binary.left.as_ref()
-                && col.name == "_cluster"
-                && matches!(binary.op, Operator::Eq)
-                && let Expr::Literal(lit, _) = binary.right.as_ref()
-                && let datafusion::common::ScalarValue::Utf8(Some(cluster)) = lit
-            {
-                if cluster == "*" {
-                    return ClusterFilter::All;
-                }
-                return ClusterFilter::Include(vec![cluster.clone()]);
+            if let Some(result) = self.extract_cluster_filter_from_expr(filter) {
+                return result;
             }
+        }
+        ClusterFilter::Default
+    }
 
+    /// Recursively extract _cluster filter from a single expression
+    /// Handles AND expressions by checking both sides
+    fn extract_cluster_filter_from_expr(&self, expr: &Expr) -> Option<ClusterFilter> {
+        match expr {
+            // Handle AND expressions - check both sides
+            Expr::BinaryExpr(binary) if binary.op == Operator::And => {
+                if let Some(result) = self.extract_cluster_filter_from_expr(&binary.left) {
+                    return Some(result);
+                }
+                self.extract_cluster_filter_from_expr(&binary.right)
+            }
+            // Handle _cluster = 'value' or _cluster = '*'
+            Expr::BinaryExpr(binary)
+                if matches!(binary.op, Operator::Eq)
+                    && matches!(binary.left.as_ref(), Expr::Column(col) if col.name == "_cluster") =>
+            {
+                if let Expr::Literal(lit, _) = binary.right.as_ref()
+                    && let datafusion::common::ScalarValue::Utf8(Some(cluster)) = lit
+                {
+                    if cluster == "*" {
+                        return Some(ClusterFilter::All);
+                    }
+                    return Some(ClusterFilter::Include(vec![cluster.clone()]));
+                }
+                None
+            }
             // Handle _cluster IN ('a', 'b', 'c')
-            if let Expr::InList(in_list) = filter
-                && let Expr::Column(col) = in_list.expr.as_ref()
-                && col.name == "_cluster"
-                && !in_list.negated
+            Expr::InList(in_list)
+                if matches!(in_list.expr.as_ref(), Expr::Column(col) if col.name == "_cluster")
+                    && !in_list.negated =>
             {
                 let clusters = extract_string_literals(in_list);
                 if !clusters.is_empty() {
                     // Check if '*' is in the list - treat as All
                     if clusters.iter().any(|c| c == "*") {
-                        return ClusterFilter::All;
+                        return Some(ClusterFilter::All);
                     }
-                    return ClusterFilter::Include(clusters);
+                    return Some(ClusterFilter::Include(clusters));
                 }
+                None
             }
-
             // Handle _cluster NOT IN ('a', 'b')
-            if let Expr::InList(in_list) = filter
-                && let Expr::Column(col) = in_list.expr.as_ref()
-                && col.name == "_cluster"
-                && in_list.negated
+            Expr::InList(in_list)
+                if matches!(in_list.expr.as_ref(), Expr::Column(col) if col.name == "_cluster")
+                    && in_list.negated =>
             {
                 let clusters = extract_string_literals(in_list);
                 if !clusters.is_empty() {
-                    return ClusterFilter::Exclude(clusters);
+                    return Some(ClusterFilter::Exclude(clusters));
                 }
+                None
             }
+            _ => None,
         }
-        ClusterFilter::Default
     }
 
     /// Extract label selectors from DataFusion expressions
@@ -307,10 +325,25 @@ impl TableProvider for K8sTableProvider {
         filters: &[Expr],
         _limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
+        // Log raw filters for debugging
+        debug!(
+            table = %self.resource_info.table_name,
+            filter_count = filters.len(),
+            filters = ?filters,
+            "Raw filters passed to scan"
+        );
+
         // Extract pushdown filters - these go to the K8s API to reduce data fetched
         let namespace = self.extract_namespace_filter(filters);
         let cluster_filter = self.extract_cluster_filter(filters);
         let label_selector = self.extract_label_selectors(filters);
+
+        // Log cluster filter for debugging multi-cluster queries
+        debug!(
+            table = %self.resource_info.table_name,
+            cluster_filter = ?cluster_filter,
+            "Extracted cluster filter"
+        );
 
         // Log pushdown filters for debugging
         if namespace.is_some() || label_selector.is_some() {
@@ -353,6 +386,14 @@ impl TableProvider for K8sTableProvider {
                     .collect()
             }
         };
+
+        // Log resolved clusters for debugging
+        debug!(
+            table = %self.resource_info.table_name,
+            clusters = ?clusters,
+            available_contexts = ?self.pool.list_contexts().unwrap_or_default(),
+            "Resolved clusters to query"
+        );
 
         // Fetch data from all clusters IN PARALLEL
         // Each cluster becomes a separate partition for DataFusion to process
