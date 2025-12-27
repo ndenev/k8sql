@@ -131,15 +131,15 @@ impl K8sTableProvider {
         debug!(expr = ?expr, "Checking expression for _cluster filter");
 
         // Log InList expressions at info level for debugging
-        if let Expr::InList(in_list) = expr {
-            if let Expr::Column(col) = in_list.expr.as_ref() {
-                info!(
-                    column_name = %col.name,
-                    list_len = in_list.list.len(),
-                    negated = in_list.negated,
-                    "Found InList expression for column"
-                );
-            }
+        if let Expr::InList(in_list) = expr
+            && let Expr::Column(col) = in_list.expr.as_ref()
+        {
+            info!(
+                column_name = %col.name,
+                list_len = in_list.list.len(),
+                negated = in_list.negated,
+                "Found InList expression for column"
+            );
         }
 
         match expr {
