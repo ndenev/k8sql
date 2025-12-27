@@ -145,6 +145,21 @@ impl K8sTableProvider {
                 }
                 self.extract_cluster_filter_from_expr(&binary.right)
             }
+            // Handle OR expressions - DataFusion transforms IN lists to OR chains
+            // e.g., _cluster IN ('a', 'b') becomes (_cluster = 'a') OR (_cluster = 'b')
+            Expr::BinaryExpr(binary) if binary.op == Operator::Or => {
+                let mut clusters = Vec::new();
+                if self.collect_cluster_values_from_or(expr, &mut clusters) && !clusters.is_empty()
+                {
+                    eprintln!("[DEBUG] Collected clusters from OR expression: {:?}", clusters);
+                    // Check if '*' is in the list - treat as All
+                    if clusters.iter().any(|c| c == "*") {
+                        return Some(ClusterFilter::All);
+                    }
+                    return Some(ClusterFilter::Include(clusters));
+                }
+                None
+            }
             // Handle _cluster = 'value' or _cluster = '*'
             Expr::BinaryExpr(binary)
                 if matches!(binary.op, Operator::Eq)
@@ -161,6 +176,7 @@ impl K8sTableProvider {
                 None
             }
             // Handle _cluster IN ('a', 'b', 'c') or _cluster NOT IN ('a', 'b')
+            // Note: DataFusion often rewrites IN to OR, but keep this for completeness
             Expr::InList(in_list) => {
                 if let Expr::Column(col) = in_list.expr.as_ref()
                     && col.name == "_cluster"
@@ -180,6 +196,32 @@ impl K8sTableProvider {
                 None
             }
             _ => None,
+        }
+    }
+
+    /// Recursively collect cluster values from an OR expression tree
+    /// Returns true if all leaves are `_cluster = 'value'` patterns
+    fn collect_cluster_values_from_or(&self, expr: &Expr, clusters: &mut Vec<String>) -> bool {
+        match expr {
+            Expr::BinaryExpr(binary) if binary.op == Operator::Or => {
+                // Recursively collect from both sides
+                self.collect_cluster_values_from_or(&binary.left, clusters)
+                    && self.collect_cluster_values_from_or(&binary.right, clusters)
+            }
+            Expr::BinaryExpr(binary)
+                if matches!(binary.op, Operator::Eq)
+                    && matches!(binary.left.as_ref(), Expr::Column(col) if col.name == "_cluster") =>
+            {
+                // Extract the cluster value
+                if let Expr::Literal(lit, _) = binary.right.as_ref()
+                    && let datafusion::common::ScalarValue::Utf8(Some(cluster)) = lit
+                {
+                    clusters.push(cluster.clone());
+                    return true;
+                }
+                false
+            }
+            _ => false, // Not a valid _cluster pattern
         }
     }
 
