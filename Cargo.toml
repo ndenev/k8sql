@@ -6,6 +6,9 @@ authors = ["Nikolay Denev <ndenev@gmail.com>"]
 license = "BSD-3-Clause"
 description = "Query Kubernetes with SQL"
 repository = "https://github.com/ndenev/k8sql"
+readme = "README.md"
+keywords = ["kubernetes", "sql", "k8s", "datafusion", "cli"]
+categories = ["command-line-utilities", "database"]
 
 [dependencies]
 # SQL query engine (Apache Arrow DataFusion)
