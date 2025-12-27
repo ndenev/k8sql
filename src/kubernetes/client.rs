@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
-use tracing::{debug, info, warn};
+use tracing::{debug, info, trace, warn};
 
 use super::ApiFilters;
 use super::cache::{CachedResourceInfo, ResourceCache};
@@ -658,19 +658,32 @@ impl K8sClientPool {
                 )
             })?;
 
+        // Log API endpoint details for debugging
+        debug!(
+            table = %table,
+            cluster = ?context,
+            namespace = ?namespace,
+            group = %resource_info.group,
+            version = %resource_info.version,
+            kind = %resource_info.api_resource.kind,
+            "Fetching K8s resource"
+        );
+
         let client = self.get_client(context).await?;
         let ar = &resource_info.api_resource;
         let list_params = self.build_list_params(api_filters);
 
         // Create API handle based on resource scope
-        let api: Api<DynamicObject> = if resource_info.is_namespaced() {
+        let (api, scope): (Api<DynamicObject>, &str) = if resource_info.is_namespaced() {
             match namespace {
-                Some(ns) => Api::namespaced_with(client, ns, ar),
-                None => Api::all_with(client, ar),
+                Some(ns) => (Api::namespaced_with(client, ns, ar), "namespaced"),
+                None => (Api::all_with(client, ar), "all-namespaces"),
             }
         } else {
-            Api::all_with(client, ar)
+            (Api::all_with(client, ar), "cluster-scoped")
         };
+
+        debug!(table = %table, scope = %scope, "API scope");
 
         // Fetch with retry logic for transient failures
         let list = self
@@ -844,6 +857,12 @@ impl K8sClientPool {
         if let Some(ref field_sel) = filters.field_selector {
             params = params.fields(field_sel);
         }
+
+        trace!(
+            label_selector = ?filters.label_selector,
+            field_selector = ?filters.field_selector,
+            "Built ListParams"
+        );
 
         params
     }
