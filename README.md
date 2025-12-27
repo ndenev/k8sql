@@ -1,6 +1,6 @@
 # k8sql
 
-Query Kubernetes clusters using SQL. k8sql exposes Kubernetes resources as database tables, kubectl contexts as databases, and includes a query planner that optimizes API calls.
+Query Kubernetes clusters using SQL. Powered by [Apache DataFusion](https://datafusion.apache.org/), k8sql exposes Kubernetes resources as database tables, kubectl contexts as databases, and includes a query planner that optimizes API calls.
 
 ## Features
 
@@ -24,6 +24,20 @@ k8sql -q "SELECT * FROM deployments" -o json
 
 # Use specific context
 k8sql -c prod-cluster -q "SELECT * FROM pods"
+```
+
+## Installation
+
+```bash
+cargo install k8sql
+```
+
+Or build from source:
+
+```bash
+git clone https://github.com/ndenev/k8sql
+cd k8sql
+cargo build --release
 ```
 
 ## SQL Extensions
@@ -395,8 +409,8 @@ All Kubernetes resources are exposed with a consistent schema:
 | `uid` | text | Utf8 | Unique identifier |
 | `created` | timestamp | Timestamp(ms) | Creation timestamp (supports date comparisons) |
 | `generation` | integer | Int64 | Spec change counter (supports numeric comparisons) |
-| `labels` | text (JSON) | Utf8 | Resource labels (access with `labels.key` or `json_get_str(labels, 'key')`) |
-| `annotations` | text (JSON) | Utf8 | Resource annotations (access with `annotations.key` or `json_get_str`) |
+| `labels` | text (JSON) | Utf8 | Resource labels (access with `labels->>'key'` or `json_get_str(labels, 'key')`) |
+| `annotations` | text (JSON) | Utf8 | Resource annotations (access with `annotations->>'key'` or `json_get_str(annotations, 'key')`) |
 | `spec` | json | Utf8 | Resource specification (desired state) |
 | `status` | json | Utf8 | Resource status (current state) |
 
@@ -574,11 +588,11 @@ k8sql daemon --port 15432
 psql -h localhost -p 15432
 ```
 
-## Building
+## Built With
 
-```bash
-cargo build --release
-```
+- [Apache DataFusion](https://datafusion.apache.org/) - SQL query engine
+- [kube-rs](https://kube.rs/) - Kubernetes client for Rust
+- [datafusion-postgres](https://github.com/datafusion-contrib/datafusion-postgres) - PostgreSQL wire protocol
 
 ## License
 
