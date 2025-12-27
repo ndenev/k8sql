@@ -151,7 +151,10 @@ impl K8sTableProvider {
                 let mut clusters = Vec::new();
                 if self.collect_cluster_values_from_or(expr, &mut clusters) && !clusters.is_empty()
                 {
-                    eprintln!("[DEBUG] Collected clusters from OR expression: {:?}", clusters);
+                    eprintln!(
+                        "[DEBUG] Collected clusters from OR expression: {:?}",
+                        clusters
+                    );
                     // Check if '*' is in the list - treat as All
                     if clusters.iter().any(|c| c == "*") {
                         return Some(ClusterFilter::All);
