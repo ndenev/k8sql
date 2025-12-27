@@ -29,6 +29,23 @@ use crate::kubernetes::discovery::{ResourceInfo, generate_schema};
 
 use super::convert::{json_to_record_batch, to_arrow_schema};
 
+/// Extract string literals from an IN list expression
+fn extract_string_literals(in_list: &datafusion::logical_expr::expr::InList) -> Vec<String> {
+    in_list
+        .list
+        .iter()
+        .filter_map(|e| {
+            if let Expr::Literal(lit, _) = e
+                && let datafusion::common::ScalarValue::Utf8(Some(s)) = lit
+            {
+                Some(s.clone())
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
 /// Represents how clusters should be selected for a query
 #[derive(Debug, Clone)]
 enum ClusterFilter {
@@ -104,19 +121,7 @@ impl K8sTableProvider {
                 && col.name == "_cluster"
                 && !in_list.negated
             {
-                let clusters: Vec<String> = in_list
-                    .list
-                    .iter()
-                    .filter_map(|e| {
-                        if let Expr::Literal(lit, _) = e
-                            && let datafusion::common::ScalarValue::Utf8(Some(s)) = lit
-                        {
-                            Some(s.clone())
-                        } else {
-                            None
-                        }
-                    })
-                    .collect();
+                let clusters = extract_string_literals(in_list);
                 if !clusters.is_empty() {
                     // Check if '*' is in the list - treat as All
                     if clusters.iter().any(|c| c == "*") {
@@ -132,19 +137,7 @@ impl K8sTableProvider {
                 && col.name == "_cluster"
                 && in_list.negated
             {
-                let clusters: Vec<String> = in_list
-                    .list
-                    .iter()
-                    .filter_map(|e| {
-                        if let Expr::Literal(lit, _) = e
-                            && let datafusion::common::ScalarValue::Utf8(Some(s)) = lit
-                        {
-                            Some(s.clone())
-                        } else {
-                            None
-                        }
-                    })
-                    .collect();
+                let clusters = extract_string_literals(in_list);
                 if !clusters.is_empty() {
                     return ClusterFilter::Exclude(clusters);
                 }

@@ -199,65 +199,37 @@ fn array_value_to_string(array: &datafusion::arrow::array::ArrayRef, idx: usize)
     use datafusion::arrow::array::*;
     use datafusion::arrow::datatypes::DataType;
 
+    // Helper macro to reduce boilerplate for simple downcast-and-format cases
+    macro_rules! downcast_format {
+        ($arr_type:ty) => {
+            array
+                .as_any()
+                .downcast_ref::<$arr_type>()
+                .unwrap()
+                .value(idx)
+                .to_string()
+        };
+    }
+
     if array.is_null(idx) {
         return String::new();
     }
 
     match array.data_type() {
-        DataType::Utf8 => {
-            let arr = array.as_any().downcast_ref::<StringArray>().unwrap();
-            arr.value(idx).to_string()
-        }
-        DataType::LargeUtf8 => {
-            let arr = array.as_any().downcast_ref::<LargeStringArray>().unwrap();
-            arr.value(idx).to_string()
-        }
-        DataType::Int8 => {
-            let arr = array.as_any().downcast_ref::<Int8Array>().unwrap();
-            arr.value(idx).to_string()
-        }
-        DataType::Int16 => {
-            let arr = array.as_any().downcast_ref::<Int16Array>().unwrap();
-            arr.value(idx).to_string()
-        }
-        DataType::Int32 => {
-            let arr = array.as_any().downcast_ref::<Int32Array>().unwrap();
-            arr.value(idx).to_string()
-        }
-        DataType::Int64 => {
-            let arr = array.as_any().downcast_ref::<Int64Array>().unwrap();
-            arr.value(idx).to_string()
-        }
-        DataType::UInt8 => {
-            let arr = array.as_any().downcast_ref::<UInt8Array>().unwrap();
-            arr.value(idx).to_string()
-        }
-        DataType::UInt16 => {
-            let arr = array.as_any().downcast_ref::<UInt16Array>().unwrap();
-            arr.value(idx).to_string()
-        }
-        DataType::UInt32 => {
-            let arr = array.as_any().downcast_ref::<UInt32Array>().unwrap();
-            arr.value(idx).to_string()
-        }
-        DataType::UInt64 => {
-            let arr = array.as_any().downcast_ref::<UInt64Array>().unwrap();
-            arr.value(idx).to_string()
-        }
-        DataType::Float32 => {
-            let arr = array.as_any().downcast_ref::<Float32Array>().unwrap();
-            arr.value(idx).to_string()
-        }
-        DataType::Float64 => {
-            let arr = array.as_any().downcast_ref::<Float64Array>().unwrap();
-            arr.value(idx).to_string()
-        }
-        DataType::Boolean => {
-            let arr = array.as_any().downcast_ref::<BooleanArray>().unwrap();
-            arr.value(idx).to_string()
-        }
+        DataType::Utf8 => downcast_format!(StringArray),
+        DataType::LargeUtf8 => downcast_format!(LargeStringArray),
+        DataType::Int8 => downcast_format!(Int8Array),
+        DataType::Int16 => downcast_format!(Int16Array),
+        DataType::Int32 => downcast_format!(Int32Array),
+        DataType::Int64 => downcast_format!(Int64Array),
+        DataType::UInt8 => downcast_format!(UInt8Array),
+        DataType::UInt16 => downcast_format!(UInt16Array),
+        DataType::UInt32 => downcast_format!(UInt32Array),
+        DataType::UInt64 => downcast_format!(UInt64Array),
+        DataType::Float32 => downcast_format!(Float32Array),
+        DataType::Float64 => downcast_format!(Float64Array),
+        DataType::Boolean => downcast_format!(BooleanArray),
         DataType::Timestamp(unit, _) => {
-            use datafusion::arrow::array::TimestampMillisecondArray;
             use datafusion::arrow::datatypes::TimeUnit;
 
             // We only use Millisecond timestamps, but handle gracefully

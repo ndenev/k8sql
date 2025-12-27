@@ -15,11 +15,47 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 
-use super::discovery::ResourceInfo;
+use super::discovery::{ColumnDataType, ColumnDef, ResourceInfo};
 use crate::config;
 
 /// Default cache TTL (24 hours)
 const DEFAULT_CACHE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Serializable version of ColumnDef for caching
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CachedColumnDef {
+    pub name: String,
+    pub data_type: String, // "Text", "Timestamp", or "Integer"
+    pub json_path: Option<String>,
+}
+
+impl From<&ColumnDef> for CachedColumnDef {
+    fn from(col: &ColumnDef) -> Self {
+        Self {
+            name: col.name.clone(),
+            data_type: match col.data_type {
+                ColumnDataType::Text => "Text".to_string(),
+                ColumnDataType::Timestamp => "Timestamp".to_string(),
+                ColumnDataType::Integer => "Integer".to_string(),
+            },
+            json_path: col.json_path.clone(),
+        }
+    }
+}
+
+impl From<CachedColumnDef> for ColumnDef {
+    fn from(cached: CachedColumnDef) -> Self {
+        Self {
+            name: cached.name,
+            data_type: match cached.data_type.as_str() {
+                "Timestamp" => ColumnDataType::Timestamp,
+                "Integer" => ColumnDataType::Integer,
+                _ => ColumnDataType::Text,
+            },
+            json_path: cached.json_path,
+        }
+    }
+}
 
 /// Serializable version of ResourceInfo for caching
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -36,6 +72,9 @@ pub struct CachedResourceInfo {
     pub table_name: String,
     pub aliases: Vec<String>,
     pub is_core: bool,
+    // CRD schema fields (extracted from OpenAPI definition)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub custom_fields: Option<Vec<CachedColumnDef>>,
 }
 
 impl From<&ResourceInfo> for CachedResourceInfo {
@@ -53,6 +92,10 @@ impl From<&ResourceInfo> for CachedResourceInfo {
             table_name: info.table_name.clone(),
             aliases: info.aliases.clone(),
             is_core: info.is_core,
+            custom_fields: info
+                .custom_fields
+                .as_ref()
+                .map(|fields| fields.iter().map(CachedColumnDef::from).collect()),
         }
     }
 }
@@ -83,6 +126,9 @@ impl From<CachedResourceInfo> for ResourceInfo {
             is_core: cached.is_core,
             group: cached.group,
             version: cached.version,
+            custom_fields: cached
+                .custom_fields
+                .map(|fields| fields.into_iter().map(ColumnDef::from).collect()),
         }
     }
 }
@@ -94,6 +140,15 @@ pub struct ClusterGroups {
     pub groups: Vec<(String, String)>,
     /// When this was cached
     pub created_at: u64,
+}
+
+/// Check if a cached entry is still fresh based on creation time and TTL
+fn is_cache_fresh(created_at: u64, ttl: Duration) -> bool {
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    now.saturating_sub(created_at) < ttl.as_secs()
 }
 
 impl ClusterGroups {
@@ -108,12 +163,7 @@ impl ClusterGroups {
     }
 
     pub fn is_fresh(&self, ttl: Duration) -> bool {
-        let now = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        let age = now.saturating_sub(self.created_at);
-        age < ttl.as_secs()
+        is_cache_fresh(self.created_at, ttl)
     }
 }
 
@@ -144,31 +194,30 @@ impl CachedGroup {
     }
 
     pub fn is_fresh(&self, ttl: Duration) -> bool {
-        let now = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        let age = now.saturating_sub(self.created_at);
-        age < ttl.as_secs()
+        is_cache_fresh(self.created_at, ttl)
     }
+}
+
+/// Sanitize a string for use as a filename
+/// Replaces non-alphanumeric characters (except dash, and optionally underscore) with underscore
+fn sanitize_filename(name: &str, allow_underscore: bool) -> String {
+    name.chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' || (allow_underscore && c == '_') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
 
 /// Compute a cache key for an API group
 pub fn group_cache_key(group: &str, version: &str) -> String {
-    // Sanitize group name for filesystem (replace dots with underscores)
-    let safe_group: String = if group.is_empty() {
+    let safe_group = if group.is_empty() {
         "core".to_string()
     } else {
-        group
-            .chars()
-            .map(|c| {
-                if c.is_alphanumeric() || c == '-' {
-                    c
-                } else {
-                    '_'
-                }
-            })
-            .collect()
+        sanitize_filename(group, false)
     };
     format!("{}_{}", safe_group, version)
 }
@@ -219,16 +268,7 @@ impl ResourceCache {
 
     /// Get the cluster mapping file path
     fn cluster_path(&self, cluster: &str) -> PathBuf {
-        let safe_name: String = cluster
-            .chars()
-            .map(|c| {
-                if c.is_alphanumeric() || c == '-' || c == '_' {
-                    c
-                } else {
-                    '_'
-                }
-            })
-            .collect();
+        let safe_name = sanitize_filename(cluster, true);
         self.clusters_dir().join(format!("{}.json", safe_name))
     }
 
@@ -395,6 +435,7 @@ mod tests {
             table_name: format!("{}s", name.to_lowercase()),
             aliases: vec![name.to_lowercase()],
             is_core: false,
+            custom_fields: None,
         }
     }
 
@@ -447,6 +488,7 @@ mod tests {
             is_core: false,
             group: "cert-manager.io".to_string(),
             version: "v1".to_string(),
+            custom_fields: None,
         };
 
         // Convert to cached format
@@ -489,6 +531,7 @@ mod tests {
             is_core: true,
             group: "".to_string(),
             version: "v1".to_string(),
+            custom_fields: None,
         };
 
         let cached = CachedResourceInfo::from(&resource_info);

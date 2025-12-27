@@ -228,35 +228,8 @@ impl K8sClientPool {
                 missing_count
             );
 
-            let discovered = super::discovery::discover_groups(client, &missing_groups).await?;
-
-            // Save and add discovered groups
-            let mut count = 0;
-            for ((group, version), resources) in &discovered {
-                // Convert to cached format
-                let cached_resources: Vec<CachedResourceInfo> =
-                    resources.iter().map(CachedResourceInfo::from).collect();
-
-                // Save to cache
-                if let Err(e) = self
-                    .resource_cache
-                    .save_group(group, version, &cached_resources)
-                {
-                    warn!(
-                        context = %context,
-                        group = %group,
-                        error = %e,
-                        "Failed to cache API group"
-                    );
-                }
-
-                // Add to registry
-                for info in resources {
-                    registry.add(info.clone());
-                    count += 1;
-                }
-            }
-            count
+            self.process_discovered_groups(client, context, &missing_groups, registry)
+                .await?
         } else {
             info!(
                 context = %context,
@@ -325,33 +298,9 @@ impl K8sClientPool {
                 missing_count
             );
 
-            let discovered = super::discovery::discover_groups(client, &missing_groups).await?;
-
-            // Save and add discovered groups
-            for ((group, version), resources) in &discovered {
-                // Convert to cached format
-                let cached_resources: Vec<CachedResourceInfo> =
-                    resources.iter().map(CachedResourceInfo::from).collect();
-
-                // Save to cache
-                if let Err(e) = self
-                    .resource_cache
-                    .save_group(group, version, &cached_resources)
-                {
-                    warn!(
-                        context = %context,
-                        group = %group,
-                        error = %e,
-                        "Failed to cache API group"
-                    );
-                }
-
-                // Add to registry
-                for info in resources {
-                    registry.add(info.clone());
-                    crd_count += 1;
-                }
-            }
+            crd_count += self
+                .process_discovered_groups(client, context, &missing_groups, registry)
+                .await?;
         } else {
             info!(
                 context = %context,
@@ -369,6 +318,59 @@ impl K8sClientPool {
         }
 
         Ok(crd_count)
+    }
+
+    /// Process newly discovered API groups: fetch schemas, cache, and add to registry
+    ///
+    /// This helper consolidates the common pattern of:
+    /// 1. Discovering groups from the API
+    /// 2. Fetching CRD schemas from OpenAPI definitions
+    /// 3. Saving to the local cache
+    /// 4. Adding to the in-memory registry
+    async fn process_discovered_groups(
+        &self,
+        client: &Client,
+        context: &str,
+        groups: &[(String, String)],
+        registry: &mut ResourceRegistry,
+    ) -> Result<usize> {
+        let mut discovered = super::discovery::discover_groups(client, groups).await?;
+
+        // Fetch CRD schemas for newly discovered resources
+        for resources in discovered.values_mut() {
+            if let Err(e) = super::discovery::fetch_crd_schemas(client, resources).await {
+                warn!(context = %context, error = %e, "Failed to fetch some CRD schemas");
+            }
+        }
+
+        // Save and add discovered groups
+        let mut count = 0;
+        for ((group, version), resources) in &discovered {
+            // Convert to cached format
+            let cached_resources: Vec<CachedResourceInfo> =
+                resources.iter().map(CachedResourceInfo::from).collect();
+
+            // Save to cache
+            if let Err(e) = self
+                .resource_cache
+                .save_group(group, version, &cached_resources)
+            {
+                warn!(
+                    context = %context,
+                    group = %group,
+                    error = %e,
+                    "Failed to cache API group"
+                );
+            }
+
+            // Add to registry
+            for info in resources {
+                registry.add(info.clone());
+                count += 1;
+            }
+        }
+
+        Ok(count)
     }
 
     /// Get the resource registry for the current context

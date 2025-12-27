@@ -7,7 +7,11 @@
 //! the Kubernetes discovery API.
 
 use anyhow::Result;
+use k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::{
+    CustomResourceDefinition, JSONSchemaProps,
+};
 use kube::Client;
+use kube::api::Api;
 use kube::discovery::{ApiCapabilities, ApiResource, Scope};
 use std::collections::HashMap;
 
@@ -70,6 +74,20 @@ impl ColumnDef {
     }
 }
 
+/// Result of CRD schema detection
+///
+/// Distinguishes between successful schema extraction, legitimate absence of schema,
+/// and transient errors that shouldn't trigger silent fallback.
+#[derive(Debug, Clone)]
+pub enum SchemaResult {
+    /// Successfully determined schema fields from CRD OpenAPI definition
+    Fields(Vec<ColumnDef>),
+    /// CRD exists but has no schema defined (legitimate - use fallback)
+    NoSchema,
+    /// Failed to fetch CRD - don't silently fall back, report the error
+    FetchError(String),
+}
+
 /// Information about a discovered Kubernetes resource
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
@@ -88,6 +106,8 @@ pub struct ResourceInfo {
     pub group: String,
     /// API version
     pub version: String,
+    /// Custom fields extracted from CRD OpenAPI schema (None = use default/core mapping)
+    pub custom_fields: Option<Vec<ColumnDef>>,
 }
 
 impl ResourceInfo {
@@ -203,6 +223,193 @@ pub fn is_core_api_group(group: &str) -> bool {
     matches!(group, "apps" | "batch" | "policy" | "autoscaling")
 }
 
+/// Map OpenAPI schema type to column data type
+fn openapi_type_to_column_type(schema: &JSONSchemaProps) -> ColumnDataType {
+    // Check format first for more specific types
+    if let Some(format) = &schema.format {
+        match format.as_str() {
+            "date-time" => return ColumnDataType::Timestamp,
+            "int64" | "int32" => return ColumnDataType::Integer,
+            _ => {}
+        }
+    }
+
+    // Fall back to type
+    if let Some(type_str) = &schema.type_
+        && type_str.as_str() == "integer"
+    {
+        return ColumnDataType::Integer;
+    }
+
+    // Default to text (handles strings, objects, arrays as JSON)
+    ColumnDataType::Text
+}
+
+/// Extract column definitions from a CRD's OpenAPI v3 schema
+fn extract_schema_fields(crd: &CustomResourceDefinition) -> Option<Vec<ColumnDef>> {
+    // Find the stored/served version with a schema
+    let version = crd.spec.versions.iter().find(|v| v.served && v.storage)?;
+
+    let schema = version.schema.as_ref()?.open_api_v3_schema.as_ref()?;
+    let properties = schema.properties.as_ref()?;
+
+    let mut fields = Vec::new();
+
+    for (name, prop) in properties {
+        // Skip standard K8s fields that we handle separately
+        if matches!(name.as_str(), "metadata" | "apiVersion" | "kind") {
+            continue;
+        }
+
+        let col_type = openapi_type_to_column_type(prop);
+
+        // Convert camelCase to snake_case for SQL column names
+        let col_name = camel_to_snake(name);
+
+        fields.push(ColumnDef {
+            name: col_name,
+            data_type: col_type,
+            json_path: Some(name.clone()),
+        });
+    }
+
+    if fields.is_empty() {
+        None
+    } else {
+        Some(fields)
+    }
+}
+
+/// Convert camelCase to snake_case
+fn camel_to_snake(s: &str) -> String {
+    let mut result = String::with_capacity(s.len() + 4);
+    for (i, c) in s.chars().enumerate() {
+        if c.is_uppercase() {
+            if i > 0 {
+                result.push('_');
+            }
+            result.push(c.to_lowercase().next().unwrap());
+        } else {
+            result.push(c);
+        }
+    }
+    result
+}
+
+/// Fetch CRD schema from the CustomResourceDefinition object
+///
+/// Returns:
+/// - `SchemaResult::Fields` if schema was successfully extracted
+/// - `SchemaResult::NoSchema` if CRD exists but has no schema (use fallback)
+/// - `SchemaResult::FetchError` on transient errors (don't silently fall back)
+pub async fn get_crd_schema(client: &Client, group: &str, kind: &str) -> SchemaResult {
+    // CRD name is plural.group (e.g., "certificates.cert-manager.io")
+    // But we receive the group and kind, so we need to construct the CRD name
+    // The CRD name format is: <plural>.<group>
+    // We'll try to fetch by listing CRDs and matching group + kind
+
+    let api: Api<CustomResourceDefinition> = Api::all(client.clone());
+
+    // List CRDs and find matching one by group and kind
+    let crd_list = match api.list(&Default::default()).await {
+        Ok(list) => list,
+        Err(e) => {
+            return SchemaResult::FetchError(format!(
+                "Failed to list CRDs while looking for {}.{}: {}",
+                kind, group, e
+            ));
+        }
+    };
+
+    // Find the CRD that matches our group and kind
+    let crd = crd_list
+        .items
+        .into_iter()
+        .find(|crd| crd.spec.group == group && crd.spec.names.kind.eq_ignore_ascii_case(kind));
+
+    match crd {
+        Some(crd) => {
+            if let Some(fields) = extract_schema_fields(&crd) {
+                SchemaResult::Fields(fields)
+            } else {
+                // CRD exists but has no OpenAPI schema defined
+                SchemaResult::NoSchema
+            }
+        }
+        None => {
+            // Not a CRD (or CRD not found) - use fallback
+            SchemaResult::NoSchema
+        }
+    }
+}
+
+/// Fetch CRD schemas for all non-core resources in parallel
+///
+/// This function updates the `custom_fields` of each ResourceInfo with the
+/// schema extracted from the CRD's OpenAPI definition.
+pub async fn fetch_crd_schemas(client: &Client, resources: &mut [ResourceInfo]) -> Result<()> {
+    use futures::future::join_all;
+
+    // Filter to non-core resources that might be CRDs
+    let crd_resources: Vec<_> = resources
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| !r.is_core && get_core_resource_fields(&r.table_name).is_none())
+        .map(|(i, r)| (i, r.group.clone(), r.api_resource.kind.clone()))
+        .collect();
+
+    if crd_resources.is_empty() {
+        return Ok(());
+    }
+
+    tracing::debug!(
+        "Fetching schemas for {} potential CRDs",
+        crd_resources.len()
+    );
+
+    // Fetch all CRD schemas in parallel
+    let futures: Vec<_> = crd_resources
+        .iter()
+        .map(|(_, group, kind)| {
+            let client = client.clone();
+            let group = group.clone();
+            let kind = kind.clone();
+            async move { get_crd_schema(&client, &group, &kind).await }
+        })
+        .collect();
+
+    let results = join_all(futures).await;
+
+    // Update resources with fetched schemas
+    for ((idx, group, kind), result) in crd_resources.iter().zip(results) {
+        match result {
+            SchemaResult::Fields(fields) => {
+                tracing::debug!(
+                    "CRD {}.{}: extracted {} fields from schema",
+                    kind,
+                    group,
+                    fields.len()
+                );
+                resources[*idx].custom_fields = Some(fields);
+            }
+            SchemaResult::NoSchema => {
+                tracing::debug!(
+                    "CRD {}.{}: no schema, using spec/status fallback",
+                    kind,
+                    group
+                );
+                // Leave custom_fields as None - generate_schema will use fallback
+            }
+            SchemaResult::FetchError(e) => {
+                tracing::warn!("CRD {}.{}: {}", kind, group, e);
+                // Leave custom_fields as None - use fallback but log the warning
+            }
+        }
+    }
+
+    Ok(())
+}
+
 /// Build a registry with just core resources using k8s-openapi types (no discovery, instant startup)
 ///
 /// This uses compile-time type information from k8s-openapi, so it automatically
@@ -257,6 +464,7 @@ pub fn build_core_registry() -> ResourceRegistry {
                 is_core: true,
                 group: <$type>::group(&()).to_string(),
                 version: <$type>::version(&()).to_string(),
+                custom_fields: None, // Core resources use get_core_resource_fields()
             };
             registry.add(info);
         }};
@@ -438,6 +646,7 @@ pub async fn discover_groups(
                 is_core,
                 group: ar.group.clone(),
                 version: ar.version.clone(),
+                custom_fields: None, // Will be populated by fetch_crd_schemas()
             };
 
             resources.push(info);
@@ -460,11 +669,26 @@ fn get_core_resource_fields(table_name: &str) -> Option<Vec<ColumnDef>> {
     match table_name {
         // ==================== Standard spec/status pattern ====================
         // Most workload and configuration resources follow this pattern
-        "pods" | "deployments" | "statefulsets" | "daemonsets" | "replicasets"
-        | "jobs" | "cronjobs" | "services" | "ingresses" | "networkpolicies"
-        | "persistentvolumeclaims" | "persistentvolumes" | "storageclasses"
-        | "horizontalpodautoscalers" | "poddisruptionbudgets" | "namespaces"
-        | "nodes" | "resourcequotas" | "limitranges" | "leases" => Some(vec![
+        "pods"
+        | "deployments"
+        | "statefulsets"
+        | "daemonsets"
+        | "replicasets"
+        | "jobs"
+        | "cronjobs"
+        | "services"
+        | "ingresses"
+        | "networkpolicies"
+        | "persistentvolumeclaims"
+        | "persistentvolumes"
+        | "storageclasses"
+        | "horizontalpodautoscalers"
+        | "poddisruptionbudgets"
+        | "namespaces"
+        | "nodes"
+        | "resourcequotas"
+        | "limitranges"
+        | "leases" => Some(vec![
             ColumnDef::text("spec", "spec"),
             ColumnDef::text("status", "status"),
         ]),
@@ -487,13 +711,14 @@ fn get_core_resource_fields(table_name: &str) -> Option<Vec<ColumnDef>> {
         "serviceaccounts" => Some(vec![
             ColumnDef::text("secrets", "secrets"),
             ColumnDef::text("image_pull_secrets", "imagePullSecrets"),
-            ColumnDef::text("automount_service_account_token", "automountServiceAccountToken"),
+            ColumnDef::text(
+                "automount_service_account_token",
+                "automountServiceAccountToken",
+            ),
         ]),
 
         // ==================== Endpoints: subsets pattern ====================
-        "endpoints" => Some(vec![
-            ColumnDef::text("subsets", "subsets"),
-        ]),
+        "endpoints" => Some(vec![ColumnDef::text("subsets", "subsets")]),
 
         // ==================== ConfigMap/Secret: data pattern ====================
         "configmaps" => Some(vec![
@@ -541,7 +766,7 @@ fn get_core_resource_fields(table_name: &str) -> Option<Vec<ColumnDef>> {
 ///
 /// Schema generation follows this priority:
 /// 1. Core resource explicit mapping (get_core_resource_fields)
-/// 2. CRD schema from OpenAPI definition (future: get_crd_schema)
+/// 2. CRD schema from OpenAPI definition (custom_fields from fetch_crd_schemas)
 /// 3. Fallback to spec/status pattern
 pub fn generate_schema(info: &ResourceInfo) -> Vec<ColumnDef> {
     let mut columns = vec![
@@ -564,13 +789,18 @@ pub fn generate_schema(info: &ResourceInfo) -> Vec<ColumnDef> {
         ColumnDef::text("finalizers", "metadata.finalizers"),
     ];
 
-    // Add resource-specific columns
+    // Add resource-specific columns with priority:
+    // 1. Core resource explicit mapping
+    // 2. CRD schema from OpenAPI definition (cached in custom_fields)
+    // 3. Fallback to spec/status
     if let Some(fields) = get_core_resource_fields(&info.table_name) {
         // Core resource with known field mapping
         columns.extend(fields);
+    } else if let Some(fields) = &info.custom_fields {
+        // CRD with schema extracted from OpenAPI definition
+        columns.extend(fields.clone());
     } else {
-        // Unknown resource (likely CRD) - fall back to spec/status
-        // TODO: Implement CRD schema detection from OpenAPI definition
+        // Unknown resource or CRD without schema - fall back to spec/status
         columns.push(ColumnDef::text("spec", "spec"));
         columns.push(ColumnDef::text("status", "status"));
     }
