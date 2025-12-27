@@ -74,10 +74,20 @@ kubectl --context "k3d-$CLUSTER2" apply -f "$SCRIPT_DIR/fixtures/test-resources.
 echo "Creating cluster2-only namespace..."
 kubectl --context "k3d-$CLUSTER2" create namespace cluster2-only || true
 
-# Wait for deployments to be ready
+# Wait for deployments to be ready (5 min timeout for image pulls in CI)
 echo "Waiting for deployments to be ready..."
-kubectl --context "k3d-$CLUSTER1" wait --for=condition=available deployment/test-app -n default --timeout=120s
-kubectl --context "k3d-$CLUSTER2" wait --for=condition=available deployment/test-app -n default --timeout=120s
+kubectl --context "k3d-$CLUSTER1" wait --for=condition=available deployment/test-app -n default --timeout=300s || {
+    echo "Cluster 1 deployment failed. Pod status:"
+    kubectl --context "k3d-$CLUSTER1" get pods -n default
+    kubectl --context "k3d-$CLUSTER1" describe pods -n default -l app=nginx
+    exit 1
+}
+kubectl --context "k3d-$CLUSTER2" wait --for=condition=available deployment/test-app -n default --timeout=300s || {
+    echo "Cluster 2 deployment failed. Pod status:"
+    kubectl --context "k3d-$CLUSTER2" get pods -n default
+    kubectl --context "k3d-$CLUSTER2" describe pods -n default -l app=nginx
+    exit 1
+}
 
 echo ""
 echo "=== Test clusters ready ==="
