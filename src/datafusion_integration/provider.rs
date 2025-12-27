@@ -111,6 +111,9 @@ impl K8sTableProvider {
     /// Recursively extract _cluster filter from a single expression
     /// Handles AND expressions by checking both sides
     fn extract_cluster_filter_from_expr(&self, expr: &Expr) -> Option<ClusterFilter> {
+        // Debug: log the expression type being checked
+        debug!(expr = ?expr, "Checking expression for _cluster filter");
+
         match expr {
             // Handle AND expressions - check both sides
             Expr::BinaryExpr(binary) if binary.op == Operator::And => {
