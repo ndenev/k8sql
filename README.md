@@ -6,7 +6,7 @@ Query Kubernetes clusters using SQL. k8sql exposes Kubernetes resources as datab
 
 - **SQL queries on Kubernetes resources** - SELECT, WHERE, ORDER BY, LIMIT
 - **Multi-cluster support** - Query across clusters using `_cluster` column
-- **Query optimizer** - Pushes filters to K8s API (namespaces, labels, field selectors)
+- **Query optimizer** - Pushes filters to K8s API (namespaces, labels)
 - **Multiple interfaces** - Interactive REPL, batch mode, PostgreSQL wire protocol
 - **Rich output formats** - Table, JSON, CSV, YAML
 
@@ -112,39 +112,33 @@ The function syntax supports chaining multiple keys and array indices in a singl
 
 ### Labels and Annotations
 
-Labels and annotations are stored as JSON strings, accessible via `json_get_str()` or convenient dot notation:
+Labels and annotations are stored as JSON strings. Access them using the `->>` operator or `json_get_str()` function:
 
 ```sql
 -- Access a specific label
-SELECT name, json_get_str(labels, 'app') as app FROM pods
+SELECT name, labels->>'app' as app FROM pods
 
 -- Filter by label (pushed to K8s API as label selector)
-SELECT * FROM pods WHERE labels.app = 'nginx'
+SELECT * FROM pods WHERE labels->>'app' = 'nginx'
 
 -- Multiple label conditions (combined into single API call)
-SELECT * FROM pods WHERE labels.app = 'nginx' AND labels.env = 'prod'
+SELECT * FROM pods WHERE labels->>'app' = 'nginx' AND labels->>'env' = 'prod'
 
 -- Access annotations
-SELECT name, json_get_str(annotations, 'kubectl.kubernetes.io/last-applied-configuration') as config
+SELECT name, annotations->>'kubectl.kubernetes.io/last-applied-configuration' as config
 FROM deployments
 
--- Labels with special characters (dots, slashes)
-SELECT * FROM pods WHERE labels.app.kubernetes.io/name = 'cert-manager'
-
--- Pattern matching with LIKE (case-sensitive)
-SELECT * FROM pods WHERE labels.app LIKE 'nginx%'
+-- Pattern matching with LIKE (case-sensitive, evaluated client-side)
+SELECT * FROM pods WHERE labels->>'app' LIKE 'nginx%'
 
 -- Case-insensitive pattern matching with ILIKE
-SELECT * FROM pods WHERE labels.app ILIKE 'Nginx%'
-
--- Exclude patterns with NOT LIKE
-SELECT * FROM pods WHERE labels.app NOT LIKE 'test%'
+SELECT * FROM pods WHERE labels->>'app' ILIKE 'Nginx%'
 ```
 
-The `labels.key = 'value'` syntax is automatically converted to `json_get_str(labels, 'key')` and pushed to the Kubernetes API as a label selector for efficient server-side filtering. LIKE patterns are evaluated client-side by DataFusion.
+Label equality filters (`labels->>'key' = 'value'`) are pushed to the Kubernetes API as label selectors for efficient server-side filtering. LIKE patterns are evaluated client-side by DataFusion.
 
 **Note:** Label matching follows SQL semantics, not Kubernetes selector semantics. This means:
-- `labels.app != 'nginx'` excludes rows where `labels.app` is NULL (missing label)
+- `labels->>'app' != 'nginx'` excludes rows where the label is NULL (missing)
 - In Kubernetes selectors, `app!=nginx` would include resources without the `app` label
 
 ### Working with Arrays (UNNEST)
@@ -504,9 +498,8 @@ k8sql optimizes queries by pushing predicates to the Kubernetes API when possibl
 | Predicate | Optimization |
 |-----------|--------------|
 | `namespace = 'x'` | Uses `Api::namespaced()` - only fetches from that namespace |
-| `labels.app = 'nginx'` | K8s label selector - server-side filtering |
-| `json_get_str(labels, 'app') = 'nginx'` | Same as above (explicit JSON access) |
-| `labels.app = 'x' AND labels.env = 'y'` | Combined label selector: `app=x,env=y` |
+| `labels->>'app' = 'nginx'` | K8s label selector - server-side filtering |
+| `labels->>'app' = 'x' AND labels->>'env' = 'y'` | Combined label selector: `app=x,env=y` |
 | `_cluster = 'prod'` | Only queries that cluster |
 | `_cluster IN ('a', 'b')` | Only queries specified clusters |
 | `_cluster NOT IN ('x')` | Queries all except specified clusters |
@@ -520,7 +513,7 @@ k8sql optimizes queries by pushing predicates to the Kubernetes API when possibl
 
 Use `-v` flag to see what filters are being pushed down:
 ```bash
-k8sql -v -q "SELECT name FROM pods WHERE labels.app = 'nginx' AND namespace = 'default'"
+k8sql -v -q "SELECT name FROM pods WHERE labels->>'app' = 'nginx' AND namespace = 'default'"
 # Shows: labels=Some("app=nginx"), namespace=Some("default")
 ```
 
