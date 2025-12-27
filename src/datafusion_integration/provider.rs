@@ -101,7 +101,10 @@ impl K8sTableProvider {
     /// Supports: _cluster = 'x', _cluster = '*', _cluster IN (...), _cluster NOT IN (...)
     fn extract_cluster_filter(&self, filters: &[Expr]) -> ClusterFilter {
         // DEBUG: Print filter expressions directly to stderr for CI visibility
-        eprintln!("[DEBUG] Extracting cluster filter from {} expressions", filters.len());
+        eprintln!(
+            "[DEBUG] Extracting cluster filter from {} expressions",
+            filters.len()
+        );
         for (i, filter) in filters.iter().enumerate() {
             eprintln!("[DEBUG] Filter {}: {:?}", i, filter);
         }
@@ -126,8 +129,12 @@ impl K8sTableProvider {
         if let Expr::InList(in_list) = expr
             && let Expr::Column(col) = in_list.expr.as_ref()
         {
-            eprintln!("[DEBUG] Found InList for column '{}', list_len={}, negated={}",
-                col.name, in_list.list.len(), in_list.negated);
+            eprintln!(
+                "[DEBUG] Found InList for column '{}', list_len={}, negated={}",
+                col.name,
+                in_list.list.len(),
+                in_list.negated
+            );
         }
 
         match expr {
