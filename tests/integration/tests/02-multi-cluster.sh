@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+# Multi-cluster query tests for k8sql
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/../lib.sh"
+
+echo "=== Multi-Cluster Tests ==="
+
+# Query from cluster 1 explicitly
+assert_success "Query cluster 1 explicitly" "k3d-k8sql-test-1" \
+    "SELECT name FROM namespaces WHERE _cluster = 'k3d-k8sql-test-1'"
+
+# Query from cluster 2
+assert_success "Query cluster 2" "k3d-k8sql-test-2" \
+    "SELECT name FROM namespaces WHERE _cluster = 'k3d-k8sql-test-2'"
+
+# Cluster 2 has the extra namespace
+assert_contains "Cluster 2 has cluster2-only namespace" "k3d-k8sql-test-2" \
+    "SELECT name FROM namespaces" "cluster2-only"
+
+# Query all clusters with wildcard (from cluster 1 context)
+assert_success "Wildcard cluster query" "k3d-k8sql-test-1" \
+    "SELECT DISTINCT _cluster FROM namespaces WHERE _cluster = '*'"
+
+# Wildcard should return results from both clusters
+assert_contains "Wildcard returns cluster 1" "k3d-k8sql-test-1" \
+    "SELECT DISTINCT _cluster FROM namespaces WHERE _cluster = '*'" "k3d-k8sql-test-1"
+
+assert_contains "Wildcard returns cluster 2" "k3d-k8sql-test-1" \
+    "SELECT DISTINCT _cluster FROM namespaces WHERE _cluster = '*'" "k3d-k8sql-test-2"
+
+# Cluster IN list - query specific clusters
+assert_success "Cluster IN list" "k3d-k8sql-test-1" \
+    "SELECT name, _cluster FROM pods WHERE _cluster IN ('k3d-k8sql-test-1', 'k3d-k8sql-test-2') AND namespace = 'default'"
+
+# Results from IN should contain both clusters
+assert_contains "IN list returns cluster 1 pods" "k3d-k8sql-test-1" \
+    "SELECT name, _cluster FROM pods WHERE _cluster IN ('k3d-k8sql-test-1', 'k3d-k8sql-test-2') AND namespace = 'default'" \
+    "k3d-k8sql-test-1"
+
+assert_contains "IN list returns cluster 2 pods" "k3d-k8sql-test-1" \
+    "SELECT name, _cluster FROM pods WHERE _cluster IN ('k3d-k8sql-test-1', 'k3d-k8sql-test-2') AND namespace = 'default'" \
+    "k3d-k8sql-test-2"
+
+# _cluster column is present in results
+assert_contains "_cluster column in output" "k3d-k8sql-test-1" \
+    "SELECT _cluster, name FROM pods WHERE namespace = 'default' LIMIT 1" "k3d-k8sql-test-1"
+
+print_summary

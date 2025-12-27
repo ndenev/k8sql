@@ -1,0 +1,138 @@
+---
+# Test namespace with labels
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: test-ns
+  labels:
+    env: test
+    team: k8sql
+---
+# Test deployment with labels
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: test-app
+  namespace: default
+  labels:
+    app: nginx
+    env: test
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: nginx
+  template:
+    metadata:
+      labels:
+        app: nginx
+    spec:
+      containers:
+        - name: nginx
+          image: nginx:alpine
+          resources:
+            limits:
+              memory: "64Mi"
+              cpu: "100m"
+---
+# ConfigMap for testing data field access
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: test-config
+  namespace: default
+  labels:
+    app: test
+data:
+  key1: value1
+  key2: value2
+  config.yaml: |
+    setting: enabled
+    level: info
+---
+# Secret for testing (optional, secrets might be redacted)
+apiVersion: v1
+kind: Secret
+metadata:
+  name: test-secret
+  namespace: default
+type: Opaque
+stringData:
+  password: secret123
+  api-key: test-api-key
+---
+# Service for testing
+apiVersion: v1
+kind: Service
+metadata:
+  name: test-service
+  namespace: default
+  labels:
+    app: nginx
+spec:
+  selector:
+    app: nginx
+  ports:
+    - port: 80
+      targetPort: 80
+---
+# Role for testing RBAC schema
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: test-role
+  namespace: default
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get"]
+---
+# RoleBinding for testing subjects field
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: test-rolebinding
+  namespace: default
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: test-role
+subjects:
+  - kind: ServiceAccount
+    name: default
+    namespace: default
+---
+# ServiceAccount
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: test-sa
+  namespace: default
+---
+# Test CRD instance
+apiVersion: k8sql.io/v1
+kind: TestResource
+metadata:
+  name: test-cr
+  namespace: default
+  labels:
+    app: test-crd
+spec:
+  message: "Hello from CRD"
+  count: 42
+---
+# Another CRD instance in test-ns
+apiVersion: k8sql.io/v1
+kind: TestResource
+metadata:
+  name: test-cr-2
+  namespace: test-ns
+  labels:
+    app: test-crd
+    env: staging
+spec:
+  message: "Hello from test-ns"
+  count: 100
