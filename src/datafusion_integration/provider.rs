@@ -100,27 +100,19 @@ impl K8sTableProvider {
     /// Extract _cluster filter from DataFusion expressions
     /// Supports: _cluster = 'x', _cluster = '*', _cluster IN (...), _cluster NOT IN (...)
     fn extract_cluster_filter(&self, filters: &[Expr]) -> ClusterFilter {
-        // Log all filter expressions for debugging
-        info!(
-            filter_count = filters.len(),
-            "Extracting cluster filter from expressions"
-        );
+        // DEBUG: Print filter expressions directly to stderr for CI visibility
+        eprintln!("[DEBUG] Extracting cluster filter from {} expressions", filters.len());
         for (i, filter) in filters.iter().enumerate() {
-            info!(
-                index = i,
-                expr_type = %format!("{:?}", std::mem::discriminant(filter)),
-                expr = %filter,
-                "Filter expression"
-            );
+            eprintln!("[DEBUG] Filter {}: {:?}", i, filter);
         }
 
         for filter in filters {
             if let Some(result) = self.extract_cluster_filter_from_expr(filter) {
-                info!(cluster_filter = ?result, "Extracted cluster filter");
+                eprintln!("[DEBUG] Extracted cluster filter: {:?}", result);
                 return result;
             }
         }
-        info!("No cluster filter found, using default");
+        eprintln!("[DEBUG] No cluster filter found, using default");
         ClusterFilter::Default
     }
 
@@ -130,16 +122,12 @@ impl K8sTableProvider {
         // Debug: log the expression type being checked
         debug!(expr = ?expr, "Checking expression for _cluster filter");
 
-        // Log InList expressions at info level for debugging
+        // DEBUG: Log InList expressions to stderr
         if let Expr::InList(in_list) = expr
             && let Expr::Column(col) = in_list.expr.as_ref()
         {
-            info!(
-                column_name = %col.name,
-                list_len = in_list.list.len(),
-                negated = in_list.negated,
-                "Found InList expression for column"
-            );
+            eprintln!("[DEBUG] Found InList for column '{}', list_len={}, negated={}",
+                col.name, in_list.list.len(), in_list.negated);
         }
 
         match expr {
