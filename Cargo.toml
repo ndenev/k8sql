@@ -12,7 +12,15 @@ categories = ["command-line-utilities", "database"]
 
 [dependencies]
 # SQL query engine (Apache Arrow DataFusion)
-datafusion = "51"
+datafusion = { version = "51", default-features = false, features = [
+    "nested_expressions",
+    "datetime_expressions",
+    "regex_expressions",
+    "string_expressions",
+    "unicode_expressions",
+    "sql",
+    "recursive_protection",
+] }
 datafusion-functions-json = "0.51"
 
 # Kubernetes client
@@ -67,5 +75,11 @@ regex = "1"
 
 [dev-dependencies]
 tempfile = "3"
+
+[profile.release]
+strip = true
+lto = "thin"
+codegen-units = 1
+opt-level = "z"  # Optimize for size
 
 
