@@ -85,12 +85,20 @@ jobs:
           name: k8sql-linux
           path: ./bin
 
-      - name: Make binary executable
-        run: chmod +x ./bin/k8sql
+      - name: Verify and prepare binary
+        run: |
+          echo "Contents of ./bin:"
+          ls -la ./bin/
+          chmod +x ./bin/k8sql
+          echo "Binary version check:"
+          ./bin/k8sql --help | head -5 || true
 
       - name: Install k3d
         run: |
           curl -s https://raw.githubusercontent.com/k3d-io/k3d/main/install.sh | bash
+
+      - name: Install jq
+        run: sudo apt-get update && sudo apt-get install -y jq
 
       - name: Install kubectl
         run: |

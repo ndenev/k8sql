@@ -3,10 +3,23 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-cd "$SCRIPT_DIR"
 
-# Set K8SQL binary path
-export K8SQL="${K8SQL:-../../bin/k8sql}"
+# Set K8SQL binary path - convert to absolute path before changing directories
+if [[ -n "${K8SQL:-}" ]]; then
+    # If K8SQL is set, resolve to absolute path from current directory
+    if [[ "$K8SQL" = /* ]]; then
+        # Already absolute
+        export K8SQL
+    else
+        # Convert relative to absolute
+        export K8SQL="$(cd "$(dirname "$K8SQL")" && pwd)/$(basename "$K8SQL")"
+    fi
+else
+    # Default path relative to script directory
+    export K8SQL="$SCRIPT_DIR/../../bin/k8sql"
+fi
+
+cd "$SCRIPT_DIR"
 
 # Check that k8sql binary exists
 if [[ ! -x "$K8SQL" ]]; then
