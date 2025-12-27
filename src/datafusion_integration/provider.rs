@@ -17,7 +17,7 @@ use datafusion::logical_expr::{Operator, TableProviderFilterPushDown};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::Expr;
 use futures::stream::{self, StreamExt};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 /// Maximum number of clusters to query concurrently
 /// Higher values improve performance but increase local resource usage (connections, memory)
@@ -384,7 +384,7 @@ impl TableProvider for K8sTableProvider {
 
                 async move {
                     let start = Instant::now();
-                    let resources = pool
+                    let resources = match pool
                         .fetch_resources(
                             &table_name,
                             namespace.as_deref(),
@@ -392,7 +392,18 @@ impl TableProvider for K8sTableProvider {
                             &api_filters,
                         )
                         .await
-                        .unwrap_or_default();
+                    {
+                        Ok(r) => r,
+                        Err(e) => {
+                            warn!(
+                                cluster = %cluster,
+                                table = %table_name,
+                                error = %e,
+                                "Failed to fetch resources from cluster"
+                            );
+                            Vec::new()
+                        }
+                    };
                     let elapsed = start.elapsed();
                     let row_count = resources.len();
                     debug!(

@@ -80,10 +80,13 @@ impl ColumnDef {
 /// and transient errors that shouldn't trigger silent fallback.
 #[derive(Debug, Clone)]
 pub enum SchemaResult {
-    /// Successfully determined schema fields from CRD OpenAPI definition
-    Fields(Vec<ColumnDef>),
-    /// CRD exists but has no schema defined (legitimate - use fallback)
-    NoSchema,
+    /// Successfully extracted CRD information
+    Found {
+        /// Schema fields from CRD OpenAPI definition (None if no schema defined)
+        fields: Option<Vec<ColumnDef>>,
+        /// Short names from CRD spec.names.shortNames
+        short_names: Vec<String>,
+    },
     /// Failed to fetch CRD - don't silently fall back, report the error
     FetchError(String),
 }
@@ -329,16 +332,31 @@ pub async fn get_crd_schema(client: &Client, group: &str, kind: &str) -> SchemaR
 
     match crd {
         Some(crd) => {
-            if let Some(fields) = extract_schema_fields(&crd) {
-                SchemaResult::Fields(fields)
-            } else {
-                // CRD exists but has no OpenAPI schema defined
-                SchemaResult::NoSchema
+            // Extract short names from CRD spec.names.shortNames
+            let short_names = crd
+                .spec
+                .names
+                .short_names
+                .clone()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|s| s.to_lowercase())
+                .collect();
+
+            // Extract schema fields if available
+            let fields = extract_schema_fields(&crd);
+
+            SchemaResult::Found {
+                fields,
+                short_names,
             }
         }
         None => {
-            // Not a CRD (or CRD not found) - use fallback
-            SchemaResult::NoSchema
+            // Not a CRD (or CRD not found) - return empty short names, no fields
+            SchemaResult::Found {
+                fields: None,
+                short_names: Vec::new(),
+            }
         }
     }
 }
@@ -380,25 +398,44 @@ pub async fn fetch_crd_schemas(client: &Client, resources: &mut [ResourceInfo]) 
 
     let results = join_all(futures).await;
 
-    // Update resources with fetched schemas
+    // Update resources with fetched schemas and short names
     for ((idx, group, kind), result) in crd_resources.iter().zip(results) {
         match result {
-            SchemaResult::Fields(fields) => {
-                tracing::debug!(
-                    "CRD {}.{}: extracted {} fields from schema",
-                    kind,
-                    group,
-                    fields.len()
-                );
-                resources[*idx].custom_fields = Some(fields);
-            }
-            SchemaResult::NoSchema => {
-                tracing::debug!(
-                    "CRD {}.{}: no schema, using spec/status fallback",
-                    kind,
-                    group
-                );
-                // Leave custom_fields as None - generate_schema will use fallback
+            SchemaResult::Found {
+                fields,
+                short_names,
+            } => {
+                // Add short names to aliases
+                if !short_names.is_empty() {
+                    tracing::debug!(
+                        "CRD {}.{}: adding short names {:?}",
+                        kind,
+                        group,
+                        short_names
+                    );
+                    resources[*idx].aliases.extend(short_names);
+                }
+
+                // Set custom fields if schema was extracted
+                match fields {
+                    Some(f) => {
+                        tracing::debug!(
+                            "CRD {}.{}: extracted {} fields from schema",
+                            kind,
+                            group,
+                            f.len()
+                        );
+                        resources[*idx].custom_fields = Some(f);
+                    }
+                    None => {
+                        tracing::debug!(
+                            "CRD {}.{}: no schema, using spec/status fallback",
+                            kind,
+                            group
+                        );
+                        // Leave custom_fields as None - generate_schema will use fallback
+                    }
+                }
             }
             SchemaResult::FetchError(e) => {
                 tracing::warn!("CRD {}.{}: {}", kind, group, e);
