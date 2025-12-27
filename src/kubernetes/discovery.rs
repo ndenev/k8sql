@@ -449,8 +449,100 @@ pub async fn discover_groups(
     Ok(discovered)
 }
 
-/// Generate a PostgreSQL-style schema for a discovered resource
-/// All resources get the same schema: metadata columns + spec/status as JSONB
+/// Get resource-specific columns for core Kubernetes resources.
+///
+/// This function provides explicit field mappings for all core K8s resources,
+/// based on the actual structure defined in k8s-openapi. Resources that don't
+/// follow the standard spec/status pattern get their actual top-level fields.
+///
+/// Returns None for unknown resources (CRDs), which should use schema detection.
+fn get_core_resource_fields(table_name: &str) -> Option<Vec<ColumnDef>> {
+    match table_name {
+        // ==================== Standard spec/status pattern ====================
+        // Most workload and configuration resources follow this pattern
+        "pods" | "deployments" | "statefulsets" | "daemonsets" | "replicasets"
+        | "jobs" | "cronjobs" | "services" | "ingresses" | "networkpolicies"
+        | "persistentvolumeclaims" | "persistentvolumes" | "storageclasses"
+        | "horizontalpodautoscalers" | "poddisruptionbudgets" | "namespaces"
+        | "nodes" | "resourcequotas" | "limitranges" | "leases" => Some(vec![
+            ColumnDef::text("spec", "spec"),
+            ColumnDef::text("status", "status"),
+        ]),
+
+        // ==================== RBAC: rules pattern ====================
+        // Role and ClusterRole have rules array, not spec/status
+        "roles" | "clusterroles" => Some(vec![
+            ColumnDef::text("rules", "rules"),
+            ColumnDef::text("aggregation_rule", "aggregationRule"),
+        ]),
+
+        // ==================== RBAC: binding pattern ====================
+        // RoleBinding and ClusterRoleBinding reference a role and subjects
+        "rolebindings" | "clusterrolebindings" => Some(vec![
+            ColumnDef::text("role_ref", "roleRef"),
+            ColumnDef::text("subjects", "subjects"),
+        ]),
+
+        // ==================== ServiceAccount: flat fields ====================
+        "serviceaccounts" => Some(vec![
+            ColumnDef::text("secrets", "secrets"),
+            ColumnDef::text("image_pull_secrets", "imagePullSecrets"),
+            ColumnDef::text("automount_service_account_token", "automountServiceAccountToken"),
+        ]),
+
+        // ==================== Endpoints: subsets pattern ====================
+        "endpoints" => Some(vec![
+            ColumnDef::text("subsets", "subsets"),
+        ]),
+
+        // ==================== ConfigMap/Secret: data pattern ====================
+        "configmaps" => Some(vec![
+            ColumnDef::text("data", "data"),
+            ColumnDef::text("binary_data", "binaryData"),
+            ColumnDef::text("immutable", "immutable"),
+        ]),
+        "secrets" => Some(vec![
+            ColumnDef::text("type", "type"),
+            ColumnDef::text("data", "data"),
+            ColumnDef::text("string_data", "stringData"),
+            ColumnDef::text("immutable", "immutable"),
+        ]),
+
+        // ==================== Events: flat structure ====================
+        "events" => Some(vec![
+            ColumnDef::text("type", "type"),
+            ColumnDef::text("reason", "reason"),
+            ColumnDef::text("message", "message"),
+            ColumnDef::integer("count", "count"),
+            ColumnDef::timestamp("first_timestamp", "firstTimestamp"),
+            ColumnDef::timestamp("last_timestamp", "lastTimestamp"),
+            ColumnDef::text("involved_object", "involvedObject"),
+            ColumnDef::text("source", "source"),
+        ]),
+
+        // ==================== Metrics: special structure ====================
+        "podmetrics" => Some(vec![
+            ColumnDef::timestamp("timestamp", "timestamp"),
+            ColumnDef::text("window", "window"),
+            ColumnDef::text("containers", "containers"),
+        ]),
+        "nodemetrics" => Some(vec![
+            ColumnDef::timestamp("timestamp", "timestamp"),
+            ColumnDef::text("window", "window"),
+            ColumnDef::text("usage", "usage"),
+        ]),
+
+        // Unknown resource - return None to trigger CRD schema detection or fallback
+        _ => None,
+    }
+}
+
+/// Generate a PostgreSQL-style schema for a discovered resource.
+///
+/// Schema generation follows this priority:
+/// 1. Core resource explicit mapping (get_core_resource_fields)
+/// 2. CRD schema from OpenAPI definition (future: get_crd_schema)
+/// 3. Fallback to spec/status pattern
 pub fn generate_schema(info: &ResourceInfo) -> Vec<ColumnDef> {
     let mut columns = vec![
         // Virtual column for cluster/context name
@@ -472,50 +564,15 @@ pub fn generate_schema(info: &ResourceInfo) -> Vec<ColumnDef> {
         ColumnDef::text("finalizers", "metadata.finalizers"),
     ];
 
-    // Add resource-specific columns based on type
-    // ConfigMaps and Secrets use 'data' instead of spec/status
-    match info.table_name.as_str() {
-        "configmaps" => {
-            columns.push(ColumnDef::text("data", "data"));
-        }
-        "secrets" => {
-            columns.push(ColumnDef::text("type", "type"));
-            columns.push(ColumnDef::text("data", "data"));
-        }
-        "events" => {
-            // Events have a flat structure, not spec/status
-            columns.extend(vec![
-                ColumnDef::text("type", "type"),
-                ColumnDef::text("reason", "reason"),
-                ColumnDef::text("message", "message"),
-                ColumnDef::integer("count", "count"),
-                ColumnDef::timestamp("first_timestamp", "firstTimestamp"),
-                ColumnDef::timestamp("last_timestamp", "lastTimestamp"),
-                ColumnDef::text("involved_object", "involvedObject"),
-                ColumnDef::text("source", "source"),
-            ]);
-        }
-        "podmetrics" => {
-            // PodMetrics from metrics.k8s.io - has containers with CPU/memory usage
-            columns.extend(vec![
-                ColumnDef::timestamp("timestamp", "timestamp"),
-                ColumnDef::text("window", "window"),
-                ColumnDef::text("containers", "containers"),
-            ]);
-        }
-        "nodemetrics" => {
-            // NodeMetrics from metrics.k8s.io - has node-level CPU/memory usage
-            columns.extend(vec![
-                ColumnDef::timestamp("timestamp", "timestamp"),
-                ColumnDef::text("window", "window"),
-                ColumnDef::text("usage", "usage"),
-            ]);
-        }
-        _ => {
-            // Most resources have spec and status
-            columns.push(ColumnDef::text("spec", "spec"));
-            columns.push(ColumnDef::text("status", "status"));
-        }
+    // Add resource-specific columns
+    if let Some(fields) = get_core_resource_fields(&info.table_name) {
+        // Core resource with known field mapping
+        columns.extend(fields);
+    } else {
+        // Unknown resource (likely CRD) - fall back to spec/status
+        // TODO: Implement CRD schema detection from OpenAPI definition
+        columns.push(ColumnDef::text("spec", "spec"));
+        columns.push(ColumnDef::text("status", "status"));
     }
 
     columns
