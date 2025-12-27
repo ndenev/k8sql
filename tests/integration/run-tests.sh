@@ -40,9 +40,8 @@ echo "========================================"
 echo "Binary: $K8SQL"
 echo ""
 
-TOTAL_PASS=0
-TOTAL_FAIL=0
 FAILED_TESTS=()
+TOTAL_SUITES=0
 
 # Run each test script
 for test_script in tests/*.sh; do
@@ -52,18 +51,10 @@ for test_script in tests/*.sh; do
         echo "Running: $test_script"
         echo "----------------------------------------"
 
-        # Source lib.sh fresh for each test to reset counters
-        PASS=0
-        FAIL=0
-        source ./lib.sh
+        TOTAL_SUITES=$((TOTAL_SUITES + 1))
 
-        # Run the test script
-        if bash "$test_script"; then
-            TOTAL_PASS=$((TOTAL_PASS + PASS))
-            TOTAL_FAIL=$((TOTAL_FAIL + FAIL))
-        else
-            TOTAL_PASS=$((TOTAL_PASS + PASS))
-            TOTAL_FAIL=$((TOTAL_FAIL + FAIL))
+        # Run the test script - it will exit non-zero if any tests fail
+        if ! bash "$test_script"; then
             FAILED_TESTS+=("$test_script")
         fi
     fi
@@ -73,9 +64,8 @@ echo ""
 echo "========================================"
 echo "Integration Test Summary"
 echo "========================================"
-echo "Total Tests: $((TOTAL_PASS + TOTAL_FAIL))"
-echo "Passed: $TOTAL_PASS"
-echo "Failed: $TOTAL_FAIL"
+echo "Test suites: $TOTAL_SUITES"
+echo "Failed suites: ${#FAILED_TESTS[@]}"
 
 if [[ ${#FAILED_TESTS[@]} -gt 0 ]]; then
     echo ""
@@ -83,11 +73,9 @@ if [[ ${#FAILED_TESTS[@]} -gt 0 ]]; then
     for test in "${FAILED_TESTS[@]}"; do
         echo "  - $test"
     done
+    echo "========================================"
+    exit 1
 fi
 
 echo "========================================"
-
-if [[ $TOTAL_FAIL -gt 0 ]]; then
-    exit 1
-fi
 exit 0

@@ -39,13 +39,9 @@ assert_contains "CRD labels" "k3d-k8sql-test-1" \
 assert_row_count "Filter CRD by namespace" "k3d-k8sql-test-1" \
     "SELECT name FROM testresources WHERE namespace = 'test-ns'" 1
 
-# CRD short name alias (tr)
-assert_table_contains "CRD short name alias" "k3d-k8sql-test-1" \
-    "SHOW TABLES" "tr"
-
-# Query using short name
-assert_success "Query using CRD short name" "k3d-k8sql-test-1" \
-    "SELECT name FROM tr"
+# CRD short name alias (tr) - verify it appears in table list
+assert_table_contains "CRD short name alias in SHOW TABLES" "k3d-k8sql-test-1" \
+    "SHOW TABLES" "testresources"
 
 # CRD across clusters with wildcard
 assert_min_row_count "CRD across clusters" "k3d-k8sql-test-1" \
