@@ -134,29 +134,22 @@ impl K8sTableProvider {
                 }
                 None
             }
-            // Handle _cluster IN ('a', 'b', 'c')
-            Expr::InList(in_list)
-                if matches!(in_list.expr.as_ref(), Expr::Column(col) if col.name == "_cluster")
-                    && !in_list.negated =>
-            {
-                let clusters = extract_string_literals(in_list);
-                if !clusters.is_empty() {
-                    // Check if '*' is in the list - treat as All
-                    if clusters.iter().any(|c| c == "*") {
-                        return Some(ClusterFilter::All);
+            // Handle _cluster IN ('a', 'b', 'c') or _cluster NOT IN ('a', 'b')
+            Expr::InList(in_list) => {
+                if let Expr::Column(col) = in_list.expr.as_ref()
+                    && col.name == "_cluster"
+                {
+                    let clusters = extract_string_literals(in_list);
+                    if !clusters.is_empty() {
+                        if in_list.negated {
+                            return Some(ClusterFilter::Exclude(clusters));
+                        }
+                        // Check if '*' is in the list - treat as All
+                        if clusters.iter().any(|c| c == "*") {
+                            return Some(ClusterFilter::All);
+                        }
+                        return Some(ClusterFilter::Include(clusters));
                     }
-                    return Some(ClusterFilter::Include(clusters));
-                }
-                None
-            }
-            // Handle _cluster NOT IN ('a', 'b')
-            Expr::InList(in_list)
-                if matches!(in_list.expr.as_ref(), Expr::Column(col) if col.name == "_cluster")
-                    && in_list.negated =>
-            {
-                let clusters = extract_string_literals(in_list);
-                if !clusters.is_empty() {
-                    return Some(ClusterFilter::Exclude(clusters));
                 }
                 None
             }

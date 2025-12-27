@@ -38,14 +38,6 @@ assert_contains "IN list returns current cluster pods" "k3d-k8sql-test-1" \
     "k3d-k8sql-test-1"
 
 # IN list should also return cluster 2's pods
-# Debug: test simpler IN list without AND condition
-echo "DEBUG: Simple IN list (no AND):"
-$K8SQL -c "k3d-k8sql-test-1" -q "SELECT name, _cluster FROM pods WHERE _cluster IN ('k3d-k8sql-test-1', 'k3d-k8sql-test-2')" -o json 2>&1 | head -20 || true
-
-echo "DEBUG: IN list with AND namespace:"
-$K8SQL -c "k3d-k8sql-test-1" -q "SELECT name, _cluster FROM pods WHERE _cluster IN ('k3d-k8sql-test-1', 'k3d-k8sql-test-2') AND namespace = 'default'" -o json 2>&1 || true
-echo ""
-
 assert_contains "IN list returns cluster 2 pods" "k3d-k8sql-test-1" \
     "SELECT name, _cluster FROM pods WHERE _cluster IN ('k3d-k8sql-test-1', 'k3d-k8sql-test-2') AND namespace = 'default'" \
     "k3d-k8sql-test-2"
