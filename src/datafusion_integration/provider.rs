@@ -100,43 +100,17 @@ impl K8sTableProvider {
     /// Extract _cluster filter from DataFusion expressions
     /// Supports: _cluster = 'x', _cluster = '*', _cluster IN (...), _cluster NOT IN (...)
     fn extract_cluster_filter(&self, filters: &[Expr]) -> ClusterFilter {
-        // DEBUG: Print filter expressions directly to stderr for CI visibility
-        eprintln!(
-            "[DEBUG] Extracting cluster filter from {} expressions",
-            filters.len()
-        );
-        for (i, filter) in filters.iter().enumerate() {
-            eprintln!("[DEBUG] Filter {}: {:?}", i, filter);
-        }
-
         for filter in filters {
             if let Some(result) = self.extract_cluster_filter_from_expr(filter) {
-                eprintln!("[DEBUG] Extracted cluster filter: {:?}", result);
                 return result;
             }
         }
-        eprintln!("[DEBUG] No cluster filter found, using default");
         ClusterFilter::Default
     }
 
     /// Recursively extract _cluster filter from a single expression
     /// Handles AND expressions by checking both sides
     fn extract_cluster_filter_from_expr(&self, expr: &Expr) -> Option<ClusterFilter> {
-        // Debug: log the expression type being checked
-        debug!(expr = ?expr, "Checking expression for _cluster filter");
-
-        // DEBUG: Log InList expressions to stderr
-        if let Expr::InList(in_list) = expr
-            && let Expr::Column(col) = in_list.expr.as_ref()
-        {
-            eprintln!(
-                "[DEBUG] Found InList for column '{}', list_len={}, negated={}",
-                col.name,
-                in_list.list.len(),
-                in_list.negated
-            );
-        }
-
         match expr {
             // Handle AND expressions - check both sides
             Expr::BinaryExpr(binary) if binary.op == Operator::And => {
@@ -151,10 +125,6 @@ impl K8sTableProvider {
                 let mut clusters = Vec::new();
                 if self.collect_cluster_values_from_or(expr, &mut clusters) && !clusters.is_empty()
                 {
-                    eprintln!(
-                        "[DEBUG] Collected clusters from OR expression: {:?}",
-                        clusters
-                    );
                     // Check if '*' is in the list - treat as All
                     if clusters.iter().any(|c| c == "*") {
                         return Some(ClusterFilter::All);
