@@ -100,11 +100,27 @@ impl K8sTableProvider {
     /// Extract _cluster filter from DataFusion expressions
     /// Supports: _cluster = 'x', _cluster = '*', _cluster IN (...), _cluster NOT IN (...)
     fn extract_cluster_filter(&self, filters: &[Expr]) -> ClusterFilter {
+        // Log all filter expressions for debugging
+        info!(
+            filter_count = filters.len(),
+            "Extracting cluster filter from expressions"
+        );
+        for (i, filter) in filters.iter().enumerate() {
+            info!(
+                index = i,
+                expr_type = %format!("{:?}", std::mem::discriminant(filter)),
+                expr = %filter,
+                "Filter expression"
+            );
+        }
+
         for filter in filters {
             if let Some(result) = self.extract_cluster_filter_from_expr(filter) {
+                info!(cluster_filter = ?result, "Extracted cluster filter");
                 return result;
             }
         }
+        info!("No cluster filter found, using default");
         ClusterFilter::Default
     }
 
@@ -113,6 +129,18 @@ impl K8sTableProvider {
     fn extract_cluster_filter_from_expr(&self, expr: &Expr) -> Option<ClusterFilter> {
         // Debug: log the expression type being checked
         debug!(expr = ?expr, "Checking expression for _cluster filter");
+
+        // Log InList expressions at info level for debugging
+        if let Expr::InList(in_list) = expr {
+            if let Expr::Column(col) = in_list.expr.as_ref() {
+                info!(
+                    column_name = %col.name,
+                    list_len = in_list.list.len(),
+                    negated = in_list.negated,
+                    "Found InList expression for column"
+                );
+            }
+        }
 
         match expr {
             // Handle AND expressions - check both sides
