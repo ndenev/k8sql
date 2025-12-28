@@ -151,12 +151,16 @@ async fn run_batch(args: &Args) -> Result<()> {
         .map(|s| s.contains(',') || s.contains('*') || s.contains('?'))
         .unwrap_or(false);
 
-    // Initialize with first real context from spec (or kubeconfig default)
-    // If spec contains patterns, use None and let switch_context handle it
+    // For initialization, extract the first concrete context name from the spec.
+    // This avoids connecting to an irrelevant default context when using patterns.
     let initial_context = if is_multi_or_pattern {
-        // For patterns/multi-context, start with kubeconfig default
-        // switch_context() will handle the actual context selection
-        None
+        // For multi-context or patterns, extract first non-pattern context if available
+        // e.g., "prod, staging" -> "prod", "prod-*" -> None (let switch_context handle it)
+        context_spec.as_ref().and_then(|s| {
+            s.split(',')
+                .map(str::trim)
+                .find(|c| !c.contains('*') && !c.contains('?'))
+        })
     } else {
         context_spec.as_deref()
     };
@@ -169,12 +173,8 @@ async fn run_batch(args: &Args) -> Result<()> {
         pool.switch_context(spec, false).await?;
     }
 
-    let mut session = K8sSessionContext::new(Arc::clone(&pool)).await?;
-
-    // Refresh tables if we switched to multiple contexts after initial setup
-    if is_multi_or_pattern {
-        session.refresh_tables().await?;
-    }
+    // Create session - this uses the updated current_contexts from switch_context()
+    let session = K8sSessionContext::new(Arc::clone(&pool)).await?;
 
     let queries = if let Some(query) = &args.query {
         vec![query.clone()]
