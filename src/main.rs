@@ -126,11 +126,54 @@ async fn main() -> Result<()> {
 }
 
 async fn run_batch(args: &Args) -> Result<()> {
-    let pool = Arc::new(K8sClientPool::new(
-        args.context.as_deref(),
-        &args.namespace,
-    )?);
+    // Load saved contexts from config (same as REPL does)
+    let saved_contexts = config::Config::load()
+        .map(|c| c.selected_contexts)
+        .unwrap_or_else(|e| {
+            tracing::debug!("Could not load saved contexts: {}", e);
+            vec![]
+        });
+
+    // Determine context spec: CLI arg takes priority, then saved config
+    // Note: We need to own the string for the lifetime of this function
+    let context_spec: Option<String> = args.context.clone().or_else(|| {
+        if saved_contexts.is_empty() {
+            None
+        } else {
+            // Join saved contexts into comma-separated spec
+            Some(saved_contexts.join(", "))
+        }
+    });
+
+    // Check if context spec contains patterns or multiple contexts
+    let is_multi_or_pattern = context_spec
+        .as_ref()
+        .map(|s| s.contains(',') || s.contains('*') || s.contains('?'))
+        .unwrap_or(false);
+
+    // For initialization, extract the first concrete context name from the spec.
+    // This avoids connecting to an irrelevant default context when using patterns.
+    let initial_context = if is_multi_or_pattern {
+        // For multi-context or patterns, extract first non-pattern context if available
+        // e.g., "prod, staging" -> "prod", "prod-*" -> None (let switch_context handle it)
+        context_spec.as_ref().and_then(|s| {
+            s.split(',')
+                .map(str::trim)
+                .find(|c| !c.contains('*') && !c.contains('?'))
+        })
+    } else {
+        context_spec.as_deref()
+    };
+
+    let pool = Arc::new(K8sClientPool::new(initial_context, &args.namespace)?);
     pool.initialize().await?;
+
+    // If context spec has multiple contexts or patterns, switch to all of them
+    if is_multi_or_pattern && let Some(ref spec) = context_spec {
+        pool.switch_context(spec, false).await?;
+    }
+
+    // Create session - this uses the updated current_contexts from switch_context()
     let session = K8sSessionContext::new(Arc::clone(&pool)).await?;
 
     let queries = if let Some(query) = &args.query {
