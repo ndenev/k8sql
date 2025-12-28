@@ -62,14 +62,24 @@ echo "=== Multi-Cluster LIMIT Tests ==="
 # LIMIT across multiple clusters should return exactly the requested number of rows
 # This tests that DataFusion's LimitExec correctly limits the final result
 # even though each partition (cluster) may fetch up to LIMIT rows
-assert_row_count "Multi-cluster LIMIT 3" "k3d-k8sql-test-1" \
-    "SELECT name, _cluster FROM pods WHERE _cluster = '*' AND namespace = 'default' LIMIT 3" 3
 
-assert_row_count "Multi-cluster LIMIT 5" "k3d-k8sql-test-1" \
-    "SELECT name, _cluster FROM pods WHERE _cluster IN ('k3d-k8sql-test-1', 'k3d-k8sql-test-2') AND namespace = 'default' LIMIT 5" 5
+# Each cluster has 6 ConfigMaps with label type=limit-test in default namespace
+# Total: 12 ConfigMaps across both clusters - good for testing various LIMIT values
+
+# Test LIMIT smaller than per-cluster count
+assert_row_count "Multi-cluster LIMIT 3" "k3d-k8sql-test-1" \
+    "SELECT name, _cluster FROM configmaps WHERE _cluster = '*' AND namespace = 'default' AND labels->>'type' = 'limit-test' LIMIT 3" 3
+
+# Test LIMIT larger than per-cluster count but smaller than total
+assert_row_count "Multi-cluster LIMIT 8" "k3d-k8sql-test-1" \
+    "SELECT name, _cluster FROM configmaps WHERE _cluster IN ('k3d-k8sql-test-1', 'k3d-k8sql-test-2') AND namespace = 'default' AND labels->>'type' = 'limit-test' LIMIT 8" 8
 
 # LIMIT 1 should return exactly 1 row even with wildcard cluster
 assert_row_count "Multi-cluster LIMIT 1" "k3d-k8sql-test-1" \
-    "SELECT name FROM namespaces WHERE _cluster = '*' LIMIT 1" 1
+    "SELECT name FROM configmaps WHERE _cluster = '*' AND namespace = 'default' AND labels->>'type' = 'limit-test' LIMIT 1" 1
+
+# Verify we can get all 12 ConfigMaps with a higher limit (tests no under-fetching)
+assert_row_count "Multi-cluster all configmaps" "k3d-k8sql-test-1" \
+    "SELECT name, _cluster FROM configmaps WHERE _cluster = '*' AND namespace = 'default' AND labels->>'type' = 'limit-test' LIMIT 20" 12
 
 print_summary

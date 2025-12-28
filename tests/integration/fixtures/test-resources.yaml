@@ -35,7 +35,7 @@ spec:
               memory: "64Mi"
               cpu: "100m"
 ---
-# ConfigMap for testing data field access
+# ConfigMaps for testing data field access and LIMIT behavior
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -43,12 +43,63 @@ metadata:
   namespace: default
   labels:
     app: test
+    type: limit-test
 data:
   key1: value1
   key2: value2
   config.yaml: |
     setting: enabled
     level: info
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: limit-test-1
+  namespace: default
+  labels:
+    type: limit-test
+data:
+  index: "1"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: limit-test-2
+  namespace: default
+  labels:
+    type: limit-test
+data:
+  index: "2"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: limit-test-3
+  namespace: default
+  labels:
+    type: limit-test
+data:
+  index: "3"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: limit-test-4
+  namespace: default
+  labels:
+    type: limit-test
+data:
+  index: "4"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: limit-test-5
+  namespace: default
+  labels:
+    type: limit-test
+data:
+  index: "5"
 ---
 # Secret for testing (optional, secrets might be redacted)
 apiVersion: v1
