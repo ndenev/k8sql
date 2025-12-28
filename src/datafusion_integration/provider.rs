@@ -4,6 +4,7 @@
 //! DataFusion TableProvider implementation for Kubernetes resources
 
 use std::any::Any;
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -37,6 +38,15 @@ fn extract_string_literals(in_list: &datafusion::logical_expr::expr::InList) -> 
                 None
             }
         })
+        .collect()
+}
+
+/// Deduplicate a list of strings while preserving order
+fn deduplicate(values: Vec<String>) -> Vec<String> {
+    let mut seen = HashSet::new();
+    values
+        .into_iter()
+        .filter(|v| seen.insert(v.clone()))
         .collect()
 }
 
@@ -115,8 +125,11 @@ impl K8sTableProvider {
                 if self.collect_namespace_values_from_or(expr, &mut namespaces)
                     && !namespaces.is_empty()
                 {
+                    let namespaces = deduplicate(namespaces);
                     if namespaces.len() == 1 {
-                        return Some(NamespaceFilter::Single(namespaces.remove(0)));
+                        return Some(NamespaceFilter::Single(
+                            namespaces.into_iter().next().unwrap(),
+                        ));
                     }
                     return Some(NamespaceFilter::Multiple(namespaces));
                 }
@@ -141,10 +154,12 @@ impl K8sTableProvider {
                     && col.name == "namespace"
                     && !in_list.negated
                 {
-                    let namespaces = extract_string_literals(in_list);
+                    let namespaces = deduplicate(extract_string_literals(in_list));
                     if !namespaces.is_empty() {
                         if namespaces.len() == 1 {
-                            return Some(NamespaceFilter::Single(namespaces[0].clone()));
+                            return Some(NamespaceFilter::Single(
+                                namespaces.into_iter().next().unwrap(),
+                            ));
                         }
                         return Some(NamespaceFilter::Multiple(namespaces));
                     }

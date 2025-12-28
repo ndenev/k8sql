@@ -19,7 +19,7 @@ use datafusion::physical_expr::{EquivalenceProperties, Partitioning};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
 use futures::stream;
-use tracing::{debug, warn};
+use tracing::debug;
 
 use crate::kubernetes::discovery::ResourceInfo;
 use crate::kubernetes::{ApiFilters, K8sClientPool};
@@ -204,14 +204,22 @@ impl ExecutionPlan for K8sExecutionPlan {
             {
                 Ok(r) => r,
                 Err(e) => {
-                    warn!(
-                        cluster = %target.cluster,
-                        namespace = ?target.namespace,
-                        table = %table_name,
-                        error = %e,
-                        "Failed to fetch resources from cluster"
-                    );
-                    Vec::new()
+                    // Fail the query with a clear error message
+                    // User can exclude this cluster with _cluster NOT IN ('...') if needed
+                    return Err(datafusion::error::DataFusionError::External(
+                        format!(
+                            "Failed to fetch {} from cluster '{}'{}: {}",
+                            table_name,
+                            target.cluster,
+                            target
+                                .namespace
+                                .as_ref()
+                                .map(|ns| format!(" namespace '{}'", ns))
+                                .unwrap_or_default(),
+                            e
+                        )
+                        .into(),
+                    ));
                 }
             };
 
