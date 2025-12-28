@@ -2492,6 +2492,7 @@ name = "k8sql"
 version = "0.1.1"
 dependencies = [
  "anyhow",
+ "async-stream",
  "async-trait",
  "chrono",
  "clap",

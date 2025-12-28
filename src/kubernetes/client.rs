@@ -1,9 +1,13 @@
 use anyhow::{Context, Result, anyhow};
+use async_stream::stream;
+use futures::Stream;
 use kube::api::DynamicObject;
 use kube::config::{KubeConfigOptions, Kubeconfig};
 use kube::{Api, Client, Config, api::ListParams};
 use std::collections::HashMap;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 use tracing::{debug, info, trace, warn};
@@ -63,9 +67,28 @@ pub struct K8sClientPool {
     progress: ProgressHandle,
     /// Local disk cache for CRD discovery results
     resource_cache: ResourceCache,
+    /// Cache hit counter for diagnostics
+    cache_hits: AtomicUsize,
+    /// Cache miss counter for diagnostics
+    cache_misses: AtomicUsize,
 }
 
 impl K8sClientPool {
+    /// Create a minimal client pool for unit tests (no kubeconfig required)
+    #[cfg(test)]
+    pub fn new_for_test(progress: crate::progress::ProgressHandle) -> Self {
+        Self {
+            kubeconfig: Kubeconfig::default(),
+            clients: Arc::new(RwLock::new(HashMap::new())),
+            registries: Arc::new(RwLock::new(HashMap::new())),
+            current_contexts: Arc::new(RwLock::new(vec!["test-context".to_string()])),
+            progress,
+            resource_cache: ResourceCache::new().expect("Failed to create test cache"),
+            cache_hits: AtomicUsize::new(0),
+            cache_misses: AtomicUsize::new(0),
+        }
+    }
+
     /// Create a new client pool without connecting (fast, no I/O)
     /// Call `initialize()` after subscribing to progress events
     pub fn new(context: Option<&str>, _namespace: &str) -> Result<Self> {
@@ -91,6 +114,8 @@ impl K8sClientPool {
             current_contexts: Arc::new(RwLock::new(vec![context_name])),
             progress: crate::progress::create_progress_handle(),
             resource_cache: ResourceCache::new()?,
+            cache_hits: AtomicUsize::new(0),
+            cache_misses: AtomicUsize::new(0),
         })
     }
 
@@ -413,9 +438,11 @@ impl K8sClientPool {
         {
             let clients = self.clients.read().await;
             if let Some(client) = clients.get(context) {
+                self.cache_hits.fetch_add(1, Ordering::Relaxed);
                 return Ok(client.clone());
             }
         }
+        self.cache_misses.fetch_add(1, Ordering::Relaxed);
 
         // Verify context exists
         if !self.kubeconfig.contexts.iter().any(|c| c.name == context) {
@@ -639,152 +666,6 @@ impl K8sClientPool {
         pi == pattern.len()
     }
 
-    /// Fetch resources using dynamic discovery
-    /// Works for all resource types: core, extensions, and CRDs
-    /// Includes retry logic with exponential backoff for transient failures
-    pub async fn fetch_resources(
-        &self,
-        table: &str,
-        namespace: Option<&str>,
-        context: Option<&str>,
-        api_filters: &ApiFilters,
-    ) -> Result<Vec<serde_json::Value>> {
-        // Look up resource info from discovery
-        let resource_info = self
-            .get_resource_info(table, context)
-            .await?
-            .ok_or_else(|| {
-                anyhow!(
-                    "Unknown table: '{}'. Run SHOW TABLES to see available resources.",
-                    table
-                )
-            })?;
-
-        // Log API endpoint details for debugging
-        debug!(
-            table = %table,
-            cluster = ?context,
-            namespace = ?namespace,
-            group = %resource_info.group,
-            version = %resource_info.version,
-            kind = %resource_info.api_resource.kind,
-            "Fetching K8s resource"
-        );
-
-        let client = self.get_client(context).await?;
-        let ar = &resource_info.api_resource;
-        let list_params = self.build_list_params(api_filters);
-
-        // Create API handle based on resource scope
-        let (api, scope): (Api<DynamicObject>, &str) = if resource_info.is_namespaced() {
-            match namespace {
-                Some(ns) => (Api::namespaced_with(client, ns, ar), "namespaced"),
-                None => (Api::all_with(client, ar), "all-namespaces"),
-            }
-        } else {
-            (Api::all_with(client, ar), "cluster-scoped")
-        };
-
-        debug!(table = %table, scope = %scope, "API scope");
-
-        // Fetch with retry logic for transient failures
-        let list = self
-            .list_with_retry(&api, &list_params, table, context)
-            .await?;
-
-        // Build apiVersion string (e.g., "v1", "apps/v1", "cert-manager.io/v1")
-        let api_version = if resource_info.group.is_empty() {
-            resource_info.version.clone()
-        } else {
-            format!("{}/{}", resource_info.group, resource_info.version)
-        };
-        let kind = &resource_info.api_resource.kind;
-
-        let values: Vec<serde_json::Value> = list
-            .items
-            .into_iter()
-            .map(|item| {
-                let mut value = serde_json::to_value(item).unwrap_or(serde_json::Value::Null);
-                // Inject apiVersion and kind (K8s list API doesn't include these per-item)
-                if let serde_json::Value::Object(ref mut map) = value {
-                    map.insert(
-                        "apiVersion".to_string(),
-                        serde_json::Value::String(api_version.clone()),
-                    );
-                    map.insert("kind".to_string(), serde_json::Value::String(kind.clone()));
-                }
-                value
-            })
-            .collect();
-
-        Ok(values)
-    }
-
-    /// List resources with pagination and retry logic
-    /// Uses continue tokens to fetch all pages efficiently
-    async fn list_with_retry(
-        &self,
-        api: &Api<DynamicObject>,
-        base_params: &ListParams,
-        table: &str,
-        context: Option<&str>,
-    ) -> Result<kube::api::ObjectList<DynamicObject>> {
-        let ctx_name = context.unwrap_or("default");
-        let mut all_items: Vec<DynamicObject> = Vec::new();
-        let mut continue_token: Option<String> = None;
-        let mut page_count = 0u32;
-
-        loop {
-            // Build params for this page
-            let mut params = base_params.clone().limit(PAGE_SIZE);
-            if let Some(ref token) = continue_token {
-                params = params.continue_token(token);
-            }
-
-            // Fetch with retry
-            let list = self
-                .list_page_with_retry(api, &params, table, ctx_name)
-                .await?;
-
-            let items_count = list.items.len();
-            all_items.extend(list.items);
-            page_count += 1;
-
-            // Check for more pages
-            match list.metadata.continue_ {
-                Some(token) if !token.is_empty() => {
-                    debug!(
-                        table = %table,
-                        context = %ctx_name,
-                        page = page_count,
-                        items_this_page = items_count,
-                        total_so_far = all_items.len(),
-                        "Fetched page, continuing"
-                    );
-                    continue_token = Some(token);
-                }
-                _ => break,
-            }
-        }
-
-        if page_count > 1 {
-            debug!(
-                table = %table,
-                context = %ctx_name,
-                pages = page_count,
-                total_items = all_items.len(),
-                "Pagination complete"
-            );
-        }
-
-        // Construct a combined result
-        Ok(kube::api::ObjectList {
-            metadata: kube::api::ListMeta::default(),
-            items: all_items,
-            types: Default::default(),
-        })
-    }
-
     /// Fetch a single page with retry logic
     async fn list_page_with_retry(
         &self,
@@ -867,5 +748,191 @@ impl K8sClientPool {
         );
 
         params
+    }
+
+    /// Get cache statistics (hits, misses)
+    #[allow(dead_code)]
+    pub fn cache_stats(&self) -> (usize, usize) {
+        (
+            self.cache_hits.load(Ordering::Relaxed),
+            self.cache_misses.load(Ordering::Relaxed),
+        )
+    }
+
+    /// Stream resources from Kubernetes API as pages arrive
+    ///
+    /// This method yields pages of resources as they are fetched from the K8s API,
+    /// enabling streaming execution and early termination with LIMIT.
+    /// Each yielded Vec contains one page of resources (up to PAGE_SIZE items).
+    pub fn stream_resources(
+        &self,
+        table: &str,
+        namespace: Option<&str>,
+        context: Option<&str>,
+        api_filters: &ApiFilters,
+        limit: Option<usize>,
+    ) -> Pin<Box<dyn Stream<Item = Result<Vec<serde_json::Value>>> + Send + '_>> {
+        let table = table.to_string();
+        let namespace = namespace.map(String::from);
+        let context = context.map(String::from);
+        let api_filters = api_filters.clone();
+
+        Box::pin(stream! {
+            // Look up resource info from discovery
+            let resource_info = match self.get_resource_info(&table, context.as_deref()).await {
+                Ok(Some(info)) => info,
+                Ok(None) => {
+                    yield Err(anyhow!(
+                        "Unknown table: '{}'. Run SHOW TABLES to see available resources.",
+                        table
+                    ));
+                    return;
+                }
+                Err(e) => {
+                    yield Err(e);
+                    return;
+                }
+            };
+
+            let ctx_name = context.as_deref().unwrap_or("default");
+
+            debug!(
+                table = %table,
+                cluster = %ctx_name,
+                namespace = ?namespace,
+                limit = ?limit,
+                group = %resource_info.group,
+                version = %resource_info.version,
+                kind = %resource_info.api_resource.kind,
+                "Streaming K8s resource"
+            );
+
+            let client = match self.get_client(context.as_deref()).await {
+                Ok(c) => c,
+                Err(e) => {
+                    yield Err(e);
+                    return;
+                }
+            };
+
+            let ar = &resource_info.api_resource;
+            let base_params = self.build_list_params(&api_filters);
+
+            // Create API handle based on resource scope
+            let api: Api<DynamicObject> = if resource_info.is_namespaced() {
+                match &namespace {
+                    Some(ns) => Api::namespaced_with(client, ns, ar),
+                    None => Api::all_with(client, ar),
+                }
+            } else {
+                Api::all_with(client, ar)
+            };
+
+            // Build apiVersion string (e.g., "v1", "apps/v1", "cert-manager.io/v1")
+            let api_version = if resource_info.group.is_empty() {
+                resource_info.version.clone()
+            } else {
+                format!("{}/{}", resource_info.group, resource_info.version)
+            };
+            let kind = resource_info.api_resource.kind.clone();
+
+            // Stream pages with pagination
+            let mut continue_token: Option<String> = None;
+            let mut total_fetched = 0usize;
+            let mut page_count = 0u32;
+
+            loop {
+                // Build params for this page
+                let mut params = base_params.clone().limit(PAGE_SIZE);
+                if let Some(ref token) = continue_token {
+                    params = params.continue_token(token);
+                }
+
+                // Fetch page with retry
+                let list = match self.list_page_with_retry(&api, &params, &table, ctx_name).await {
+                    Ok(l) => l,
+                    Err(e) => {
+                        yield Err(e);
+                        return;
+                    }
+                };
+
+                let items_count = list.items.len();
+                page_count += 1;
+
+                // Convert items to JSON values with apiVersion and kind
+                let mut values: Vec<serde_json::Value> = list
+                    .items
+                    .into_iter()
+                    .map(|item| {
+                        let mut value = serde_json::to_value(item).unwrap_or(serde_json::Value::Null);
+                        if let serde_json::Value::Object(ref mut map) = value {
+                            map.insert(
+                                "apiVersion".to_string(),
+                                serde_json::Value::String(api_version.clone()),
+                            );
+                            map.insert("kind".to_string(), serde_json::Value::String(kind.clone()));
+                        }
+                        value
+                    })
+                    .collect();
+
+                // Truncate to limit if needed (before yielding)
+                let mut hit_limit = false;
+                if let Some(max) = limit {
+                    let remaining = max.saturating_sub(total_fetched);
+                    if remaining < values.len() {
+                        values.truncate(remaining);
+                        hit_limit = true;
+                    }
+                }
+
+                let yielded_count = values.len();
+                total_fetched += yielded_count;
+
+                debug!(
+                    table = %table,
+                    context = %ctx_name,
+                    page = page_count,
+                    items_this_page = items_count,
+                    yielded = yielded_count,
+                    total_so_far = total_fetched,
+                    "Streaming page"
+                );
+
+                // Yield this page (possibly truncated)
+                yield Ok(values);
+
+                // Stop if we hit the limit
+                if hit_limit {
+                    debug!(
+                        table = %table,
+                        context = %ctx_name,
+                        limit = ?limit,
+                        total_fetched = total_fetched,
+                        "Reached limit, stopping pagination"
+                    );
+                    break;
+                }
+
+                // Check for more pages
+                match list.metadata.continue_ {
+                    Some(token) if !token.is_empty() => {
+                        continue_token = Some(token);
+                    }
+                    _ => break,
+                }
+            }
+
+            if page_count > 1 {
+                debug!(
+                    table = %table,
+                    context = %ctx_name,
+                    pages = page_count,
+                    total_items = total_fetched,
+                    "Streaming pagination complete"
+                );
+            }
+        })
     }
 }

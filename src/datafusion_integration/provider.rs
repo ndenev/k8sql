@@ -448,7 +448,8 @@ impl TableProvider for K8sTableProvider {
                         }
                     }
                 }
-                TableProviderFilterPushDown::Inexact
+                // We don't push this filter to K8s API - DataFusion must apply it
+                TableProviderFilterPushDown::Unsupported
             })
             .collect())
     }
@@ -458,7 +459,7 @@ impl TableProvider for K8sTableProvider {
         _state: &dyn Session,
         projection: Option<&Vec<usize>>,
         filters: &[Expr],
-        _limit: Option<usize>,
+        limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         // Log raw filters for debugging
         debug!(
@@ -563,12 +564,14 @@ impl TableProvider for K8sTableProvider {
 
         let num_targets = query_targets.len();
         let num_clusters = clusters.len();
+
         info!(
             table = %self.resource_info.table_name,
             clusters = num_clusters,
             targets = num_targets,
             namespace_filter = ?namespace_filter,
             labels = ?api_filters.label_selector,
+            limit = ?limit,
             "Creating lazy K8s execution plan"
         );
 
@@ -581,6 +584,10 @@ impl TableProvider for K8sTableProvider {
         // Create lazy execution plan - data will be fetched when partitions are executed
         // Each partition corresponds to one QueryTarget (cluster, namespace pair)
         // DataFusion controls parallelism via its thread pool
+        //
+        // Note: DataFusion only passes `limit` when it's safe to apply at the source.
+        // This is determined by supports_filters_pushdown() - we return Unsupported for
+        // filters we don't push, so DataFusion adds FilterExec and won't push limit through it.
         let plan = K8sExecutionPlan::new(
             self.resource_info.table_name.clone(),
             self.resource_info.clone(),
@@ -588,6 +595,7 @@ impl TableProvider for K8sTableProvider {
             api_filters,
             self.pool.clone(),
             self.schema.clone(),
+            limit,
         );
 
         // Handle projection if specified
@@ -618,5 +626,190 @@ impl TableProvider for K8sTableProvider {
         } else {
             Ok(Arc::new(plan))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use datafusion::common::Column;
+    use datafusion::logical_expr::expr::InList;
+    use datafusion::logical_expr::BinaryExpr;
+    use k8s_openapi::apimachinery::pkg::apis::meta::v1::APIResource;
+    use kube::discovery::{ApiCapabilities, ApiResource, Scope};
+
+    /// Helper to create a K8sTableProvider for testing
+    fn create_test_provider() -> K8sTableProvider {
+        use crate::kubernetes::discovery::ResourceInfo;
+        use crate::progress::create_progress_handle;
+
+        let api_resource = ApiResource::from_gvk_with_plural(
+            &kube::api::GroupVersionKind::gvk("", "v1", "Pod"),
+            "pods",
+        );
+
+        let capabilities = ApiCapabilities {
+            scope: Scope::Namespaced,
+            subresources: vec![],
+            operations: vec![],
+        };
+
+        let resource_info = ResourceInfo {
+            api_resource,
+            capabilities,
+            table_name: "pods".to_string(),
+            aliases: vec!["pod".to_string()],
+            is_core: true,
+            group: "".to_string(),
+            version: "v1".to_string(),
+            custom_fields: None,
+        };
+
+        // Create a minimal pool - won't actually connect in tests
+        let progress = create_progress_handle();
+        let pool = Arc::new(K8sClientPool::new_for_test(progress));
+
+        K8sTableProvider::new(resource_info, pool)
+    }
+
+    #[test]
+    fn test_filter_pushdown_namespace_equals() {
+        let provider = create_test_provider();
+        let filter = Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(Expr::Column(Column::new_unqualified("namespace"))),
+            op: Operator::Eq,
+            right: Box::new(Expr::Literal(
+                datafusion::common::ScalarValue::Utf8(Some("default".to_string())),
+                None,
+            )),
+        });
+
+        let result = provider
+            .supports_filters_pushdown(&[&filter])
+            .unwrap();
+
+        assert_eq!(result.len(), 1);
+        assert!(matches!(result[0], TableProviderFilterPushDown::Exact));
+    }
+
+    #[test]
+    fn test_filter_pushdown_cluster_equals() {
+        let provider = create_test_provider();
+        let filter = Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(Expr::Column(Column::new_unqualified("_cluster"))),
+            op: Operator::Eq,
+            right: Box::new(Expr::Literal(
+                datafusion::common::ScalarValue::Utf8(Some("prod".to_string())),
+                None,
+            )),
+        });
+
+        let result = provider
+            .supports_filters_pushdown(&[&filter])
+            .unwrap();
+
+        assert_eq!(result.len(), 1);
+        assert!(matches!(result[0], TableProviderFilterPushDown::Exact));
+    }
+
+    #[test]
+    fn test_filter_pushdown_namespace_in_list() {
+        let provider = create_test_provider();
+        let filter = Expr::InList(InList {
+            expr: Box::new(Expr::Column(Column::new_unqualified("namespace"))),
+            list: vec![
+                Expr::Literal(
+                    datafusion::common::ScalarValue::Utf8(Some("ns1".to_string())),
+                    None,
+                ),
+                Expr::Literal(
+                    datafusion::common::ScalarValue::Utf8(Some("ns2".to_string())),
+                    None,
+                ),
+            ],
+            negated: false,
+        });
+
+        let result = provider
+            .supports_filters_pushdown(&[&filter])
+            .unwrap();
+
+        assert_eq!(result.len(), 1);
+        assert!(matches!(result[0], TableProviderFilterPushDown::Exact));
+    }
+
+    #[test]
+    fn test_filter_pushdown_unsupported_name_comparison() {
+        let provider = create_test_provider();
+        // name = 'test' is not pushed to K8s API (not namespace/_cluster/labels)
+        let filter = Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(Expr::Column(Column::new_unqualified("name"))),
+            op: Operator::Eq,
+            right: Box::new(Expr::Literal(
+                datafusion::common::ScalarValue::Utf8(Some("test".to_string())),
+                None,
+            )),
+        });
+
+        let result = provider
+            .supports_filters_pushdown(&[&filter])
+            .unwrap();
+
+        assert_eq!(result.len(), 1);
+        assert!(matches!(result[0], TableProviderFilterPushDown::Unsupported));
+    }
+
+    #[test]
+    fn test_filter_pushdown_unsupported_status_field() {
+        let provider = create_test_provider();
+        // status = 'Running' is not pushed to K8s API
+        let filter = Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(Expr::Column(Column::new_unqualified("status"))),
+            op: Operator::Eq,
+            right: Box::new(Expr::Literal(
+                datafusion::common::ScalarValue::Utf8(Some("Running".to_string())),
+                None,
+            )),
+        });
+
+        let result = provider
+            .supports_filters_pushdown(&[&filter])
+            .unwrap();
+
+        assert_eq!(result.len(), 1);
+        assert!(matches!(result[0], TableProviderFilterPushDown::Unsupported));
+    }
+
+    #[test]
+    fn test_filter_pushdown_mixed_filters() {
+        let provider = create_test_provider();
+
+        // namespace = 'default' (pushable)
+        let namespace_filter = Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(Expr::Column(Column::new_unqualified("namespace"))),
+            op: Operator::Eq,
+            right: Box::new(Expr::Literal(
+                datafusion::common::ScalarValue::Utf8(Some("default".to_string())),
+                None,
+            )),
+        });
+
+        // name = 'test' (not pushable)
+        let name_filter = Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(Expr::Column(Column::new_unqualified("name"))),
+            op: Operator::Eq,
+            right: Box::new(Expr::Literal(
+                datafusion::common::ScalarValue::Utf8(Some("test".to_string())),
+                None,
+            )),
+        });
+
+        let result = provider
+            .supports_filters_pushdown(&[&namespace_filter, &name_filter])
+            .unwrap();
+
+        assert_eq!(result.len(), 2);
+        assert!(matches!(result[0], TableProviderFilterPushDown::Exact));
+        assert!(matches!(result[1], TableProviderFilterPushDown::Unsupported));
     }
 }
