@@ -94,6 +94,25 @@ assert_contains() {
     fi
 }
 
+# Assert query output does NOT contain a value
+assert_not_contains() {
+    local desc="$1"
+    local context="$2"
+    local query="$3"
+    local unexpected="$4"
+
+    local result
+    result=$(run_query "$context" "$query")
+
+    if echo "$result" | grep -q "$unexpected"; then
+        echo -e "${RED}✗${NC} $desc (unexpectedly contained: $unexpected)"
+        FAIL=$((FAIL + 1))
+    else
+        echo -e "${GREEN}✓${NC} $desc"
+        PASS=$((PASS + 1))
+    fi
+}
+
 # Assert table output contains expected value
 assert_table_contains() {
     local desc="$1"
