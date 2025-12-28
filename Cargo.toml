@@ -64,6 +64,9 @@ tracing-rolling-file = { version = "0.1", features = ["non-blocking"] }
 # Futures
 futures = "0.3"
 
+# Async streaming
+async-stream = "0.3"
+
 # Async trait support
 async-trait = "0.1"
 
