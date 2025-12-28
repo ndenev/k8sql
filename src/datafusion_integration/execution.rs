@@ -26,6 +26,18 @@ use crate::kubernetes::{ApiFilters, K8sClientPool};
 
 use super::convert::json_to_record_batch;
 
+/// Check if an error is a Kubernetes "not found" (404) error
+///
+/// Returns true for 404 errors which indicate the namespace or resource
+/// doesn't exist. These are expected in cross-cluster queries where not
+/// all clusters have the same namespaces.
+fn is_not_found_error(err: &anyhow::Error) -> bool {
+    if let Some(kube::Error::Api(api_err)) = err.downcast_ref::<kube::Error>() {
+        return api_err.code == 404;
+    }
+    false
+}
+
 /// A query target representing a specific (cluster, namespace) pair to fetch
 #[derive(Debug, Clone)]
 pub struct QueryTarget {
@@ -204,22 +216,34 @@ impl ExecutionPlan for K8sExecutionPlan {
             {
                 Ok(r) => r,
                 Err(e) => {
-                    // Fail the query with a clear error message
-                    // User can exclude this cluster with _cluster NOT IN ('...') if needed
-                    return Err(datafusion::error::DataFusionError::External(
-                        format!(
-                            "Failed to fetch {} from cluster '{}'{}: {}",
-                            table_name,
-                            target.cluster,
-                            target
-                                .namespace
-                                .as_ref()
-                                .map(|ns| format!(" namespace '{}'", ns))
-                                .unwrap_or_default(),
-                            e
-                        )
-                        .into(),
-                    ));
+                    // Check if this is a "not found" error (404)
+                    // These are expected when a namespace doesn't exist in a cluster
+                    if is_not_found_error(&e) {
+                        debug!(
+                            cluster = %target.cluster,
+                            namespace = ?target.namespace,
+                            table = %table_name,
+                            "Resource/namespace not found, returning empty results"
+                        );
+                        Vec::new()
+                    } else {
+                        // Real errors (auth, network, server) should fail the query
+                        // User can exclude this cluster with _cluster NOT IN ('...') if needed
+                        return Err(datafusion::error::DataFusionError::External(
+                            format!(
+                                "Failed to fetch {} from cluster '{}'{}: {}",
+                                table_name,
+                                target.cluster,
+                                target
+                                    .namespace
+                                    .as_ref()
+                                    .map(|ns| format!(" namespace '{}'", ns))
+                                    .unwrap_or_default(),
+                                e
+                            )
+                            .into(),
+                        ));
+                    }
                 }
             };
 
