@@ -32,14 +32,12 @@ pub enum ProgressUpdate {
     // === Query phases ===
     /// Starting to query clusters
     StartingQuery { table: String, cluster_count: usize },
-    /// Fetched data from a cluster
+    /// Fetched data from a cluster/partition
     ClusterComplete {
         cluster: String,
         rows: usize,
         elapsed_ms: u64,
     },
-    /// All clusters complete
-    QueryComplete { total_rows: usize, elapsed_ms: u64 },
 }
 
 /// Global progress reporter
@@ -76,20 +74,12 @@ impl ProgressReporter {
         });
     }
 
-    /// Report cluster completion
+    /// Report cluster/partition completion
     pub fn cluster_complete(&self, cluster: &str, rows: usize, elapsed_ms: u64) {
         self.clusters_done.fetch_add(1, Ordering::SeqCst);
         let _ = self.sender.send(ProgressUpdate::ClusterComplete {
             cluster: cluster.to_string(),
             rows,
-            elapsed_ms,
-        });
-    }
-
-    /// Report query completion
-    pub fn query_complete(&self, total_rows: usize, elapsed_ms: u64) {
-        let _ = self.sender.send(ProgressUpdate::QueryComplete {
-            total_rows,
             elapsed_ms,
         });
     }
@@ -228,11 +218,10 @@ mod tests {
         reporter.registering_tables(100);
         reporter.start_query("pods", 1);
         reporter.cluster_complete("cluster-1", 25, 100);
-        reporter.query_complete(25, 150);
 
         // Verify all updates were received
         let updates: Vec<_> = std::iter::from_fn(|| receiver.try_recv().ok()).collect();
-        assert_eq!(updates.len(), 8);
+        assert_eq!(updates.len(), 7);
 
         // Check types of updates
         assert!(matches!(updates[0], ProgressUpdate::Connecting { .. }));
@@ -248,7 +237,6 @@ mod tests {
         ));
         assert!(matches!(updates[5], ProgressUpdate::StartingQuery { .. }));
         assert!(matches!(updates[6], ProgressUpdate::ClusterComplete { .. }));
-        assert!(matches!(updates[7], ProgressUpdate::QueryComplete { .. }));
     }
 
     #[test]

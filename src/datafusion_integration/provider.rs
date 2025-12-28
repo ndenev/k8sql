@@ -4,30 +4,25 @@
 //! DataFusion TableProvider implementation for Kubernetes resources
 
 use std::any::Any;
+use std::collections::HashSet;
 use std::sync::Arc;
-use std::time::Instant;
 
 use async_trait::async_trait;
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::catalog::Session;
-use datafusion::datasource::memory::MemorySourceConfig;
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::error::Result;
 use datafusion::logical_expr::{Operator, TableProviderFilterPushDown};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::Expr;
-use futures::stream::{self, StreamExt};
-use tracing::{debug, info, warn};
-
-/// Maximum number of clusters to query concurrently
-/// Higher values improve performance but increase local resource usage (connections, memory)
-const MAX_CONCURRENT_CLUSTERS: usize = 15;
+use tracing::{debug, info};
 
 use crate::kubernetes::ApiFilters;
 use crate::kubernetes::K8sClientPool;
 use crate::kubernetes::discovery::{ResourceInfo, generate_schema};
 
-use super::convert::{json_to_record_batch, to_arrow_schema};
+use super::convert::to_arrow_schema;
+use super::execution::{K8sExecutionPlan, QueryTarget};
 
 /// Extract string literals from an IN list expression
 fn extract_string_literals(in_list: &datafusion::logical_expr::expr::InList) -> Vec<String> {
@@ -46,6 +41,15 @@ fn extract_string_literals(in_list: &datafusion::logical_expr::expr::InList) -> 
         .collect()
 }
 
+/// Deduplicate a list of strings while preserving order
+fn deduplicate(values: Vec<String>) -> Vec<String> {
+    let mut seen = HashSet::new();
+    values
+        .into_iter()
+        .filter(|v| seen.insert(v.clone()))
+        .collect()
+}
+
 /// Represents how clusters should be selected for a query
 #[derive(Debug, Clone)]
 enum ClusterFilter {
@@ -57,6 +61,17 @@ enum ClusterFilter {
     Include(Vec<String>),
     /// Query all clusters except these (from _cluster NOT IN (...))
     Exclude(Vec<String>),
+}
+
+/// Represents how namespaces should be selected for a query
+#[derive(Debug, Clone)]
+enum NamespaceFilter {
+    /// No namespace filter - query all namespaces (cluster-wide)
+    All,
+    /// Single namespace (namespace = 'x')
+    Single(String),
+    /// Multiple namespaces (namespace IN ('x', 'y')) - parallel queries
+    Multiple(Vec<String>),
 }
 
 /// A DataFusion TableProvider that fetches data from Kubernetes
@@ -81,20 +96,104 @@ impl K8sTableProvider {
         }
     }
 
-    /// Extract namespace filter from DataFusion expressions if possible
-    fn extract_namespace_filter(&self, filters: &[Expr]) -> Option<String> {
+    /// Extract namespace filter from DataFusion expressions
+    /// Supports: namespace = 'x', namespace IN (...), and OR chains
+    fn extract_namespace_filter(&self, filters: &[Expr]) -> NamespaceFilter {
         for filter in filters {
-            if let Expr::BinaryExpr(binary) = filter
-                && let (Expr::Column(col), Expr::Literal(lit, _)) =
-                    (binary.left.as_ref(), binary.right.as_ref())
-                && col.name == "namespace"
-                && matches!(binary.op, datafusion::logical_expr::Operator::Eq)
-                && let datafusion::common::ScalarValue::Utf8(Some(ns)) = lit
-            {
-                return Some(ns.clone());
+            if let Some(result) = self.extract_namespace_filter_from_expr(filter) {
+                return result;
             }
         }
-        None
+        NamespaceFilter::All
+    }
+
+    /// Recursively extract namespace filter from a single expression
+    /// Handles AND expressions by checking both sides
+    fn extract_namespace_filter_from_expr(&self, expr: &Expr) -> Option<NamespaceFilter> {
+        match expr {
+            // Handle AND expressions - check both sides
+            Expr::BinaryExpr(binary) if binary.op == Operator::And => {
+                if let Some(result) = self.extract_namespace_filter_from_expr(&binary.left) {
+                    return Some(result);
+                }
+                self.extract_namespace_filter_from_expr(&binary.right)
+            }
+            // Handle OR expressions - DataFusion transforms IN lists to OR chains
+            // e.g., namespace IN ('a', 'b') becomes (namespace = 'a') OR (namespace = 'b')
+            Expr::BinaryExpr(binary) if binary.op == Operator::Or => {
+                let mut namespaces = Vec::new();
+                if self.collect_namespace_values_from_or(expr, &mut namespaces)
+                    && !namespaces.is_empty()
+                {
+                    let namespaces = deduplicate(namespaces);
+                    if namespaces.len() == 1 {
+                        return Some(NamespaceFilter::Single(
+                            namespaces.into_iter().next().unwrap(),
+                        ));
+                    }
+                    return Some(NamespaceFilter::Multiple(namespaces));
+                }
+                None
+            }
+            // Handle namespace = 'value'
+            Expr::BinaryExpr(binary)
+                if matches!(binary.op, Operator::Eq)
+                    && matches!(binary.left.as_ref(), Expr::Column(col) if col.name == "namespace") =>
+            {
+                if let Expr::Literal(lit, _) = binary.right.as_ref()
+                    && let datafusion::common::ScalarValue::Utf8(Some(ns)) = lit
+                {
+                    return Some(NamespaceFilter::Single(ns.clone()));
+                }
+                None
+            }
+            // Handle namespace IN ('a', 'b', 'c')
+            // Note: DataFusion often rewrites IN to OR, but keep this for completeness
+            Expr::InList(in_list) => {
+                if let Expr::Column(col) = in_list.expr.as_ref()
+                    && col.name == "namespace"
+                    && !in_list.negated
+                {
+                    let namespaces = deduplicate(extract_string_literals(in_list));
+                    if !namespaces.is_empty() {
+                        if namespaces.len() == 1 {
+                            return Some(NamespaceFilter::Single(
+                                namespaces.into_iter().next().unwrap(),
+                            ));
+                        }
+                        return Some(NamespaceFilter::Multiple(namespaces));
+                    }
+                }
+                None
+            }
+            _ => None,
+        }
+    }
+
+    /// Recursively collect namespace values from an OR expression tree
+    /// Returns true if all leaves are `namespace = 'value'` patterns
+    fn collect_namespace_values_from_or(&self, expr: &Expr, namespaces: &mut Vec<String>) -> bool {
+        match expr {
+            Expr::BinaryExpr(binary) if binary.op == Operator::Or => {
+                // Recursively collect from both sides
+                self.collect_namespace_values_from_or(&binary.left, namespaces)
+                    && self.collect_namespace_values_from_or(&binary.right, namespaces)
+            }
+            Expr::BinaryExpr(binary)
+                if matches!(binary.op, Operator::Eq)
+                    && matches!(binary.left.as_ref(), Expr::Column(col) if col.name == "namespace") =>
+            {
+                // Extract the namespace value
+                if let Expr::Literal(lit, _) = binary.right.as_ref()
+                    && let datafusion::common::ScalarValue::Utf8(Some(ns)) = lit
+                {
+                    namespaces.push(ns.clone());
+                    return true;
+                }
+                false
+            }
+            _ => false, // Not a valid namespace pattern
+        }
     }
 
     /// Extract _cluster filter from DataFusion expressions
@@ -304,6 +403,7 @@ impl TableProvider for K8sTableProvider {
     ) -> Result<Vec<TableProviderFilterPushDown>> {
         // We can push down these filters to the K8s API:
         // - namespace = 'x' -> Uses namespaced API
+        // - namespace IN (...) -> Parallel queries to each namespace
         // - _cluster = 'x' -> Queries specific cluster
         // - _cluster IN (...) / NOT IN (...) -> Queries specific clusters
         // - labels->>'key' = 'value' -> K8s label selector
@@ -312,9 +412,10 @@ impl TableProvider for K8sTableProvider {
             .iter()
             .map(|f| {
                 // Check for _cluster IN (...) or NOT IN (...)
+                // Check for namespace IN (...) - parallel queries to each namespace
                 if let Expr::InList(in_list) = f
                     && let Expr::Column(col) = in_list.expr.as_ref()
-                    && col.name == "_cluster"
+                    && (col.name == "_cluster" || (col.name == "namespace" && !in_list.negated))
                 {
                     return TableProviderFilterPushDown::Exact;
                 }
@@ -368,26 +469,18 @@ impl TableProvider for K8sTableProvider {
         );
 
         // Extract pushdown filters - these go to the K8s API to reduce data fetched
-        let namespace = self.extract_namespace_filter(filters);
+        let namespace_filter = self.extract_namespace_filter(filters);
         let cluster_filter = self.extract_cluster_filter(filters);
         let label_selector = self.extract_label_selectors(filters);
 
-        // Log cluster filter for debugging multi-cluster queries
+        // Log cluster and namespace filters for debugging
         debug!(
             table = %self.resource_info.table_name,
             cluster_filter = ?cluster_filter,
-            "Extracted cluster filter"
+            namespace_filter = ?namespace_filter,
+            labels = ?label_selector,
+            "Extracted filters for K8s API"
         );
-
-        // Log pushdown filters for debugging
-        if namespace.is_some() || label_selector.is_some() {
-            debug!(
-                table = %self.resource_info.table_name,
-                namespace = ?namespace,
-                labels = ?label_selector,
-                "Pushing down filters to K8s API"
-            );
-        }
 
         // Build API filters with label selector
         let api_filters = ApiFilters {
@@ -429,127 +522,101 @@ impl TableProvider for K8sTableProvider {
             "Resolved clusters to query"
         );
 
-        // Fetch data from all clusters IN PARALLEL
-        // Each cluster becomes a separate partition for DataFusion to process
-        let table_name = self.resource_info.table_name.clone();
-        let resource_info = self.resource_info.clone();
-        let pool = self.pool.clone();
-
-        let num_clusters = clusters.len();
-        info!(
-            table = %table_name,
-            clusters = num_clusters,
-            namespace = ?namespace,
-            labels = ?api_filters.label_selector,
-            "Fetching resources from K8s API"
-        );
-
-        let fetch_start = Instant::now();
-
-        // Report query start
-        pool.progress().start_query(&table_name, num_clusters);
-
-        // Execute cluster queries with concurrency limit to avoid overwhelming APIs
-        let results: Vec<_> = stream::iter(clusters.iter().cloned())
-            .map(|cluster| {
-                let pool = pool.clone();
-                let table_name = table_name.clone();
-                let namespace = namespace.clone();
-                let api_filters = api_filters.clone();
-
-                async move {
-                    let start = Instant::now();
-                    let resources = match pool
-                        .fetch_resources(
-                            &table_name,
-                            namespace.as_deref(),
-                            Some(&cluster),
-                            &api_filters,
-                        )
-                        .await
-                    {
-                        Ok(r) => r,
-                        Err(e) => {
-                            warn!(
-                                cluster = %cluster,
-                                table = %table_name,
-                                error = %e,
-                                "Failed to fetch resources from cluster"
-                            );
-                            Vec::new()
-                        }
-                    };
-                    let elapsed = start.elapsed();
-                    let row_count = resources.len();
-                    debug!(
-                        cluster = %cluster,
-                        table = %table_name,
-                        rows = row_count,
-                        elapsed_ms = elapsed.as_millis(),
-                        "Fetched from cluster"
-                    );
-                    // Report cluster completion
-                    pool.progress().cluster_complete(
-                        &cluster,
-                        row_count,
-                        elapsed.as_millis() as u64,
-                    );
-                    (cluster, resources)
-                }
-            })
-            // Limit concurrent requests to avoid overwhelming K8s APIs
-            .buffer_unordered(MAX_CONCURRENT_CLUSTERS)
-            .collect()
-            .await;
-        let fetch_elapsed = fetch_start.elapsed();
-
-        // Convert results to partitions - one partition per cluster
-        // This allows DataFusion to process clusters in parallel
-        let mut partitions: Vec<Vec<datafusion::arrow::array::RecordBatch>> = Vec::new();
-        let mut total_rows = 0usize;
-        let mut batch_schema: Option<SchemaRef> = None;
-
-        for (cluster, resources) in results {
-            let row_count = resources.len();
-            total_rows += row_count;
-            if !resources.is_empty() {
-                let batch = json_to_record_batch(&cluster, &resource_info, resources)?;
-                // Capture the schema from the first non-empty batch
-                if batch_schema.is_none() {
-                    batch_schema = Some(batch.schema());
-                }
-                // Each cluster's data is its own partition
-                partitions.push(vec![batch]);
+        // Build query targets: (cluster, Option<namespace>) pairs
+        // For namespace IN (...), we create separate targets per (cluster, namespace) pair
+        // This enables parallel queries to each namespace across all clusters
+        let query_targets: Vec<QueryTarget> = match &namespace_filter {
+            NamespaceFilter::All => {
+                // Query all namespaces (cluster-wide) for each cluster
+                clusters
+                    .iter()
+                    .map(|c| QueryTarget {
+                        cluster: c.clone(),
+                        namespace: None,
+                    })
+                    .collect()
             }
-        }
+            NamespaceFilter::Single(ns) => {
+                // Query specific namespace for each cluster
+                clusters
+                    .iter()
+                    .map(|c| QueryTarget {
+                        cluster: c.clone(),
+                        namespace: Some(ns.clone()),
+                    })
+                    .collect()
+            }
+            NamespaceFilter::Multiple(namespaces) => {
+                // Query each (cluster, namespace) pair in parallel
+                // This creates C × N targets for C clusters and N namespaces
+                clusters
+                    .iter()
+                    .flat_map(|c| {
+                        namespaces.iter().map(move |ns| QueryTarget {
+                            cluster: c.clone(),
+                            namespace: Some(ns.clone()),
+                        })
+                    })
+                    .collect()
+            }
+        };
 
-        // Use the inferred schema from batches, or fall back to provider schema for empty results
-        let exec_schema = batch_schema.unwrap_or_else(|| self.schema.clone());
-
-        // If no data, create a single empty partition with the schema
-        if partitions.is_empty() {
-            let empty_batch = datafusion::arrow::array::RecordBatch::new_empty(exec_schema.clone());
-            partitions.push(vec![empty_batch]);
-        }
-
-        // Report query completion
-        pool.progress()
-            .query_complete(total_rows, fetch_elapsed.as_millis() as u64);
-
+        let num_targets = query_targets.len();
+        let num_clusters = clusters.len();
         info!(
             table = %self.resource_info.table_name,
             clusters = num_clusters,
-            partitions = partitions.len(),
-            total_rows = total_rows,
-            fetch_ms = fetch_elapsed.as_millis(),
-            "K8s API fetch complete"
+            targets = num_targets,
+            namespace_filter = ?namespace_filter,
+            labels = ?api_filters.label_selector,
+            "Creating lazy K8s execution plan"
         );
 
-        // Create MemorySourceConfig execution plan with multiple partitions
-        // DataFusion's executor will process partitions in parallel
-        // Use the batch schema which may have native struct types for spec/status
-        let plan = MemorySourceConfig::try_new_exec(&partitions, exec_schema, projection.cloned())?;
+        // Report query start for progress tracking
+        // Note: actual fetching happens lazily when DataFusion executes partitions
+        self.pool
+            .progress()
+            .start_query(&self.resource_info.table_name, num_targets);
 
-        Ok(plan)
+        // Create lazy execution plan - data will be fetched when partitions are executed
+        // Each partition corresponds to one QueryTarget (cluster, namespace pair)
+        // DataFusion controls parallelism via its thread pool
+        let plan = K8sExecutionPlan::new(
+            self.resource_info.table_name.clone(),
+            self.resource_info.clone(),
+            query_targets,
+            api_filters,
+            self.pool.clone(),
+            self.schema.clone(),
+        );
+
+        // Handle projection if specified
+        if let Some(proj) = projection {
+            // Create a ProjectionExec to handle column projection
+            use datafusion::physical_plan::projection::ProjectionExec;
+
+            let input_plan: Arc<dyn ExecutionPlan> = Arc::new(plan);
+            let projected_exprs: Result<Vec<_>> = proj
+                .iter()
+                .map(|&i| {
+                    let field = self.schema.field(i);
+                    let col =
+                        datafusion::physical_expr::expressions::col(field.name(), &self.schema)
+                            .map_err(|e| {
+                                datafusion::error::DataFusionError::Internal(format!(
+                                    "Column {} not found in schema: {}",
+                                    field.name(),
+                                    e
+                                ))
+                            })?;
+                    Ok((col, field.name().to_string()))
+                })
+                .collect();
+
+            let projection_plan = ProjectionExec::try_new(projected_exprs?, input_plan)?;
+            Ok(Arc::new(projection_plan))
+        } else {
+            Ok(Arc::new(plan))
+        }
     }
 }

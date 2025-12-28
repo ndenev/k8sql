@@ -23,6 +23,18 @@ Performance is our second priority - still very important.
 - Efficient data structures and algorithms
 - But never sacrifice correctness for performance
 
+## Git Commits
+
+- Do NOT add Claude attributions to commit messages (no "Generated with Claude Code", no "Co-Authored-By: Claude")
+- Write clear, conventional commit messages focusing on what changed and why
+- Always run `cargo fmt` before committing
+- Always verify with `cargo clippy` for lint issues before committing
+
+## Code Navigation
+
+- Use the Serena MCP with rust-analyzer for code navigation and symbol lookup
+- Prefer symbolic tools (find_symbol, find_referencing_symbols, get_symbols_overview) over grep for Rust code
+
 ## Project Overview
 
 k8sql exposes the Kubernetes API as a SQL-compatible database using Apache DataFusion as the query engine. kubectl contexts are treated as databases (switchable with `USE cluster1;`) and Kubernetes resources are exposed as tables. The `_cluster` column is part of every table's primary key, enabling cross-cluster queries.

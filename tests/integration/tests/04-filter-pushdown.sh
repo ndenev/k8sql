@@ -45,4 +45,35 @@ assert_contains "Service spec field" "k3d-k8sql-test-1" \
 assert_success "Deployment status field" "k3d-k8sql-test-1" \
     "SELECT name, status FROM deployments WHERE name = 'test-app' AND namespace = 'default'"
 
+# Namespace IN list - parallel queries to multiple namespaces
+echo ""
+echo "=== Namespace IN Parallel Query Tests ==="
+
+# Query pods from multiple namespaces using IN list
+assert_success "Namespace IN list query succeeds" "k3d-k8sql-test-1" \
+    "SELECT name, namespace FROM pods WHERE namespace IN ('default', 'kube-system')"
+
+# Namespace IN should return pods from both namespaces
+assert_contains "Namespace IN returns default pods" "k3d-k8sql-test-1" \
+    "SELECT name, namespace FROM pods WHERE namespace IN ('default', 'kube-system')" "default"
+
+assert_contains "Namespace IN returns kube-system pods" "k3d-k8sql-test-1" \
+    "SELECT name, namespace FROM pods WHERE namespace IN ('default', 'kube-system')" "kube-system"
+
+# Namespace IN with non-overlapping namespaces
+assert_contains "Namespace IN default and test-ns" "k3d-k8sql-test-1" \
+    "SELECT DISTINCT namespace FROM pods WHERE namespace IN ('default', 'test-ns')" "default"
+
+# Namespace IN combined with other filters
+assert_success "Namespace IN combined with label filter" "k3d-k8sql-test-1" \
+    "SELECT name, namespace FROM pods WHERE namespace IN ('default', 'test-ns') AND labels->>'app' = 'nginx'"
+
+# Namespace IN across clusters - should work with _cluster = '*'
+assert_success "Namespace IN across all clusters" "k3d-k8sql-test-1" \
+    "SELECT name, namespace, _cluster FROM pods WHERE namespace IN ('default', 'kube-system') AND _cluster = '*' LIMIT 10"
+
+# Namespace IN with aggregation
+assert_success "Namespace IN with COUNT" "k3d-k8sql-test-1" \
+    "SELECT namespace, COUNT(*) as cnt FROM pods WHERE namespace IN ('default', 'kube-system') GROUP BY namespace"
+
 print_summary
