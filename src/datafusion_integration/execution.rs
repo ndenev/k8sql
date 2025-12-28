@@ -6,6 +6,27 @@
 //! This module provides a DataFusion ExecutionPlan that fetches data lazily,
 //! allowing DataFusion to control parallelism and enabling streaming execution.
 //! Results are streamed as pages arrive from the K8s API for optimal memory usage.
+//!
+//! # LIMIT Behavior with Multiple Partitions
+//!
+//! When querying multiple clusters/namespaces (multiple partitions) with a LIMIT:
+//!
+//! - Each partition independently applies the limit as an optimization hint
+//! - For `SELECT * FROM pods WHERE _cluster = '*' LIMIT 10` across 3 clusters:
+//!   - Partition 0 (cluster1): fetches up to 10 rows
+//!   - Partition 1 (cluster2): fetches up to 10 rows
+//!   - Partition 2 (cluster3): fetches up to 10 rows
+//!   - K8sExec returns up to 30 rows total
+//!   - DataFusion's LimitExec (above K8sExec) then takes the first 10
+//!
+//! This is the expected behavior for partitioned scans with limit pushdown.
+//! We cannot know which partition will provide the "first" N rows until
+//! execution, so each partition optimistically fetches up to N rows.
+//! The final LIMIT is always correctly enforced by DataFusion's LimitExec.
+//!
+//! The benefit: instead of fetching ALL rows from all partitions, we fetch
+//! at most `limit * num_partitions` rows, which is still a significant
+//! reduction for large result sets.
 
 use std::any::Any;
 use std::fmt;

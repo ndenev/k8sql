@@ -56,4 +56,20 @@ assert_not_contains "NOT IN excludes cluster 2" "k3d-k8sql-test-1" \
     "SELECT DISTINCT _cluster FROM pods WHERE _cluster NOT IN ('k3d-k8sql-test-2') AND namespace = 'default'" \
     "k3d-k8sql-test-2"
 
+echo ""
+echo "=== Multi-Cluster LIMIT Tests ==="
+
+# LIMIT across multiple clusters should return exactly the requested number of rows
+# This tests that DataFusion's LimitExec correctly limits the final result
+# even though each partition (cluster) may fetch up to LIMIT rows
+assert_row_count "Multi-cluster LIMIT 3" "k3d-k8sql-test-1" \
+    "SELECT name, _cluster FROM pods WHERE _cluster = '*' AND namespace = 'default' LIMIT 3" 3
+
+assert_row_count "Multi-cluster LIMIT 5" "k3d-k8sql-test-1" \
+    "SELECT name, _cluster FROM pods WHERE _cluster IN ('k3d-k8sql-test-1', 'k3d-k8sql-test-2') AND namespace = 'default' LIMIT 5" 5
+
+# LIMIT 1 should return exactly 1 row even with wildcard cluster
+assert_row_count "Multi-cluster LIMIT 1" "k3d-k8sql-test-1" \
+    "SELECT name FROM namespaces WHERE _cluster = '*' LIMIT 1" 1
+
 print_summary

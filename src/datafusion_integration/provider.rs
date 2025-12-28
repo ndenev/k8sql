@@ -633,8 +633,8 @@ impl TableProvider for K8sTableProvider {
 mod tests {
     use super::*;
     use datafusion::common::Column;
-    use datafusion::logical_expr::expr::InList;
     use datafusion::logical_expr::BinaryExpr;
+    use datafusion::logical_expr::expr::InList;
     use k8s_openapi::apimachinery::pkg::apis::meta::v1::APIResource;
     use kube::discovery::{ApiCapabilities, ApiResource, Scope};
 
@@ -684,9 +684,7 @@ mod tests {
             )),
         });
 
-        let result = provider
-            .supports_filters_pushdown(&[&filter])
-            .unwrap();
+        let result = provider.supports_filters_pushdown(&[&filter]).unwrap();
 
         assert_eq!(result.len(), 1);
         assert!(matches!(result[0], TableProviderFilterPushDown::Exact));
@@ -704,9 +702,7 @@ mod tests {
             )),
         });
 
-        let result = provider
-            .supports_filters_pushdown(&[&filter])
-            .unwrap();
+        let result = provider.supports_filters_pushdown(&[&filter]).unwrap();
 
         assert_eq!(result.len(), 1);
         assert!(matches!(result[0], TableProviderFilterPushDown::Exact));
@@ -730,9 +726,7 @@ mod tests {
             negated: false,
         });
 
-        let result = provider
-            .supports_filters_pushdown(&[&filter])
-            .unwrap();
+        let result = provider.supports_filters_pushdown(&[&filter]).unwrap();
 
         assert_eq!(result.len(), 1);
         assert!(matches!(result[0], TableProviderFilterPushDown::Exact));
@@ -751,12 +745,13 @@ mod tests {
             )),
         });
 
-        let result = provider
-            .supports_filters_pushdown(&[&filter])
-            .unwrap();
+        let result = provider.supports_filters_pushdown(&[&filter]).unwrap();
 
         assert_eq!(result.len(), 1);
-        assert!(matches!(result[0], TableProviderFilterPushDown::Unsupported));
+        assert!(matches!(
+            result[0],
+            TableProviderFilterPushDown::Unsupported
+        ));
     }
 
     #[test]
@@ -772,12 +767,13 @@ mod tests {
             )),
         });
 
-        let result = provider
-            .supports_filters_pushdown(&[&filter])
-            .unwrap();
+        let result = provider.supports_filters_pushdown(&[&filter]).unwrap();
 
         assert_eq!(result.len(), 1);
-        assert!(matches!(result[0], TableProviderFilterPushDown::Unsupported));
+        assert!(matches!(
+            result[0],
+            TableProviderFilterPushDown::Unsupported
+        ));
     }
 
     #[test]
@@ -810,6 +806,9 @@ mod tests {
 
         assert_eq!(result.len(), 2);
         assert!(matches!(result[0], TableProviderFilterPushDown::Exact));
-        assert!(matches!(result[1], TableProviderFilterPushDown::Unsupported));
+        assert!(matches!(
+            result[1],
+            TableProviderFilterPushDown::Unsupported
+        ));
     }
 }
