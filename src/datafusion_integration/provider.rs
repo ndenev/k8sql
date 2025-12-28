@@ -585,14 +585,15 @@ impl TableProvider for K8sTableProvider {
                 .iter()
                 .map(|&i| {
                     let field = self.schema.field(i);
-                    let col = datafusion::physical_expr::expressions::col(field.name(), &self.schema)
-                        .map_err(|e| {
-                            datafusion::error::DataFusionError::Internal(format!(
-                                "Column {} not found in schema: {}",
-                                field.name(),
-                                e
-                            ))
-                        })?;
+                    let col =
+                        datafusion::physical_expr::expressions::col(field.name(), &self.schema)
+                            .map_err(|e| {
+                                datafusion::error::DataFusionError::Internal(format!(
+                                    "Column {} not found in schema: {}",
+                                    field.name(),
+                                    e
+                                ))
+                            })?;
                     Ok((col, field.name().to_string()))
                 })
                 .collect();

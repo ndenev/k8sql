@@ -100,7 +100,9 @@ impl fmt::Debug for K8sExecutionPlan {
 impl DisplayAs for K8sExecutionPlan {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match t {
-            DisplayFormatType::Default | DisplayFormatType::Verbose | DisplayFormatType::TreeRender => {
+            DisplayFormatType::Default
+            | DisplayFormatType::Verbose
+            | DisplayFormatType::TreeRender => {
                 write!(
                     f,
                     "K8sExec: table={}, partitions={}",
