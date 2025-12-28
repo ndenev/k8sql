@@ -126,12 +126,52 @@ async fn main() -> Result<()> {
 }
 
 async fn run_batch(args: &Args) -> Result<()> {
-    let pool = Arc::new(K8sClientPool::new(
-        args.context.as_deref(),
-        &args.namespace,
-    )?);
+    // Load saved contexts from config (same as REPL does)
+    let saved_contexts = config::Config::load()
+        .map(|c| c.selected_contexts)
+        .unwrap_or_default();
+
+    // Determine context spec: CLI arg takes priority, then saved config
+    // Note: We need to own the string for the lifetime of this function
+    let context_spec: Option<String> = args.context.clone().or_else(|| {
+        if saved_contexts.is_empty() {
+            None
+        } else {
+            // Join saved contexts into comma-separated spec
+            Some(saved_contexts.join(", "))
+        }
+    });
+
+    // Check if context spec contains patterns or multiple contexts
+    let is_multi_or_pattern = context_spec
+        .as_ref()
+        .map(|s| s.contains(',') || s.contains('*') || s.contains('?'))
+        .unwrap_or(false);
+
+    // Initialize with first real context from spec (or kubeconfig default)
+    // If spec contains patterns, use None and let switch_context handle it
+    let initial_context = if is_multi_or_pattern {
+        // For patterns/multi-context, start with kubeconfig default
+        // switch_context() will handle the actual context selection
+        None
+    } else {
+        context_spec.as_deref()
+    };
+
+    let pool = Arc::new(K8sClientPool::new(initial_context, &args.namespace)?);
     pool.initialize().await?;
-    let session = K8sSessionContext::new(Arc::clone(&pool)).await?;
+
+    // If context spec has multiple contexts or patterns, switch to all of them
+    if is_multi_or_pattern && let Some(ref spec) = context_spec {
+        pool.switch_context(spec, false).await?;
+    }
+
+    let mut session = K8sSessionContext::new(Arc::clone(&pool)).await?;
+
+    // Refresh tables if we switched to multiple contexts after initial setup
+    if is_multi_or_pattern {
+        session.refresh_tables().await?;
+    }
 
     let queries = if let Some(query) = &args.query {
         vec![query.clone()]
