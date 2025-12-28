@@ -46,4 +46,14 @@ assert_contains "IN list returns cluster 2 pods" "k3d-k8sql-test-1" \
 assert_contains "_cluster column in output" "k3d-k8sql-test-1" \
     "SELECT _cluster, name FROM pods WHERE namespace = 'default' LIMIT 1" "k3d-k8sql-test-1"
 
+# NOT IN tests - verify exclusion works correctly
+# NOT IN should query all clusters EXCEPT the excluded ones
+assert_contains "NOT IN returns cluster 1" "k3d-k8sql-test-1" \
+    "SELECT DISTINCT _cluster FROM pods WHERE _cluster NOT IN ('k3d-k8sql-test-2') AND namespace = 'default'" \
+    "k3d-k8sql-test-1"
+
+assert_not_contains "NOT IN excludes cluster 2" "k3d-k8sql-test-1" \
+    "SELECT DISTINCT _cluster FROM pods WHERE _cluster NOT IN ('k3d-k8sql-test-2') AND namespace = 'default'" \
+    "k3d-k8sql-test-2"
+
 print_summary
