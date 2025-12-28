@@ -23,6 +23,11 @@ Performance is our second priority - still very important.
 - Efficient data structures and algorithms
 - But never sacrifice correctness for performance
 
+## Git Commits
+
+- Do NOT add Claude attributions to commit messages (no "Generated with Claude Code", no "Co-Authored-By: Claude")
+- Write clear, conventional commit messages focusing on what changed and why
+
 ## Project Overview
 
 k8sql exposes the Kubernetes API as a SQL-compatible database using Apache DataFusion as the query engine. kubectl contexts are treated as databases (switchable with `USE cluster1;`) and Kubernetes resources are exposed as tables. The `_cluster` column is part of every table's primary key, enabling cross-cluster queries.
