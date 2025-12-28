@@ -420,6 +420,16 @@ impl TableProvider for K8sTableProvider {
                     return TableProviderFilterPushDown::Exact;
                 }
                 if let Expr::BinaryExpr(binary) = f {
+                    // Check for OR chains: (_cluster = 'a') OR (_cluster = 'b')
+                    // DataFusion rewrites IN lists to OR chains before calling us
+                    if binary.op == Operator::Or {
+                        let mut clusters = Vec::new();
+                        if self.collect_cluster_values_from_or(f, &mut clusters)
+                            && !clusters.is_empty()
+                        {
+                            return TableProviderFilterPushDown::Exact;
+                        }
+                    }
                     // Check for column-based filters (namespace, _cluster)
                     if let Expr::Column(col) = binary.left.as_ref()
                         && (col.name == "namespace" || col.name == "_cluster")

@@ -72,7 +72,7 @@ assert_row_count "Multi-cluster LIMIT 3" "k3d-k8sql-test-1" \
 
 # Test LIMIT larger than per-cluster count but smaller than total
 assert_row_count "Multi-cluster LIMIT 8" "k3d-k8sql-test-1" \
-    "SELECT name, _cluster FROM configmaps WHERE _cluster = '*' AND namespace = 'default' AND labels->>'type' = 'limit-test' LIMIT 8" 8
+    "SELECT name, _cluster FROM configmaps WHERE _cluster IN ('k3d-k8sql-test-1', 'k3d-k8sql-test-2') AND namespace = 'default' AND labels->>'type' = 'limit-test' LIMIT 8" 8
 
 # LIMIT 1 should return exactly 1 row even with wildcard cluster
 assert_row_count "Multi-cluster LIMIT 1" "k3d-k8sql-test-1" \
