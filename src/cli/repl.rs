@@ -1112,9 +1112,6 @@ pub async fn run_repl(mut session: K8sSessionContext, pool: Arc<K8sClientPool>) 
                                         done, total, cluster, rows
                                     ));
                                 }
-                                Ok(ProgressUpdate::QueryComplete { total_rows, elapsed_ms: _ }) => {
-                                    spinner.set_message(format!("Processing {} rows...", total_rows));
-                                }
                                 // Connection/discovery events - shouldn't happen during query
                                 Ok(ProgressUpdate::Connecting { .. })
                                 | Ok(ProgressUpdate::Connected { .. })

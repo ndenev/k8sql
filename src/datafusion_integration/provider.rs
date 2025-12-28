@@ -5,29 +5,23 @@
 
 use std::any::Any;
 use std::sync::Arc;
-use std::time::Instant;
 
 use async_trait::async_trait;
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::catalog::Session;
-use datafusion::datasource::memory::MemorySourceConfig;
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::error::Result;
 use datafusion::logical_expr::{Operator, TableProviderFilterPushDown};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::Expr;
-use futures::stream::{self, StreamExt};
-use tracing::{debug, info, warn};
-
-/// Maximum number of clusters to query concurrently
-/// Higher values improve performance but increase local resource usage (connections, memory)
-const MAX_CONCURRENT_CLUSTERS: usize = 15;
+use tracing::{debug, info};
 
 use crate::kubernetes::ApiFilters;
 use crate::kubernetes::K8sClientPool;
 use crate::kubernetes::discovery::{ResourceInfo, generate_schema};
 
-use super::convert::{json_to_record_batch, to_arrow_schema};
+use super::convert::to_arrow_schema;
+use super::execution::{K8sExecutionPlan, QueryTarget};
 
 /// Extract string literals from an IN list expression
 fn extract_string_literals(in_list: &datafusion::logical_expr::expr::InList) -> Vec<String> {
@@ -516,16 +510,25 @@ impl TableProvider for K8sTableProvider {
         // Build query targets: (cluster, Option<namespace>) pairs
         // For namespace IN (...), we create separate targets per (cluster, namespace) pair
         // This enables parallel queries to each namespace across all clusters
-        let query_targets: Vec<(String, Option<String>)> = match &namespace_filter {
+        let query_targets: Vec<QueryTarget> = match &namespace_filter {
             NamespaceFilter::All => {
                 // Query all namespaces (cluster-wide) for each cluster
-                clusters.iter().map(|c| (c.clone(), None)).collect()
+                clusters
+                    .iter()
+                    .map(|c| QueryTarget {
+                        cluster: c.clone(),
+                        namespace: None,
+                    })
+                    .collect()
             }
             NamespaceFilter::Single(ns) => {
                 // Query specific namespace for each cluster
                 clusters
                     .iter()
-                    .map(|c| (c.clone(), Some(ns.clone())))
+                    .map(|c| QueryTarget {
+                        cluster: c.clone(),
+                        namespace: Some(ns.clone()),
+                    })
                     .collect()
             }
             NamespaceFilter::Multiple(namespaces) => {
@@ -534,140 +537,70 @@ impl TableProvider for K8sTableProvider {
                 clusters
                     .iter()
                     .flat_map(|c| {
-                        namespaces
-                            .iter()
-                            .map(move |ns| (c.clone(), Some(ns.clone())))
+                        namespaces.iter().map(move |ns| QueryTarget {
+                            cluster: c.clone(),
+                            namespace: Some(ns.clone()),
+                        })
                     })
                     .collect()
             }
         };
 
-        // Fetch data from all targets IN PARALLEL
-        // Each target becomes a separate partition for DataFusion to process
-        let table_name = self.resource_info.table_name.clone();
-        let resource_info = self.resource_info.clone();
-        let pool = self.pool.clone();
-
         let num_targets = query_targets.len();
         let num_clusters = clusters.len();
-        info!(
-            table = %table_name,
-            clusters = num_clusters,
-            targets = num_targets,
-            namespace_filter = ?namespace_filter,
-            labels = ?api_filters.label_selector,
-            "Fetching resources from K8s API"
-        );
-
-        let fetch_start = Instant::now();
-
-        // Report query start (using targets count for accurate progress)
-        pool.progress().start_query(&table_name, num_targets);
-
-        // Execute queries with concurrency limit to avoid overwhelming APIs
-        // Each target is a (cluster, namespace) pair
-        let results: Vec<_> = stream::iter(query_targets.into_iter())
-            .map(|(cluster, namespace)| {
-                let pool = pool.clone();
-                let table_name = table_name.clone();
-                let api_filters = api_filters.clone();
-
-                async move {
-                    let start = Instant::now();
-                    let resources = match pool
-                        .fetch_resources(
-                            &table_name,
-                            namespace.as_deref(),
-                            Some(&cluster),
-                            &api_filters,
-                        )
-                        .await
-                    {
-                        Ok(r) => r,
-                        Err(e) => {
-                            warn!(
-                                cluster = %cluster,
-                                namespace = ?namespace,
-                                table = %table_name,
-                                error = %e,
-                                "Failed to fetch resources from cluster"
-                            );
-                            Vec::new()
-                        }
-                    };
-                    let elapsed = start.elapsed();
-                    let row_count = resources.len();
-                    debug!(
-                        cluster = %cluster,
-                        namespace = ?namespace,
-                        table = %table_name,
-                        rows = row_count,
-                        elapsed_ms = elapsed.as_millis(),
-                        "Fetched from target"
-                    );
-                    // Report target completion
-                    pool.progress().cluster_complete(
-                        &cluster,
-                        row_count,
-                        elapsed.as_millis() as u64,
-                    );
-                    (cluster, resources)
-                }
-            })
-            // Limit concurrent requests to avoid overwhelming K8s APIs
-            .buffer_unordered(MAX_CONCURRENT_CLUSTERS)
-            .collect()
-            .await;
-        let fetch_elapsed = fetch_start.elapsed();
-
-        // Convert results to partitions - one partition per target (cluster, namespace)
-        // This allows DataFusion to process all targets in parallel
-        let mut partitions: Vec<Vec<datafusion::arrow::array::RecordBatch>> = Vec::new();
-        let mut total_rows = 0usize;
-        let mut batch_schema: Option<SchemaRef> = None;
-
-        for (cluster, resources) in results {
-            let row_count = resources.len();
-            total_rows += row_count;
-            if !resources.is_empty() {
-                let batch = json_to_record_batch(&cluster, &resource_info, resources)?;
-                // Capture the schema from the first non-empty batch
-                if batch_schema.is_none() {
-                    batch_schema = Some(batch.schema());
-                }
-                // Each target's data is its own partition
-                partitions.push(vec![batch]);
-            }
-        }
-
-        // Use the inferred schema from batches, or fall back to provider schema for empty results
-        let exec_schema = batch_schema.unwrap_or_else(|| self.schema.clone());
-
-        // If no data, create a single empty partition with the schema
-        if partitions.is_empty() {
-            let empty_batch = datafusion::arrow::array::RecordBatch::new_empty(exec_schema.clone());
-            partitions.push(vec![empty_batch]);
-        }
-
-        // Report query completion
-        pool.progress()
-            .query_complete(total_rows, fetch_elapsed.as_millis() as u64);
-
         info!(
             table = %self.resource_info.table_name,
             clusters = num_clusters,
             targets = num_targets,
-            partitions = partitions.len(),
-            total_rows = total_rows,
-            fetch_ms = fetch_elapsed.as_millis(),
-            "K8s API fetch complete"
+            namespace_filter = ?namespace_filter,
+            labels = ?api_filters.label_selector,
+            "Creating lazy K8s execution plan"
         );
 
-        // Create MemorySourceConfig execution plan with multiple partitions
-        // DataFusion's executor will process partitions in parallel
-        // Use the batch schema which may have native struct types for spec/status
-        let plan = MemorySourceConfig::try_new_exec(&partitions, exec_schema, projection.cloned())?;
+        // Report query start for progress tracking
+        // Note: actual fetching happens lazily when DataFusion executes partitions
+        self.pool
+            .progress()
+            .start_query(&self.resource_info.table_name, num_targets);
 
-        Ok(plan)
+        // Create lazy execution plan - data will be fetched when partitions are executed
+        // Each partition corresponds to one QueryTarget (cluster, namespace pair)
+        // DataFusion controls parallelism via its thread pool
+        let plan = K8sExecutionPlan::new(
+            self.resource_info.table_name.clone(),
+            self.resource_info.clone(),
+            query_targets,
+            api_filters,
+            self.pool.clone(),
+            self.schema.clone(),
+        );
+
+        // Handle projection if specified
+        if let Some(proj) = projection {
+            // Create a ProjectionExec to handle column projection
+            use datafusion::physical_plan::projection::ProjectionExec;
+
+            let input_plan: Arc<dyn ExecutionPlan> = Arc::new(plan);
+            let projected_exprs: Result<Vec<_>> = proj
+                .iter()
+                .map(|&i| {
+                    let field = self.schema.field(i);
+                    let col = datafusion::physical_expr::expressions::col(field.name(), &self.schema)
+                        .map_err(|e| {
+                            datafusion::error::DataFusionError::Internal(format!(
+                                "Column {} not found in schema: {}",
+                                field.name(),
+                                e
+                            ))
+                        })?;
+                    Ok((col, field.name().to_string()))
+                })
+                .collect();
+
+            let projection_plan = ProjectionExec::try_new(projected_exprs?, input_plan)?;
+            Ok(Arc::new(projection_plan))
+        } else {
+            Ok(Arc::new(plan))
+        }
     }
 }
