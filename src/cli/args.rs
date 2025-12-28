@@ -15,7 +15,8 @@ pub struct Args {
     pub query: Option<String>,
 
     /// Kubernetes context(s) to use. Supports comma-separated list and glob patterns.
-    /// Examples: -c prod, -c "prod,staging", -c "prod-*"
+    /// Examples: -c prod, -c 'prod,staging', -c 'prod-*', -c '*'
+    /// Note: Use quotes for patterns with wildcards or commas.
     #[arg(short, long, value_name = "CONTEXT")]
     pub context: Option<String>,
 

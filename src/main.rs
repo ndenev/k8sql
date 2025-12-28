@@ -129,7 +129,10 @@ async fn run_batch(args: &Args) -> Result<()> {
     // Load saved contexts from config (same as REPL does)
     let saved_contexts = config::Config::load()
         .map(|c| c.selected_contexts)
-        .unwrap_or_default();
+        .unwrap_or_else(|e| {
+            tracing::debug!("Could not load saved contexts: {}", e);
+            vec![]
+        });
 
     // Determine context spec: CLI arg takes priority, then saved config
     // Note: We need to own the string for the lifetime of this function
