@@ -214,7 +214,9 @@ impl K8sClientPool {
         pool.initialize().await?;
 
         // If context spec has multiple contexts or patterns, switch to all of them
-        if is_multi_or_pattern_spec(context_spec) && let Some(spec) = context_spec {
+        if is_multi_or_pattern_spec(context_spec)
+            && let Some(spec) = context_spec
+        {
             pool.switch_context(spec, false).await?;
         }
 

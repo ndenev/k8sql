@@ -262,7 +262,9 @@ async fn run_interactive(args: &Args) -> Result<()> {
     let mut session = session_result?;
 
     // If multi-context or pattern, switch to all matching contexts
-    if is_multi_or_pattern_spec(context_spec.as_deref()) && let Some(ref spec) = context_spec {
+    if is_multi_or_pattern_spec(context_spec.as_deref())
+        && let Some(ref spec) = context_spec
+    {
         // Create a new spinner for the multi-context switch
         let spinner = create_spinner("Restoring saved contexts...");
         let mut progress_rx = pool.progress().subscribe();
