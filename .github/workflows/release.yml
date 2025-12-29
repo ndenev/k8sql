@@ -89,15 +89,23 @@ jobs:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
             name: k8sql-linux-x86_64
+            cross: false
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            name: k8sql-linux-aarch64
+            cross: true
           - target: x86_64-apple-darwin
             os: macos-latest
             name: k8sql-macos-x86_64
+            cross: false
           - target: aarch64-apple-darwin
             os: macos-latest
             name: k8sql-macos-aarch64
+            cross: false
           - target: x86_64-pc-windows-msvc
             os: windows-latest
             name: k8sql-windows-x86_64.exe
+            cross: false
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -110,7 +118,20 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Build
+      - name: Install cross-compilation tools (Linux ARM64)
+        if: matrix.cross && matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: Build (native)
+        if: ${{ !matrix.cross }}
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Build (cross-compile Linux ARM64)
+        if: matrix.cross && matrix.target == 'aarch64-unknown-linux-gnu'
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
         run: cargo build --release --target ${{ matrix.target }}
 
       - name: Rename binary (Unix)
