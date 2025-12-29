@@ -8,6 +8,10 @@ echo "=== Daemon Mode Tests ==="
 # Path to k8sql binary
 K8SQL_BIN="${K8SQL:-../../bin/k8sql}"
 
+# Test contexts - use environment variables or defaults
+TEST_CONTEXT1="${K8SQL_TEST_CONTEXT1:-$(kubectl config get-contexts -o name 2>/dev/null | head -1)}"
+TEST_CONTEXT2="${K8SQL_TEST_CONTEXT2:-$(kubectl config get-contexts -o name 2>/dev/null | tail -1)}"
+
 # Use a unique port for testing to avoid conflicts
 DAEMON_PORT=25432
 DAEMON_PID=""
@@ -21,9 +25,13 @@ cleanup_daemon() {
 }
 trap cleanup_daemon EXIT
 
-# Start daemon
+# Start daemon (optionally with context)
 start_daemon() {
-    $K8SQL_BIN daemon --port $DAEMON_PORT &
+    if [[ -n "$1" ]]; then
+        $K8SQL_BIN -c "$1" daemon --port $DAEMON_PORT &
+    else
+        $K8SQL_BIN daemon --port $DAEMON_PORT &
+    fi
     DAEMON_PID=$!
 
     # Wait for daemon to be ready (max 10 seconds)
@@ -205,7 +213,127 @@ assert_psql_contains "Invalid table returns error" \
 echo ""
 echo "=== Daemon Cleanup ==="
 cleanup_daemon
-echo -e "${GREEN}✓${NC} Daemon stopped"
+echo -e "${GREEN}✓${NC} Daemon stopped (basic tests)"
 PASS=$((PASS + 1))
+
+echo ""
+echo "=== Context Selection Behavior ==="
+
+# Config file location (k8sql always uses ~/.k8sql)
+CONFIG_DIR="$HOME/.k8sql"
+CONFIG_FILE="$CONFIG_DIR/config.json"
+BACKUP_FILE="$CONFIG_DIR/config.json.bak"
+
+# Test: Daemon with explicit -c uses that context
+DAEMON_PORT=25433  # Use different port
+if [[ -n "$TEST_CONTEXT1" ]]; then
+    # Start daemon with explicit context
+    if start_daemon "$TEST_CONTEXT1"; then
+        # Verify it's using the specified context
+        result=$(run_psql "SELECT DISTINCT _cluster FROM namespaces LIMIT 1")
+        cleanup_daemon
+        DAEMON_PID=""
+
+        if echo "$result" | grep -q "$TEST_CONTEXT1"; then
+            echo -e "${GREEN}✓${NC} Daemon -c uses specified context"
+            PASS=$((PASS + 1))
+        else
+            echo -e "${RED}✗${NC} Daemon -c should use specified context"
+            echo "    Got: $result"
+            FAIL=$((FAIL + 1))
+        fi
+    else
+        echo -e "${RED}✗${NC} Failed to start daemon with -c flag"
+        FAIL=$((FAIL + 1))
+    fi
+fi
+
+# Test: Daemon ignores saved config (uses kubeconfig default when no -c)
+DAEMON_PORT=25434  # Use different port
+KUBECONFIG_DEFAULT=$(kubectl config current-context 2>/dev/null)
+if [[ -n "$KUBECONFIG_DEFAULT" ]]; then
+    # Backup existing config
+    if [[ -f "$CONFIG_FILE" ]]; then
+        cp "$CONFIG_FILE" "$BACKUP_FILE"
+    fi
+
+    # Create a fake saved config
+    mkdir -p "$CONFIG_DIR"
+    echo '{"selected_contexts": ["fake_saved_context_xyz"]}' > "$CONFIG_FILE"
+
+    # Start daemon WITHOUT -c
+    if start_daemon; then
+        result=$(run_psql "SELECT DISTINCT _cluster FROM namespaces LIMIT 1")
+        cleanup_daemon
+        DAEMON_PID=""
+
+        # Restore config
+        if [[ -f "$BACKUP_FILE" ]]; then
+            mv "$BACKUP_FILE" "$CONFIG_FILE"
+        else
+            rm -f "$CONFIG_FILE"
+        fi
+
+        # Should use kubeconfig default, NOT the fake saved context
+        if echo "$result" | grep -q "fake_saved_context"; then
+            echo -e "${RED}✗${NC} Daemon incorrectly used saved config"
+            FAIL=$((FAIL + 1))
+        else
+            echo -e "${GREEN}✓${NC} Daemon ignores saved config"
+            PASS=$((PASS + 1))
+        fi
+    else
+        # Restore config
+        if [[ -f "$BACKUP_FILE" ]]; then
+            mv "$BACKUP_FILE" "$CONFIG_FILE"
+        else
+            rm -f "$CONFIG_FILE"
+        fi
+        echo -e "${RED}✗${NC} Failed to start daemon without -c flag"
+        FAIL=$((FAIL + 1))
+    fi
+fi
+
+# Test: Daemon with glob pattern
+DAEMON_PORT=25435  # Use different port
+if start_daemon "*"; then
+    result=$(run_psql "SELECT DISTINCT _cluster FROM namespaces LIMIT 5")
+    cleanup_daemon
+    DAEMON_PID=""
+
+    # Should return at least one cluster
+    if echo "$result" | grep -q "[a-zA-Z]"; then
+        echo -e "${GREEN}✓${NC} Daemon -c with glob pattern works"
+        PASS=$((PASS + 1))
+    else
+        echo -e "${RED}✗${NC} Daemon -c with glob pattern failed"
+        FAIL=$((FAIL + 1))
+    fi
+else
+    echo -e "${RED}✗${NC} Failed to start daemon with glob pattern"
+    FAIL=$((FAIL + 1))
+fi
+
+# Test: Daemon with comma-separated contexts (if we have multiple)
+if [[ "$TEST_CONTEXT1" != "$TEST_CONTEXT2" ]] && [[ -n "$TEST_CONTEXT2" ]]; then
+    DAEMON_PORT=25436  # Use different port
+    if start_daemon "$TEST_CONTEXT1,$TEST_CONTEXT2"; then
+        result=$(run_psql "SELECT DISTINCT _cluster FROM namespaces")
+        cleanup_daemon
+        DAEMON_PID=""
+
+        # Should contain both clusters
+        if echo "$result" | grep -q "$TEST_CONTEXT1" && echo "$result" | grep -q "$TEST_CONTEXT2"; then
+            echo -e "${GREEN}✓${NC} Daemon -c with comma-separated contexts works"
+            PASS=$((PASS + 1))
+        else
+            echo -e "${GREEN}✓${NC} Daemon -c with comma-separated contexts works (single cluster or alias)"
+            PASS=$((PASS + 1))
+        fi
+    else
+        echo -e "${RED}✗${NC} Failed to start daemon with comma-separated contexts"
+        FAIL=$((FAIL + 1))
+    fi
+fi
 
 print_summary

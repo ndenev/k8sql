@@ -35,16 +35,11 @@ impl K8sSessionContext {
 
     /// Create and configure a SessionContext with all K8s tables registered
     async fn create_session_context(pool: &Arc<K8sClientPool>) -> anyhow::Result<SessionContext> {
-        // Get the current Kubernetes context name for the catalog
-        let cluster_name = pool
-            .current_context()
-            .await
-            .unwrap_or_else(|_| "k8s".to_string());
-
-        // Enable information_schema and use cluster name as catalog
+        // Use "postgres" catalog and "public" schema for PostgreSQL client compatibility
+        // The _cluster column handles multi-cluster differentiation
         let config = SessionConfig::new()
             .with_information_schema(true)
-            .with_default_catalog_and_schema(&cluster_name, "default");
+            .with_default_catalog_and_schema("postgres", "public");
         let mut ctx = SessionContext::new_with_config(config);
 
         // Register JSON functions for querying spec/status fields

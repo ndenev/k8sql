@@ -108,7 +108,7 @@ async fn main() -> Result<()> {
                 run_interactive(&args).await?;
             }
             Command::Daemon { port, bind } => {
-                let server = PgWireServer::new(*port, bind.clone());
+                let server = PgWireServer::new(*port, bind.clone(), args.context.clone());
                 server.run().await?;
             }
         }
@@ -126,54 +126,9 @@ async fn main() -> Result<()> {
 }
 
 async fn run_batch(args: &Args) -> Result<()> {
-    // Load saved contexts from config (same as REPL does)
-    let saved_contexts = config::Config::load()
-        .map(|c| c.selected_contexts)
-        .unwrap_or_else(|e| {
-            tracing::debug!("Could not load saved contexts: {}", e);
-            vec![]
-        });
-
-    // Determine context spec: CLI arg takes priority, then saved config
-    // Note: We need to own the string for the lifetime of this function
-    let context_spec: Option<String> = args.context.clone().or_else(|| {
-        if saved_contexts.is_empty() {
-            None
-        } else {
-            // Join saved contexts into comma-separated spec
-            Some(saved_contexts.join(", "))
-        }
-    });
-
-    // Check if context spec contains patterns or multiple contexts
-    let is_multi_or_pattern = context_spec
-        .as_ref()
-        .map(|s| s.contains(',') || s.contains('*') || s.contains('?'))
-        .unwrap_or(false);
-
-    // For initialization, extract the first concrete context name from the spec.
-    // This avoids connecting to an irrelevant default context when using patterns.
-    let initial_context = if is_multi_or_pattern {
-        // For multi-context or patterns, extract first non-pattern context if available
-        // e.g., "prod, staging" -> "prod", "prod-*" -> None (let switch_context handle it)
-        context_spec.as_ref().and_then(|s| {
-            s.split(',')
-                .map(str::trim)
-                .find(|c| !c.contains('*') && !c.contains('?'))
-        })
-    } else {
-        context_spec.as_deref()
-    };
-
-    let pool = Arc::new(K8sClientPool::new(initial_context, &args.namespace)?);
-    pool.initialize().await?;
-
-    // If context spec has multiple contexts or patterns, switch to all of them
-    if is_multi_or_pattern && let Some(ref spec) = context_spec {
-        pool.switch_context(spec, false).await?;
-    }
-
-    // Create session - this uses the updated current_contexts from switch_context()
+    // Batch mode: use --context if specified, otherwise kubeconfig default
+    // (does not use saved REPL config for predictability)
+    let pool = K8sClientPool::with_context_spec(args.context.as_deref()).await?;
     let session = K8sSessionContext::new(Arc::clone(&pool)).await?;
 
     let queries = if let Some(query) = &args.query {
@@ -229,12 +184,36 @@ async fn run_interactive(args: &Args) -> Result<()> {
     use indicatif::{ProgressBar, ProgressStyle};
     use progress::ProgressUpdate;
 
-    // Load saved config (for persistent context selection)
-    let saved_config = config::Config::load().ok();
-    let saved_contexts = saved_config
+    // Determine context spec:
+    // - If --context specified: use it (temporary override, not persisted)
+    // - If no --context: use saved config, or kubeconfig default
+    let (context_spec, using_saved) = if let Some(ref ctx) = args.context {
+        (Some(ctx.clone()), false)
+    } else {
+        let saved = config::Config::load()
+            .ok()
+            .map(|c| c.selected_contexts)
+            .filter(|v| !v.is_empty())
+            .map(|v| v.join(", "));
+        (saved.clone(), saved.is_some())
+    };
+
+    // Check if context spec contains patterns or multiple contexts
+    let is_multi_or_pattern = context_spec
         .as_ref()
-        .map(|c| c.selected_contexts.clone())
-        .unwrap_or_default();
+        .map(|s| s.contains(',') || s.contains('*') || s.contains('?'))
+        .unwrap_or(false);
+
+    // Extract first concrete context for initial connection
+    let initial_context = if is_multi_or_pattern {
+        context_spec.as_ref().and_then(|s| {
+            s.split(',')
+                .map(str::trim)
+                .find(|c| !c.contains('*') && !c.contains('?'))
+        })
+    } else {
+        context_spec.as_deref()
+    };
 
     // Create a spinner for startup with elapsed time
     let spinner = ProgressBar::new_spinner();
@@ -247,13 +226,8 @@ async fn run_interactive(args: &Args) -> Result<()> {
     spinner.set_message("Connecting to Kubernetes...");
     spinner.enable_steady_tick(std::time::Duration::from_millis(80));
 
-    // Create pool (fast, no I/O) and subscribe to progress BEFORE initialization
-    // If CLI specifies context, use that; otherwise use first saved context or default
-    let initial_context = args
-        .context
-        .as_deref()
-        .or_else(|| saved_contexts.first().map(|s| s.as_str()));
-    let pool = Arc::new(K8sClientPool::new(initial_context, &args.namespace)?);
+    // Create pool and subscribe to progress BEFORE initialization
+    let pool = Arc::new(K8sClientPool::new(initial_context)?);
     let mut progress_rx = pool.progress().subscribe();
 
     // Initialize pool and create session with progress updates
@@ -295,14 +269,16 @@ async fn run_interactive(args: &Args) -> Result<()> {
 
     let mut session = session_result?;
 
-    // If CLI didn't specify context and we have saved contexts with multiple entries,
-    // switch to all saved contexts now (we only initialized with the first one)
-    // Use force_refresh=false to leverage cache for fast startup
-    if args.context.is_none() && saved_contexts.len() > 1 {
-        let context_spec = saved_contexts.join(", ");
-        if let Err(e) = pool.switch_context(&context_spec, false).await {
-            // Non-fatal: just warn and continue with initial context
-            eprintln!("Warning: Could not restore saved contexts: {}", e);
+    // If multi-context or pattern, switch to all matching contexts
+    if is_multi_or_pattern && let Some(ref spec) = context_spec {
+        if let Err(e) = pool.switch_context(spec, false).await {
+            if using_saved {
+                // Non-fatal for saved config: warn and continue
+                eprintln!("Warning: Could not restore saved contexts: {}", e);
+            } else {
+                // Fatal for explicit --context
+                return Err(e);
+            }
         } else {
             // Refresh tables for multi-context
             let _ = session.refresh_tables().await;
