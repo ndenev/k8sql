@@ -32,9 +32,85 @@ const MAX_RETRIES: u32 = 3;
 /// Base delay for exponential backoff (doubles each retry)
 const RETRY_BASE_DELAY: Duration = Duration::from_millis(100);
 
+/// Check if a kube error is retryable (transient failures)
+pub fn is_retryable_error(err: &kube::Error) -> bool {
+    match err {
+        // Network/connection errors are retryable
+        kube::Error::HyperError(_) => true,
+        // API errors: retry on transient HTTP status codes
+        // 408 = Request Timeout, 429 = Rate Limit, 500 = Internal Server Error,
+        // 502 = Bad Gateway, 503 = Service Unavailable, 504 = Gateway Timeout
+        kube::Error::Api(api_err) => {
+            matches!(api_err.code, 408 | 429 | 500 | 502 | 503 | 504)
+        }
+        kube::Error::InferConfig(_) => false,
+        kube::Error::Discovery(_) => false,
+        _ => false,
+    }
+}
+
+/// Execute an async operation with retry logic for transient failures
+pub async fn with_retry<T, F, Fut>(operation_name: &str, f: F) -> Result<T>
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = Result<T, kube::Error>>,
+{
+    let mut last_error = None;
+
+    for attempt in 0..MAX_RETRIES {
+        match f().await {
+            Ok(result) => return Ok(result),
+            Err(e) => {
+                if is_retryable_error(&e) && attempt < MAX_RETRIES - 1 {
+                    let delay = RETRY_BASE_DELAY * 2u32.pow(attempt);
+                    warn!(
+                        "{} failed (attempt {}/{}): {}, retrying in {:?}",
+                        operation_name,
+                        attempt + 1,
+                        MAX_RETRIES,
+                        e,
+                        delay
+                    );
+                    tokio::time::sleep(delay).await;
+                    last_error = Some(e);
+                } else {
+                    return Err(e.into());
+                }
+            }
+        }
+    }
+
+    Err(anyhow!(
+        "{} failed after {} retries: {}",
+        operation_name,
+        MAX_RETRIES,
+        last_error.map(|e| e.to_string()).unwrap_or_default()
+    ))
+}
+
 /// Page size for paginated list requests
 /// Smaller pages reduce memory pressure and allow faster initial response
 const PAGE_SIZE: u32 = 500;
+
+/// Check if a context spec contains patterns (*, ?) or multiple contexts (comma-separated)
+pub fn is_multi_or_pattern_spec(spec: Option<&str>) -> bool {
+    spec.map(|s| s.contains(',') || s.contains('*') || s.contains('?'))
+        .unwrap_or(false)
+}
+
+/// Extract the first concrete (non-pattern) context from a spec
+/// Returns the spec itself if it's a single concrete context
+pub fn extract_initial_context(spec: Option<&str>) -> Option<&str> {
+    if is_multi_or_pattern_spec(spec) {
+        spec.and_then(|s| {
+            s.split(',')
+                .map(str::trim)
+                .find(|c| !c.contains('*') && !c.contains('?'))
+        })
+    } else {
+        spec
+    }
+}
 
 /// Cached registry with timestamp
 struct CachedRegistry {
@@ -132,28 +208,15 @@ impl K8sClientPool {
     /// Create and initialize a pool with a context spec that supports globs and comma-separated lists
     /// Examples: "prod", "prod-*", "prod,staging", "*", or None for current context
     pub async fn with_context_spec(context_spec: Option<&str>) -> Result<Arc<Self>> {
-        // Check if context spec contains patterns or multiple contexts
-        let is_multi_or_pattern = context_spec
-            .map(|s| s.contains(',') || s.contains('*') || s.contains('?'))
-            .unwrap_or(false);
-
-        // For initialization, extract the first concrete context name from the spec
-        // This avoids passing a pattern to new() which validates context names
-        let initial_context = if is_multi_or_pattern {
-            context_spec.and_then(|s| {
-                s.split(',')
-                    .map(str::trim)
-                    .find(|c| !c.contains('*') && !c.contains('?'))
-            })
-        } else {
-            context_spec
-        };
+        let initial_context = extract_initial_context(context_spec);
 
         let pool = Arc::new(Self::new(initial_context)?);
         pool.initialize().await?;
 
         // If context spec has multiple contexts or patterns, switch to all of them
-        if is_multi_or_pattern && let Some(spec) = context_spec {
+        if is_multi_or_pattern_spec(context_spec)
+            && let Some(spec) = context_spec
+        {
             pool.switch_context(spec, false).await?;
         }
 
@@ -170,12 +233,22 @@ impl K8sClientPool {
     ///    b. If fingerprint cache hit from another cluster, reuse it (2 API calls for fingerprint)
     ///    c. Otherwise, run parallel discovery and cache by fingerprint
     async fn discover_resources_for_context(&self, context: &str, force: bool) -> Result<()> {
+        let start = std::time::Instant::now();
+
         // Check if already in memory and not expired
         if !force {
             let registries = self.registries.read().await;
             if let Some(cached) = registries.get(context)
                 && !cached.is_expired()
             {
+                // Emit progress events for cached registry (consistent UX)
+                self.progress.discovering(context);
+                let table_count = cached.registry.list_tables().len();
+                self.progress.discovery_complete(
+                    context,
+                    table_count,
+                    start.elapsed().as_millis() as u64,
+                );
                 return Ok(());
             }
         }
@@ -185,7 +258,6 @@ impl K8sClientPool {
 
         // Report discovering
         self.progress.discovering(context);
-        let start = std::time::Instant::now();
 
         // Step 1: Build core registry (instant, no I/O)
         let mut registry = super::discovery::build_core_registry();
@@ -465,11 +537,18 @@ impl K8sClientPool {
 
     /// Get or create a client for the given context
     async fn get_or_create_client(&self, context: &str) -> Result<Client> {
+        // Always emit connecting event for progress indication
+        self.progress.connecting(context);
+        let start = std::time::Instant::now();
+
         // Check if we already have a client
         {
             let clients = self.clients.read().await;
             if let Some(client) = clients.get(context) {
                 self.cache_hits.fetch_add(1, Ordering::Relaxed);
+                // Emit connected event even for cached client
+                self.progress
+                    .connected(context, start.elapsed().as_millis() as u64);
                 return Ok(client.clone());
             }
         }
@@ -479,10 +558,6 @@ impl K8sClientPool {
         if !self.kubeconfig.contexts.iter().any(|c| c.name == context) {
             return Err(anyhow!("Context '{}' not found in kubeconfig", context));
         }
-
-        // Report connecting
-        self.progress.connecting(context);
-        let start = std::time::Instant::now();
 
         // Create new client with timeouts
         let mut config = Config::from_custom_kubeconfig(
@@ -711,7 +786,7 @@ impl K8sClientPool {
             match api.list(params).await {
                 Ok(list) => return Ok(list),
                 Err(e) => {
-                    if Self::is_retryable_error(&e) {
+                    if is_retryable_error(&e) {
                         let delay = RETRY_BASE_DELAY * 2u32.pow(attempt);
                         warn!(
                             table = %table,
@@ -742,22 +817,6 @@ impl K8sClientPool {
             MAX_RETRIES,
             last_error.map(|e| e.to_string()).unwrap_or_default()
         ))
-    }
-
-    /// Check if an error is retryable (transient failures)
-    fn is_retryable_error(err: &kube::Error) -> bool {
-        match err {
-            // Network/connection errors are retryable
-            kube::Error::HyperError(_) => true,
-            // API errors: retry on 429 (rate limit), 503 (unavailable), 504 (timeout)
-            kube::Error::Api(api_err) => {
-                matches!(api_err.code, 429 | 503 | 504)
-            }
-            // Timeout errors are retryable
-            kube::Error::InferConfig(_) => false,
-            kube::Error::Discovery(_) => false,
-            _ => false,
-        }
     }
 
     /// Build ListParams from API filters (label selectors, field selectors)

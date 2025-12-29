@@ -18,8 +18,14 @@ use std::time::{Duration, SystemTime};
 use super::discovery::{ColumnDataType, ColumnDef, ResourceInfo};
 use crate::config;
 
-/// Default cache TTL (24 hours)
-const DEFAULT_CACHE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+/// TTL for cluster groups list (1 hour)
+/// This determines how often we check which CRDs a cluster has
+const CLUSTER_GROUPS_TTL: Duration = Duration::from_secs(60 * 60);
+
+/// TTL for CRD schemas (indefinite)
+/// CRD schemas rarely change, so we cache them forever and only
+/// refresh on error or explicit --refresh-crds flag
+const SCHEMA_CACHE_TTL: Option<Duration> = None;
 
 /// Serializable version of ColumnDef for caching
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -236,19 +242,19 @@ pub fn group_cache_key(group: &str, version: &str) -> String {
 /// This enables efficient incremental updates:
 /// - If a cluster adds one new CRD, only that API group needs to be discovered
 /// - Common CRDs (cert-manager, istio, etc.) are shared across clusters
+///
+/// Caching strategy:
+/// - Cluster groups list: 1 hour TTL (detect new/removed CRDs)
+/// - CRD schemas: Indefinite (schemas rarely change, refresh via --refresh-crds)
 pub struct ResourceCache {
     base_dir: PathBuf,
-    ttl: Duration,
 }
 
 impl ResourceCache {
     /// Create a new cache manager
     pub fn new() -> Result<Self> {
         let base_dir = Self::default_cache_dir()?;
-        Ok(Self {
-            base_dir,
-            ttl: DEFAULT_CACHE_TTL,
-        })
+        Ok(Self { base_dir })
     }
 
     /// Get the default cache directory (~/.k8sql/cache/)
@@ -288,6 +294,7 @@ impl ResourceCache {
     }
 
     /// Load the list of API groups for a cluster (if cached and fresh)
+    /// Uses CLUSTER_GROUPS_TTL (1 hour) to detect new/removed CRDs
     pub fn load_cluster_groups(&self, cluster: &str) -> Option<Vec<(String, String)>> {
         let path = self.cluster_path(cluster);
         if !path.exists() {
@@ -297,7 +304,7 @@ impl ResourceCache {
         let content = std::fs::read_to_string(&path).ok()?;
         let cluster_groups: ClusterGroups = serde_json::from_str(&content).ok()?;
 
-        if cluster_groups.is_fresh(self.ttl) {
+        if cluster_groups.is_fresh(CLUSTER_GROUPS_TTL) {
             Some(cluster_groups.groups)
         } else {
             let _ = std::fs::remove_file(&path);
@@ -305,7 +312,9 @@ impl ResourceCache {
         }
     }
 
-    /// Load a single API group's resources (if cached and fresh)
+    /// Load a single API group's resources (cached indefinitely)
+    /// CRD schemas rarely change, so we cache them forever.
+    /// Use --refresh-crds or clear the cache to force a refresh.
     pub fn load_group(&self, group: &str, version: &str) -> Option<CachedGroup> {
         let path = self.group_path(group, version);
         if !path.exists() {
@@ -315,11 +324,18 @@ impl ResourceCache {
         let content = std::fs::read_to_string(&path).ok()?;
         let cached: CachedGroup = serde_json::from_str(&content).ok()?;
 
-        if cached.is_fresh(self.ttl) {
-            Some(cached)
-        } else {
-            let _ = std::fs::remove_file(&path);
-            None
+        // CRD schemas are cached indefinitely (SCHEMA_CACHE_TTL = None)
+        // Only refresh on error or explicit --refresh-crds flag
+        match SCHEMA_CACHE_TTL {
+            Some(ttl) => {
+                if cached.is_fresh(ttl) {
+                    Some(cached)
+                } else {
+                    let _ = std::fs::remove_file(&path);
+                    None
+                }
+            }
+            None => Some(cached), // Indefinite caching
         }
     }
 
@@ -396,6 +412,16 @@ impl ResourceCache {
         }
         Ok(())
     }
+
+    /// Clear all cached CRD schemas (groups directory)
+    /// Called when --refresh-crds flag is used
+    pub fn clear_groups(&self) -> Result<()> {
+        let groups_dir = self.groups_dir();
+        if groups_dir.exists() {
+            std::fs::remove_dir_all(&groups_dir)?;
+        }
+        Ok(())
+    }
 }
 
 impl Default for ResourceCache {
@@ -414,7 +440,6 @@ mod tests {
         let temp_dir = TempDir::new().expect("Failed to create temp dir");
         let cache = ResourceCache {
             base_dir: temp_dir.path().to_path_buf(),
-            ttl: DEFAULT_CACHE_TTL,
         };
         (cache, temp_dir)
     }

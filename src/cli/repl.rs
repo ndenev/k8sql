@@ -4,7 +4,6 @@
 use anyhow::Result;
 use comfy_table::{Cell, Color, ContentArrangement, Table, presets::UTF8_FULL_CONDENSED};
 use console::{Style, style};
-use indicatif::{ProgressBar, ProgressStyle};
 use rustyline::completion::{Completer, Pair};
 use rustyline::error::ReadlineError;
 use rustyline::highlight::{CmdKind, Highlighter};
@@ -696,18 +695,8 @@ impl Highlighter for SqlHelper {
     }
 }
 
-fn create_spinner(msg: &str) -> ProgressBar {
-    let pb = ProgressBar::new_spinner();
-    pb.set_style(
-        ProgressStyle::default_spinner()
-            .tick_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏")
-            .template("{spinner:.cyan} {msg} {elapsed:.dim}")
-            .unwrap(),
-    );
-    pb.set_message(msg.to_string());
-    pb.enable_steady_tick(std::time::Duration::from_millis(80));
-    pb
-}
+// Use shared spinner from progress module
+use crate::progress::create_spinner;
 
 fn format_table(result: &QueryResult) -> String {
     let mut table = Table::new();

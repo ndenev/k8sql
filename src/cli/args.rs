@@ -39,6 +39,12 @@ pub struct Args {
     /// Enable verbose logging
     #[arg(short, long)]
     pub verbose: bool,
+
+    /// Force refresh of CRD schema cache
+    /// By default, CRD schemas are cached indefinitely since they rarely change.
+    /// Use this flag to force a fresh discovery of all CRD schemas.
+    #[arg(long)]
+    pub refresh_crds: bool,
 }
 
 #[derive(Subcommand, Debug)]
