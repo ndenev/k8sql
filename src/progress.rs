@@ -6,9 +6,24 @@
 //! Provides a way for the K8s provider to report progress during queries,
 //! which the REPL can display to the user.
 
+use indicatif::{ProgressBar, ProgressStyle};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::broadcast;
+
+/// Create a spinner with consistent styling
+pub fn create_spinner(msg: &str) -> ProgressBar {
+    let pb = ProgressBar::new_spinner();
+    pb.set_style(
+        ProgressStyle::default_spinner()
+            .tick_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏")
+            .template("{spinner:.cyan} {msg} {elapsed:.dim}")
+            .unwrap(),
+    );
+    pb.set_message(msg.to_string());
+    pb.enable_steady_tick(std::time::Duration::from_millis(80));
+    pb
+}
 
 /// Progress update message
 #[derive(Clone, Debug)]

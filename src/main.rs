@@ -17,7 +17,7 @@ use tracing_subscriber::prelude::*;
 use cli::{Args, Command};
 use daemon::PgWireServer;
 use datafusion_integration::K8sSessionContext;
-use kubernetes::K8sClientPool;
+use kubernetes::{K8sClientPool, ResourceCache, extract_initial_context, is_multi_or_pattern_spec};
 
 /// Initialize logging with file output and optional stderr
 fn init_logging(verbose: bool, to_stderr: bool) {
@@ -126,6 +126,14 @@ async fn main() -> Result<()> {
 }
 
 async fn run_batch(args: &Args) -> Result<()> {
+    // If --refresh-crds flag is set, clear the CRD schema cache
+    if args.refresh_crds
+        && let Ok(cache) = ResourceCache::new()
+        && let Err(e) = cache.clear_groups()
+    {
+        eprintln!("Warning: Failed to clear CRD cache: {}", e);
+    }
+
     // Batch mode: use --context if specified, otherwise kubeconfig default
     // (does not use saved REPL config for predictability)
     let pool = K8sClientPool::with_context_spec(args.context.as_deref()).await?;
@@ -181,8 +189,15 @@ async fn run_batch(args: &Args) -> Result<()> {
 }
 
 async fn run_interactive(args: &Args) -> Result<()> {
-    use indicatif::{ProgressBar, ProgressStyle};
-    use progress::ProgressUpdate;
+    use progress::{ProgressUpdate, create_spinner};
+
+    // If --refresh-crds flag is set, clear the CRD schema cache
+    if args.refresh_crds
+        && let Ok(cache) = ResourceCache::new()
+        && let Err(e) = cache.clear_groups()
+    {
+        eprintln!("Warning: Failed to clear CRD cache: {}", e);
+    }
 
     // Determine context spec:
     // - If --context specified: use it (temporary override, not persisted)
@@ -198,33 +213,10 @@ async fn run_interactive(args: &Args) -> Result<()> {
         (saved.clone(), saved.is_some())
     };
 
-    // Check if context spec contains patterns or multiple contexts
-    let is_multi_or_pattern = context_spec
-        .as_ref()
-        .map(|s| s.contains(',') || s.contains('*') || s.contains('?'))
-        .unwrap_or(false);
-
-    // Extract first concrete context for initial connection
-    let initial_context = if is_multi_or_pattern {
-        context_spec.as_ref().and_then(|s| {
-            s.split(',')
-                .map(str::trim)
-                .find(|c| !c.contains('*') && !c.contains('?'))
-        })
-    } else {
-        context_spec.as_deref()
-    };
+    let initial_context = extract_initial_context(context_spec.as_deref());
 
     // Create a spinner for startup with elapsed time
-    let spinner = ProgressBar::new_spinner();
-    spinner.set_style(
-        ProgressStyle::default_spinner()
-            .tick_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏")
-            .template("{spinner:.cyan} {msg} {elapsed:.dim}")
-            .unwrap(),
-    );
-    spinner.set_message("Connecting to Kubernetes...");
-    spinner.enable_steady_tick(std::time::Duration::from_millis(80));
+    let spinner = create_spinner("Connecting to Kubernetes...");
 
     // Create pool and subscribe to progress BEFORE initialization
     let pool = Arc::new(K8sClientPool::new(initial_context)?);
@@ -270,8 +262,45 @@ async fn run_interactive(args: &Args) -> Result<()> {
     let mut session = session_result?;
 
     // If multi-context or pattern, switch to all matching contexts
-    if is_multi_or_pattern && let Some(ref spec) = context_spec {
-        if let Err(e) = pool.switch_context(spec, false).await {
+    if is_multi_or_pattern_spec(context_spec.as_deref()) && let Some(ref spec) = context_spec {
+        // Create a new spinner for the multi-context switch
+        let spinner = create_spinner("Restoring saved contexts...");
+        let mut progress_rx = pool.progress().subscribe();
+
+        // Run switch_context with progress updates
+        let switch_result = {
+            let pool = Arc::clone(&pool);
+            let spec = spec.clone();
+            let mut switch_handle =
+                Box::pin(async move { pool.switch_context(&spec, false).await });
+
+            loop {
+                tokio::select! {
+                    biased;
+                    progress = progress_rx.recv() => {
+                        match progress {
+                            Ok(ProgressUpdate::Connecting { cluster }) => {
+                                spinner.set_message(format!("Connecting to {}...", cluster));
+                            }
+                            Ok(ProgressUpdate::Discovering { cluster }) => {
+                                spinner.set_message(format!("Discovering resources on {}...", cluster));
+                            }
+                            Ok(ProgressUpdate::DiscoveryComplete { cluster, table_count, .. }) => {
+                                spinner.set_message(format!("{}: {} tables found", cluster, table_count));
+                            }
+                            _ => {}
+                        }
+                    }
+                    result = &mut switch_handle => {
+                        break result;
+                    }
+                }
+            }
+        };
+
+        spinner.finish_and_clear();
+
+        if let Err(e) = switch_result {
             if using_saved {
                 // Non-fatal for saved config: warn and continue
                 eprintln!("Warning: Could not restore saved contexts: {}", e);

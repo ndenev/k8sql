@@ -570,12 +570,14 @@ pub fn build_core_registry() -> ResourceRegistry {
     registry
 }
 
-/// Get CRD API groups only (single API call)
+/// Get CRD API groups only (single API call with retry)
 /// Returns (group_name, version) pairs for non-core groups only
 /// Core resources come from k8s-openapi at compile time, so we skip them
 pub async fn get_crd_api_groups(client: &Client) -> Result<Vec<(String, String)>> {
+    use super::client::with_retry;
+
     let t0 = std::time::Instant::now();
-    let api_group_list = client.list_api_groups().await?;
+    let api_group_list = with_retry("list_api_groups", || client.list_api_groups()).await?;
     tracing::debug!(
         "get_crd_api_groups: list_api_groups {:?} ({} groups)",
         t0.elapsed(),
@@ -599,12 +601,13 @@ pub async fn get_crd_api_groups(client: &Client) -> Result<Vec<(String, String)>
     Ok(api_groups)
 }
 
-/// Discover resources for specific API groups only (parallel)
+/// Discover resources for specific API groups only (parallel with retry)
 /// Returns a map of (group, version) -> Vec<ResourceInfo>
 pub async fn discover_groups(
     client: &Client,
     groups: &[(String, String)],
 ) -> Result<std::collections::HashMap<(String, String), Vec<ResourceInfo>>> {
+    use super::client::with_retry;
     use futures::future::join_all;
     use kube::discovery::oneshot;
 
@@ -618,7 +621,13 @@ pub async fn discover_groups(
             let ver = version.clone();
             async move {
                 let t = std::time::Instant::now();
-                let result = oneshot::group(&client, &group).await;
+                let op_name = format!("discover_group({})", &group);
+                let result = with_retry(&op_name, || {
+                    let client = client.clone();
+                    let group = group.clone();
+                    async move { oneshot::group(&client, &group).await }
+                })
+                .await;
                 ((group, ver), result, t.elapsed())
             }
         })

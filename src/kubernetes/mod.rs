@@ -2,7 +2,8 @@ mod cache;
 mod client;
 pub mod discovery;
 
-pub use client::K8sClientPool;
+pub use cache::ResourceCache;
+pub use client::{K8sClientPool, extract_initial_context, is_multi_or_pattern_spec};
 
 /// Parameters to push down to the Kubernetes API
 #[derive(Debug, Clone, Default)]

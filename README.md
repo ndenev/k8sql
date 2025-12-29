@@ -1,14 +1,22 @@
 # k8sql
 
-Query Kubernetes clusters using SQL. Powered by [Apache DataFusion](https://datafusion.apache.org/), k8sql exposes Kubernetes resources as database tables, kubectl contexts as databases, and includes a query planner that optimizes API calls.
+Query Kubernetes clusters using SQL. Powered by [Apache DataFusion](https://datafusion.apache.org/).
 
 ## Features
 
-- **SQL queries on Kubernetes resources** - SELECT, WHERE, ORDER BY, LIMIT
-- **Multi-cluster support** - Query across clusters using `_cluster` column
+- **SQL queries on Kubernetes resources** - SELECT, WHERE, ORDER BY, LIMIT, GROUP BY
+- **Multi-cluster support** - Query across clusters with `_cluster` column
 - **Query optimizer** - Pushes filters to K8s API (namespaces, labels)
 - **Multiple interfaces** - Interactive REPL, batch mode, PostgreSQL wire protocol
-- **Rich output formats** - Table, JSON, CSV, YAML
+- **CRD support** - Automatically discovers and caches Custom Resource Definitions
+
+## Installation
+
+```bash
+cargo install k8sql
+```
+
+Or download binaries from [GitHub Releases](https://github.com/ndenev/k8sql/releases).
 
 ## Quick Start
 
@@ -17,635 +25,161 @@ Query Kubernetes clusters using SQL. Powered by [Apache DataFusion](https://data
 k8sql
 
 # Single query
-k8sql -q "SELECT name, namespace, status->>'phase' as phase FROM pods"
+k8sql -q "SELECT name, namespace, status->>'phase' FROM pods"
+
+# Multi-cluster query
+k8sql -c "prod-*" -q "SELECT _cluster, name FROM pods WHERE status->>'phase' = 'Failed'"
 
 # Output as JSON
 k8sql -q "SELECT * FROM deployments" -o json
-
-# Use specific context
-k8sql -c prod-cluster -q "SELECT * FROM pods"
 ```
 
-## Installation
+## CLI Options
 
-```bash
-cargo install k8sql
+```
+-q, --query <SQL>       Execute a SQL query directly
+-c, --context <CTX>     Kubernetes context(s): name, comma-separated, or glob pattern
+-n, --namespace <NS>    Default namespace (default: "default")
+-o, --output <FMT>      Output format: table, json, csv, yaml (default: table)
+-f, --file <PATH>       Execute queries from a file
+    --no-headers        Omit column headers in output
+    --refresh-crds      Force refresh of cached CRD schemas
+-v, --verbose           Enable verbose logging
 ```
 
-Or build from source:
+### Subcommands
 
 ```bash
-git clone https://github.com/ndenev/k8sql
-cd k8sql
-cargo build --release
+k8sql interactive       # Start REPL (default)
+k8sql daemon -p 15432   # PostgreSQL wire protocol server
 ```
 
 ## SQL Extensions
 
 ### The `_cluster` Column
 
-Every table includes a virtual `_cluster` column as the first column, representing the kubectl context (cluster) each resource belongs to. This enables cross-cluster queries.
+Every table includes `_cluster` as the first column, enabling cross-cluster queries:
 
 ```sql
--- Query only the current context (default behavior)
-SELECT name, namespace FROM pods
-
--- Query a specific cluster
-SELECT * FROM pods WHERE _cluster = 'prod-cluster'
-
--- Query multiple specific clusters
-SELECT * FROM pods WHERE _cluster IN ('prod', 'staging')
-
--- Exclude problematic clusters
-SELECT * FROM pods WHERE _cluster NOT IN ('broken-cluster', 'dev-old')
-
--- Query ALL clusters in your kubeconfig
-SELECT * FROM pods WHERE _cluster = '*'
+SELECT * FROM pods WHERE _cluster = 'prod'           -- Specific cluster
+SELECT * FROM pods WHERE _cluster IN ('prod', 'dev') -- Multiple clusters
+SELECT * FROM pods WHERE _cluster = '*'              -- All clusters (parallel)
 ```
 
-The `'*'` wildcard is a special value that expands to all available kubectl contexts, executing parallel queries across all clusters.
+### JSON Field Access
 
-All cluster filters (`=`, `IN`, `NOT IN`) are pushed down to the query planner, so only the specified clusters are actually queried.
-
-### Querying Nested JSON Fields
-
-Kubernetes resources are exposed with `spec` and `status` as JSON columns. Query nested fields using either **PostgreSQL-style operators** or **function syntax**:
-
-#### PostgreSQL-Style Operators
+Access nested fields in `spec`, `status`, `labels`, `annotations` using PostgreSQL-style operators:
 
 ```sql
--- Extract as text with ->>
-SELECT name, status->>'phase' as phase FROM pods
-
--- Chain operators for nested access
-SELECT name, status->'nodeInfo'->>'kubeletVersion' as version FROM nodes
-
--- Filter on JSON fields
-SELECT name FROM pods WHERE status->>'phase' = 'Running'
-```
-
-#### Function Syntax
-
-```sql
--- Extract string values with json_get_str(column, key1, key2, ...)
-SELECT name, json_get_str(status, 'phase') as phase FROM pods
-
--- Access nested fields by chaining keys
-SELECT name, json_get_str(spec, 'nodeName') as node FROM pods
-
--- Access array elements by index (0-based)
-SELECT name, json_get_str(spec, 'containers', 0, 'image') as image FROM pods
-
--- Access deeply nested fields
-SELECT name, json_get_str(status, 'nodeInfo', 'kubeletVersion') as version FROM nodes
-
--- Get integer values
-SELECT name, json_get_int(spec, 'replicas') as replicas FROM deployments
-
--- Get the full JSON object as string
-SELECT name, json_get_json(spec, 'containers') as containers FROM pods
-```
-
-#### Available JSON Functions and Operators
-
-| Operator/Function | Description |
-|-------------------|-------------|
-| `->` | Get JSON value (returns union type) |
-| `->>` | Get value as text string |
-| `json_get_str(json, key, ...)` | Extract as string |
-| `json_get_int(json, key, ...)` | Extract as integer |
-| `json_get_float(json, key, ...)` | Extract as float |
-| `json_get_bool(json, key, ...)` | Extract as boolean |
-| `json_get_json(json, key, ...)` | Extract nested JSON as string |
-| `json_get_array(json, key, ...)` | Extract as Arrow array (for UNNEST) |
-| `json_length(json)` | Get length of array or object |
-| `json_keys(json)` | Get keys of JSON object |
-| `json_contains(json, key, ...)` | Check if key exists |
-
-The function syntax supports chaining multiple keys and array indices in a single call, making it convenient for deeply nested access.
-
-### Labels and Annotations
-
-Labels and annotations are stored as JSON strings. Access them using the `->>` operator or `json_get_str()` function:
-
-```sql
--- Access a specific label
-SELECT name, labels->>'app' as app FROM pods
-
--- Filter by label (pushed to K8s API as label selector)
+SELECT name, status->>'phase' FROM pods
+SELECT name, status->'nodeInfo'->>'kubeletVersion' FROM nodes
 SELECT * FROM pods WHERE labels->>'app' = 'nginx'
-
--- Multiple label conditions (combined into single API call)
-SELECT * FROM pods WHERE labels->>'app' = 'nginx' AND labels->>'env' = 'prod'
-
--- Access annotations
-SELECT name, annotations->>'kubectl.kubernetes.io/last-applied-configuration' as config
-FROM deployments
-
--- Pattern matching with LIKE (case-sensitive, evaluated client-side)
-SELECT * FROM pods WHERE labels->>'app' LIKE 'nginx%'
-
--- Case-insensitive pattern matching with ILIKE
-SELECT * FROM pods WHERE labels->>'app' ILIKE 'Nginx%'
 ```
 
-Label equality filters (`labels->>'key' = 'value'`) are pushed to the Kubernetes API as label selectors for efficient server-side filtering. LIKE patterns are evaluated client-side by DataFusion.
-
-**Note:** Label matching follows SQL semantics, not Kubernetes selector semantics. This means:
-- `labels->>'app' != 'nginx'` excludes rows where the label is NULL (missing)
-- In Kubernetes selectors, `app!=nginx` would include resources without the `app` label
-
-### Working with Arrays (UNNEST)
-
-Use `json_get_array()` with `UNNEST` to expand JSON arrays into rows:
+Or function syntax for deeper nesting:
 
 ```sql
--- Get all containers from a pod
-SELECT name, UNNEST(json_get_array(spec, 'containers')) as container
-FROM pods
-WHERE namespace = 'kube-system'
+SELECT json_get_str(spec, 'containers', 0, 'image') FROM pods
+SELECT json_get_int(spec, 'replicas') FROM deployments
+```
 
--- Get all container images from a pod
+Available functions: `json_get_str`, `json_get_int`, `json_get_float`, `json_get_bool`, `json_get_json`, `json_get_array`, `json_length`, `json_keys`.
+
+### Working with Arrays
+
+Use `json_get_array()` with `UNNEST` to expand arrays:
+
+```sql
 SELECT name, json_get_str(UNNEST(json_get_array(spec, 'containers')), 'image') as image
 FROM pods
-
--- Get all unique images across all pods
-SELECT DISTINCT json_get_str(UNNEST(json_get_array(spec, 'containers')), 'image') as image
-FROM pods
-ORDER BY image
-
--- Get container names and images together
-SELECT
-    name as pod,
-    json_get_str(UNNEST(json_get_array(spec, 'containers')), 'name') as container,
-    json_get_str(UNNEST(json_get_array(spec, 'containers')), 'image') as image
-FROM pods
-WHERE namespace = 'default'
-
--- Count containers per pod
-SELECT name, json_length(json_get_json(spec, 'containers')) as container_count
-FROM pods
-
--- Get all volume mounts
-SELECT name,
-       json_get_str(UNNEST(json_get_array(spec, 'volumes')), 'name') as volume
-FROM pods
 ```
 
-## Example Queries
+## Query Optimization
 
-### Basic Queries
-
-```sql
--- All pods in current context
-SELECT * FROM pods
-
--- Specific columns including API version and kind
-SELECT api_version, kind, name, namespace FROM pods LIMIT 10
-
--- With ordering and limit
-SELECT name, namespace, json_get_str(status, 'phase') as phase FROM pods ORDER BY name LIMIT 10
-
--- Descending order
-SELECT name, created FROM pods ORDER BY created DESC
-```
-
-### Filtering
-
-```sql
--- Exact namespace match (optimized - uses namespaced API)
-SELECT * FROM pods WHERE namespace = 'kube-system'
-
--- Pattern matching (client-side filter)
-SELECT * FROM pods WHERE namespace LIKE 'kube%'
-SELECT * FROM pods WHERE name LIKE '%nginx%'
-
--- Filter on JSON fields
-SELECT name, namespace FROM pods
-WHERE json_get_str(status, 'phase') = 'Running'
-
--- Numeric comparisons on JSON
-SELECT name, json_get_int(spec, 'replicas') as replicas
-FROM deployments
-WHERE json_get_int(spec, 'replicas') > 1
-```
-
-### Cross-Cluster Queries
-
-```sql
--- Compare pods across prod and staging
-SELECT _cluster, name, namespace, status->>'phase' as phase
-FROM pods
-WHERE _cluster IN ('prod', 'staging') AND namespace = 'default'
-
--- Find all failing pods across all clusters
-SELECT _cluster, name, namespace, status->>'phase' as phase
-FROM pods
-WHERE _cluster = '*' AND status->>'phase' = 'Failed'
-
--- Count deployments per cluster
-SELECT _cluster, COUNT(*) as count
-FROM deployments
-WHERE _cluster = '*'
-GROUP BY _cluster
-ORDER BY count DESC
-```
-
-### Resource-Specific Examples
-
-```sql
--- Pods with status info
-SELECT name, namespace,
-       json_get_str(status, 'phase') as phase,
-       json_get_str(spec, 'nodeName') as node
-FROM pods
-
--- Deployments with replica status
-SELECT name, namespace,
-       json_get_int(spec, 'replicas') as desired,
-       json_get_int(status, 'readyReplicas') as ready,
-       json_get_int(status, 'availableReplicas') as available
-FROM deployments
-
--- Services with their types
-SELECT name, namespace,
-       json_get_str(spec, 'type') as type,
-       json_get_str(spec, 'clusterIP') as cluster_ip
-FROM services
-
--- Nodes with version info
-SELECT name,
-       json_get_str(status, 'nodeInfo', 'kubeletVersion') as version,
-       json_get_str(status, 'nodeInfo', 'osImage') as os
-FROM nodes
-
--- Recent events (events have dedicated columns)
-SELECT name, namespace, type, reason, message, count
-FROM events
-ORDER BY created DESC LIMIT 20
-
--- CRDs work the same way
-SELECT name, json_get_str(spec, 'secretName') as secret
-FROM certificates
-```
-
-### Container Image Queries
-
-```sql
--- All unique images in a namespace
-SELECT DISTINCT json_get_str(UNNEST(json_get_array(spec, 'containers')), 'image') as image
-FROM pods
-WHERE namespace = 'kube-system'
-ORDER BY image
-
--- Find pods using a specific image (use CTE to filter on UNNEST results)
-WITH container_images AS (
-    SELECT _cluster, namespace, name as pod_name,
-           json_get_str(UNNEST(json_get_array(spec, 'containers')), 'image') as image
-    FROM pods
-)
-SELECT * FROM container_images WHERE image LIKE '%nginx%'
-
--- Top 10 most used images
-SELECT json_get_str(UNNEST(json_get_array(spec, 'containers')), 'image') as image,
-       COUNT(*) as count
-FROM pods
-GROUP BY image
-ORDER BY count DESC
-LIMIT 10
-
--- Find pods with multiple containers
-SELECT name, namespace, json_length(json_get_json(spec, 'containers')) as container_count
-FROM pods
-WHERE json_length(json_get_json(spec, 'containers')) > 1
-```
-
-### Multi-Cluster Admin Queries
-
-Queries useful for administrators managing multiple Kubernetes clusters.
-
-#### Security Audits
-
-```sql
--- Find privileged pods across all clusters
-SELECT _cluster, namespace, name
-FROM pods
-WHERE _cluster = '*'
-  AND json_get_bool(spec, 'containers', 0, 'securityContext', 'privileged') = true
-
--- Find pods with hostNetwork enabled
-SELECT _cluster, namespace, name
-FROM pods
-WHERE _cluster = '*'
-  AND json_get_bool(spec, 'hostNetwork') = true
-
--- Find pods running as root (UID 0)
-SELECT _cluster, namespace, name
-FROM pods
-WHERE _cluster = '*'
-  AND json_get_int(spec, 'securityContext', 'runAsUser') = 0
-```
-
-#### Health & Status
-
-```sql
--- Find unhealthy deployments (ready < desired)
-SELECT _cluster, namespace, name,
-       json_get_int(spec, 'replicas') as desired,
-       json_get_int(status, 'readyReplicas') as ready
-FROM deployments
-WHERE _cluster = '*'
-  AND json_get_int(status, 'readyReplicas') < json_get_int(spec, 'replicas')
-
--- Find pods in error states
-SELECT _cluster, namespace, name, status->>'phase' as phase
-FROM pods
-WHERE _cluster = '*'
-  AND status->>'phase' IN ('Failed', 'Unknown')
-
--- Find resources stuck in deletion
-SELECT _cluster, namespace, name, deletion_timestamp
-FROM pods
-WHERE _cluster = '*'
-  AND deletion_timestamp IS NOT NULL
-```
-
-#### Capacity Planning
-
-```sql
--- Count pods per cluster
-SELECT _cluster, COUNT(*) as pod_count
-FROM pods
-WHERE _cluster = '*'
-GROUP BY _cluster
-ORDER BY pod_count DESC
-
--- Count nodes per cluster
-SELECT _cluster, COUNT(*) as node_count
-FROM nodes
-WHERE _cluster = '*'
-GROUP BY _cluster
-
--- Find largest namespaces across all clusters
-SELECT _cluster, namespace, COUNT(*) as pod_count
-FROM pods
-WHERE _cluster = '*'
-GROUP BY _cluster, namespace
-ORDER BY pod_count DESC
-LIMIT 20
-```
-
-## Table Schema
-
-All Kubernetes resources are exposed with a consistent schema:
-
-| Column | Type | Arrow Type | Description |
-|--------|------|------------|-------------|
-| `_cluster` | text | Utf8 | Kubernetes context/cluster name |
-| `api_version` | text | Utf8 | API version (e.g., `v1`, `apps/v1`, `cert-manager.io/v1`) |
-| `kind` | text | Utf8 | Resource kind (e.g., `Pod`, `Deployment`, `Certificate`) |
-| `name` | text | Utf8 | Resource name |
-| `namespace` | text | Utf8 | Namespace (null for cluster-scoped resources) |
-| `uid` | text | Utf8 | Unique identifier |
-| `created` | timestamp | Timestamp(ms) | Creation timestamp (supports date comparisons) |
-| `generation` | integer | Int64 | Spec change counter (supports numeric comparisons) |
-| `labels` | text (JSON) | Utf8 | Resource labels (access with `labels->>'key'` or `json_get_str(labels, 'key')`) |
-| `annotations` | text (JSON) | Utf8 | Resource annotations (access with `annotations->>'key'` or `json_get_str(annotations, 'key')`) |
-| `spec` | json | Utf8 | Resource specification (desired state) |
-| `status` | json | Utf8 | Resource status (current state) |
-
-Native Arrow types (`Timestamp`, `Int64`) enable proper SQL comparisons and sorting. JSON columns are stored as UTF-8 strings and accessed via JSON functions.
-
-The `api_version` and `kind` columns are self-describing - they identify exactly what type of resource each row represents. This is especially useful when querying CRDs across multiple clusters that might have different versions installed.
-
-Special cases:
-- **ConfigMaps/Secrets**: Have `data` column instead of spec/status
-- **Events**: Have dedicated columns for `type`, `reason`, `message`, `count`, etc.
-- **PodMetrics/NodeMetrics**: Have `timestamp`, `window`, and `containers`/`usage` columns (see below)
-
-Use `DESCRIBE <table>` to see the exact schema for any resource.
-
-## Metrics Tables
-
-If the Kubernetes metrics-server is installed, k8sql exposes pod and node metrics:
-
-| Table | Description |
-|-------|-------------|
-| `podmetrics` | CPU/memory usage per pod (from `metrics.k8s.io`) |
-| `nodemetrics` | CPU/memory usage per node (from `metrics.k8s.io`) |
-
-### PodMetrics Schema
-
-| Column | Type | Description |
-|--------|------|-------------|
-| `name` | text | Pod name |
-| `namespace` | text | Namespace |
-| `timestamp` | timestamp | When metrics were collected |
-| `window` | text | Measurement time window |
-| `containers` | json | Array of container metrics |
-
-### NodeMetrics Schema
-
-| Column | Type | Description |
-|--------|------|-------------|
-| `name` | text | Node name |
-| `timestamp` | timestamp | When metrics were collected |
-| `window` | text | Measurement time window |
-| `usage` | json | Node resource usage (cpu, memory) |
-
-### Metrics Query Examples
-
-```sql
--- Pod CPU and memory usage
-SELECT name, namespace,
-       json_get_str(containers, 0, 'usage', 'cpu') as cpu,
-       json_get_str(containers, 0, 'usage', 'memory') as memory
-FROM podmetrics
-
--- Node resource usage
-SELECT name,
-       json_get_str(usage, 'cpu') as cpu,
-       json_get_str(usage, 'memory') as memory
-FROM nodemetrics
-
--- Find pods using most memory (note: values are strings like "123456Ki")
-SELECT name, namespace,
-       json_get_str(containers, 0, 'usage', 'memory') as memory
-FROM podmetrics
-ORDER BY memory DESC
-LIMIT 10
-```
-
-Note: CPU values are in nanocores (e.g., `"2083086n"` = ~2 millicores), memory in kibibytes (e.g., `"44344Ki"`).
-
-## Supported Resources
-
-k8sql discovers all available resources at runtime, including CRDs. Use `SHOW TABLES` to see what's available in your cluster.
-
-Common resources with aliases:
-
-| Table | Aliases | Scope |
-|-------|---------|-------|
-| pods | pod | Namespaced |
-| services | service, svc | Namespaced |
-| deployments | deployment, deploy | Namespaced |
-| configmaps | configmap, cm | Namespaced |
-| secrets | secret | Namespaced |
-| ingresses | ingress, ing | Namespaced |
-| jobs | job | Namespaced |
-| cronjobs | cronjob, cj | Namespaced |
-| statefulsets | statefulset, sts | Namespaced |
-| daemonsets | daemonset, ds | Namespaced |
-| persistentvolumeclaims | pvc | Namespaced |
-| nodes | node | Cluster |
-| namespaces | namespace, ns | Cluster |
-| persistentvolumes | pv | Cluster |
-| podmetrics | - | Namespaced |
-| nodemetrics | - | Cluster |
-
-CRDs are automatically discovered and available using their plural name (e.g., `certificates`, `issuers` for cert-manager).
-
-## Query Planner
-
-k8sql optimizes queries by pushing predicates to the Kubernetes API when possible:
+k8sql pushes predicates to the Kubernetes API when possible:
 
 | Predicate | Optimization |
 |-----------|--------------|
-| `namespace = 'x'` | Uses `Api::namespaced()` - only fetches from that namespace |
-| `labels->>'app' = 'nginx'` | K8s label selector - server-side filtering |
-| `labels->>'app' = 'x' AND labels->>'env' = 'y'` | Combined label selector: `app=x,env=y` |
+| `namespace = 'x'` | Namespaced API call |
+| `labels->>'app' = 'nginx'` | Label selector (server-side) |
 | `_cluster = 'prod'` | Only queries that cluster |
-| `_cluster IN ('a', 'b')` | Only queries specified clusters |
-| `_cluster NOT IN ('x')` | Queries all except specified clusters |
-| `_cluster = '*'` | Queries all clusters in parallel |
-| `namespace LIKE '%'` | Queries all, filters client-side |
-| `json_get_str(...)` | Client-side JSON parsing |
+| `_cluster = '*'` | Parallel queries to all clusters |
 
-**Server-side optimizations** reduce API calls and network traffic by filtering at the Kubernetes API level. Label selectors are especially powerful - the API returns only matching resources.
+Use `-v` to see which filters are pushed down.
 
-**Client-side filters** (LIKE patterns, JSON field comparisons) are applied after fetching resources. For large clusters, prefer server-side filters when possible.
+## Table Schema
 
-Use `-v` flag to see what filters are being pushed down:
-```bash
-k8sql -v -q "SELECT name FROM pods WHERE labels->>'app' = 'nginx' AND namespace = 'default'"
-# Shows: labels=Some("app=nginx"), namespace=Some("default")
-```
+All resources share a consistent schema:
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `_cluster` | text | Kubernetes context name |
+| `api_version` | text | API version (v1, apps/v1, etc.) |
+| `kind` | text | Resource kind |
+| `name` | text | Resource name |
+| `namespace` | text | Namespace (null for cluster-scoped) |
+| `uid` | text | Unique identifier |
+| `created` | timestamp | Creation timestamp |
+| `labels` | json | Labels (access with `labels->>'key'`) |
+| `annotations` | json | Annotations |
+| `spec` | json | Resource specification |
+| `status` | json | Resource status |
+
+Special cases: ConfigMaps/Secrets have `data` instead of spec/status. Events have dedicated columns.
 
 ## REPL Commands
 
 ```
-SHOW TABLES          - List available tables
-SHOW DATABASES       - List kubectl contexts (active ones marked with *)
-DESCRIBE <table>     - Show table schema
-USE <cluster>        - Switch to cluster(s) - see below
-\dt                  - Shortcut for SHOW TABLES
-\l                   - Shortcut for SHOW DATABASES
-\d <table>           - Shortcut for DESCRIBE
-\x                   - Toggle expanded display mode
-\q                   - Quit
+SHOW TABLES          List available tables
+SHOW DATABASES       List kubectl contexts (* = active)
+DESCRIBE <table>     Show table schema
+USE <cluster>        Switch context(s) - supports globs: USE prod-*
+\dt, \l, \d, \x, \q  Shortcuts
 ```
 
-### Multi-Cluster USE
-
-> **Note:** Multi-cluster `USE` is a k8sql extension to SQL. Traditional SQL databases only support single-database `USE` statements. This extension is designed for the Kubernetes multi-cluster use case.
-
-The `USE` command supports multiple clusters and glob patterns:
-
-```sql
--- Single cluster (traditional SQL behavior)
-USE prod-us;
-
--- Multiple clusters (k8sql extension, comma-separated)
-USE prod-us, prod-eu, staging;
-
--- Glob patterns (k8sql extension)
-USE prod-*;           -- matches prod-us, prod-eu, prod-asia, etc.
-USE *-staging;        -- matches app-staging, db-staging, etc.
-USE prod-?;           -- matches prod-1, prod-2, etc. (? = single char)
-
--- Combine patterns and explicit names
-USE prod-*, staging;
-```
-
-After `USE`, queries without a `_cluster` filter will run against all selected contexts. `SHOW DATABASES` displays selected contexts in the `selected` column.
-
-**Persistent Selection:** Your context selection is automatically saved to `~/.k8sql/config.json` and restored on next startup. This means you can close k8sql, reopen it, and continue working with the same cluster selection.
-
-This is useful for:
-- Excluding problematic clusters that always timeout
-- Working with a subset of your many clusters
-- Quickly switching between environment sets (all prod, all staging, etc.)
-- Maintaining consistent multi-cluster workflows across sessions
-
-## Context Behavior by Mode
-
-k8sql supports multi-cluster queries in all modes. Here's how context selection works:
-
-| Mode | `--context` specified | No `--context` | Persists? |
-|------|----------------------|----------------|-----------|
-| **REPL** | Temporary override | Restores saved config, or kubeconfig default | Only `USE` command persists |
-| **Batch** | Uses specified | Kubeconfig default | Never |
-| **Daemon** | Uses specified | Kubeconfig default | Never |
-
-**Key behaviors:**
-- `--context` is always a **temporary override** - it never persists to config
-- Only the `USE` command in REPL mode persists your selection
-- Batch and Daemon modes are **explicit** - they don't read saved REPL config
-- Without `--context`, batch/daemon always use kubeconfig's current context
-
-This design ensures predictability:
-- REPL is convenient: your `USE` selections persist across sessions
-- Batch is predictable: `k8sql -q "..."` always uses kubeconfig default unless you specify `--context`
-- Daemon is explicit: no surprise clusters from saved REPL state
-
-### Examples
-
-```bash
-# REPL: restores saved context selection from previous session
-k8sql
-
-# REPL: temporary override, doesn't change saved config
-k8sql --context prod
-
-# Batch: uses kubeconfig default context
-k8sql -q "SELECT * FROM pods"
-
-# Batch: queries specific cluster(s)
-k8sql --context "prod-*" -q "SELECT * FROM pods"
-
-# Daemon: uses kubeconfig default
-k8sql daemon
-
-# Daemon: serves queries for specific cluster(s)
-k8sql daemon --context "prod,staging"
-```
+Context selection persists to `~/.k8sql/config.json` and restores on next startup.
 
 ## Daemon Mode
 
 Run as a PostgreSQL-compatible server:
 
 ```bash
-# Default: uses kubeconfig's current context
-k8sql daemon --port 15432
-
-# Multi-cluster: serve queries across multiple clusters
 k8sql daemon --port 15432 --context "prod-*"
-
-# Connect with psql
 psql -h localhost -p 15432
-
-# Connect with any PostgreSQL client (DBeaver, pgAdmin, etc.)
-# Host: localhost, Port: 15432, User: postgres
 ```
 
-The daemon supports the same `--context` patterns as other modes (globs, comma-separated). Connected clients can query the `_cluster` column to filter or aggregate across clusters.
+## Caching
+
+k8sql caches CRD schemas for fast startup:
+
+- **CRD schemas**: Cached indefinitely (use `--refresh-crds` to force refresh)
+- **Cluster CRD list**: Checked hourly for new/removed CRDs
+- **Cache location**: `~/.k8sql/cache/`
+
+## Example Queries
+
+```sql
+-- Pods with status
+SELECT name, namespace, status->>'phase' as phase FROM pods
+
+-- Unhealthy deployments
+SELECT name, json_get_int(spec, 'replicas') as desired,
+       json_get_int(status, 'readyReplicas') as ready
+FROM deployments
+WHERE json_get_int(status, 'readyReplicas') < json_get_int(spec, 'replicas')
+
+-- Cross-cluster pod count
+SELECT _cluster, COUNT(*) FROM pods WHERE _cluster = '*' GROUP BY _cluster
+
+-- Find pods by label (server-side filtering)
+SELECT name FROM pods WHERE labels->>'app' = 'nginx' AND namespace = 'default'
+```
 
 ## Built With
 
 - [Apache DataFusion](https://datafusion.apache.org/) - SQL query engine
 - [kube-rs](https://kube.rs/) - Kubernetes client for Rust
-- [datafusion-postgres](https://github.com/datafusion-contrib/datafusion-postgres) - PostgreSQL wire protocol
 
 ## License
 
-BSD-3-Clause - Copyright (c) 2025 Nikolay Denev <ndenev@gmail.com>
+BSD-3-Clause
