@@ -637,18 +637,36 @@ impl K8sClientPool {
     /// This clears the local cache and rediscovers all resources
     pub async fn refresh_tables(&self) -> Result<usize> {
         let contexts = self.current_contexts().await;
-        let mut total_tables = 0;
 
-        for context in &contexts {
-            // Force rediscovery (will update cache)
-            self.discover_resources_for_context(context, true).await?;
+        // Discover all contexts in parallel
+        let discovery_futures: Vec<_> = contexts
+            .iter()
+            .map(|ctx| {
+                let ctx = ctx.clone();
+                async move {
+                    self.discover_resources_for_context(&ctx, true)
+                        .await
+                        .with_context(|| format!("Failed to refresh resources for '{}'", ctx))
+                }
+            })
+            .collect();
 
-            // Count tables
-            let registries = self.registries.read().await;
-            if let Some(cached) = registries.get(context) {
-                total_tables += cached.registry.list_tables().len();
+        let results = futures::future::join_all(discovery_futures).await;
+
+        // Check for errors
+        for result in &results {
+            if let Err(e) = result {
+                return Err(anyhow!("{}", e));
             }
         }
+
+        // Count total tables
+        let registries = self.registries.read().await;
+        let total_tables: usize = contexts
+            .iter()
+            .filter_map(|ctx| registries.get(ctx))
+            .map(|cached| cached.registry.list_tables().len())
+            .sum();
 
         Ok(total_tables)
     }
