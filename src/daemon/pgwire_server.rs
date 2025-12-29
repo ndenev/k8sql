@@ -4,36 +4,54 @@
 use std::sync::Arc;
 
 use datafusion_postgres::auth::AuthManager;
+use datafusion_postgres::datafusion_pg_catalog::pg_catalog::context::EmptyContextProvider;
+use datafusion_postgres::datafusion_pg_catalog::setup_pg_catalog;
 use datafusion_postgres::{QueryHook, ServerOptions, serve_with_hooks};
 
-use crate::datafusion_integration::{K8sSessionContext, ShowDatabasesHook, ShowTablesHook};
+use crate::datafusion_integration::{
+    K8sSessionContext, SetConfigHook, ShowDatabasesHook, ShowTablesHook,
+};
 use crate::kubernetes::K8sClientPool;
 
 /// PostgreSQL wire protocol server for k8sql
 pub struct PgWireServer {
     port: u16,
     bind_address: String,
+    context: Option<String>,
 }
 
 impl PgWireServer {
-    pub fn new(port: u16, bind_address: String) -> Self {
-        Self { port, bind_address }
+    pub fn new(port: u16, bind_address: String, context: Option<String>) -> Self {
+        Self {
+            port,
+            bind_address,
+            context,
+        }
     }
 
     pub async fn run(&self) -> anyhow::Result<()> {
-        // Initialize connection to default context
-        let pool = Arc::new(K8sClientPool::new(None, "default")?);
-        pool.initialize().await?;
+        // Daemon mode: use --context if specified, otherwise kubeconfig default
+        // (does not use saved REPL config for predictability)
+        let pool = K8sClientPool::with_context_spec(self.context.as_deref()).await?;
         let session = K8sSessionContext::new(Arc::clone(&pool)).await?;
 
-        // Get the underlying DataFusion SessionContext wrapped in Arc
-        let ctx = Arc::new(session.into_session_context());
+        // Get the underlying DataFusion SessionContext
+        let ctx = session.into_session_context();
+
+        // Register PostgreSQL system catalog tables for client compatibility
+        // (DBeaver, pgAdmin, etc. query pg_catalog.* for introspection)
+        if let Err(e) = setup_pg_catalog(&ctx, "postgres", EmptyContextProvider) {
+            tracing::warn!("Failed to setup pg_catalog: {}", e);
+        }
+
+        let ctx = Arc::new(ctx);
 
         // Create default auth manager (accepts "postgres" user with empty password)
         let auth_manager = Arc::new(AuthManager::new());
 
         // Create custom hooks for k8sql-specific commands
         let hooks: Vec<Arc<dyn QueryHook>> = vec![
+            Arc::new(SetConfigHook::new()), // Handle SET commands from PostgreSQL clients
             Arc::new(ShowTablesHook::new()),
             Arc::new(ShowDatabasesHook::new(Arc::clone(&pool))),
         ];

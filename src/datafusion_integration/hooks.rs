@@ -10,7 +10,7 @@ use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use datafusion::common::{ParamValues, ToDFSchema};
 use datafusion::logical_expr::LogicalPlan;
 use datafusion::prelude::SessionContext;
-use datafusion::sql::sqlparser::ast::Statement;
+use datafusion::sql::sqlparser::ast::{Set, Statement};
 use datafusion_postgres::QueryHook;
 use datafusion_postgres::pgwire::api::results::{
     DataRowEncoder, FieldFormat, FieldInfo, QueryResponse, Response,
@@ -19,6 +19,134 @@ use datafusion_postgres::pgwire::api::{ClientInfo, Type};
 use datafusion_postgres::pgwire::error::{PgWireError, PgWireResult};
 
 use crate::kubernetes::K8sClientPool;
+
+/// Hook to handle SET configuration commands from PostgreSQL clients
+///
+/// Many PostgreSQL clients (DBeaver, pgAdmin, psql) send SET commands
+/// on connection for parameters like extra_float_digits, application_name, etc.
+/// We accept these to maintain compatibility, logging useful ones.
+pub struct SetConfigHook;
+
+impl SetConfigHook {
+    pub fn new() -> Self {
+        Self
+    }
+
+    /// Extract parameter name and value from SET statement
+    fn extract_set_params(statement: &Statement) -> Option<(String, String)> {
+        match statement {
+            Statement::Set(set) => match set {
+                Set::SingleAssignment {
+                    variable, values, ..
+                } => {
+                    let name = variable.to_string().to_lowercase();
+                    let val = values
+                        .iter()
+                        .map(|v| v.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    Some((name, val))
+                }
+                Set::SetTimeZone { value, .. } => Some(("timezone".to_string(), value.to_string())),
+                Set::SetNames { charset_name, .. } => {
+                    Some(("client_encoding".to_string(), charset_name.to_string()))
+                }
+                Set::SetNamesDefault {} => {
+                    Some(("client_encoding".to_string(), "DEFAULT".to_string()))
+                }
+                // Accept other SET variants (SetRole, SetTransaction, etc.)
+                _ => Some(("_other".to_string(), set.to_string())),
+            },
+            _ => None,
+        }
+    }
+
+    fn handle_set(&self, statement: &Statement) -> Option<PgWireResult<Response>> {
+        if let Some((name, value)) = Self::extract_set_params(statement) {
+            match name.as_str() {
+                "application_name" => {
+                    tracing::info!(application_name = %value, "Client application identified");
+                }
+                "timezone" | "time zone" => {
+                    tracing::debug!(timezone = %value, "Timezone requested (k8sql uses UTC internally)");
+                }
+                "statement_timeout" => {
+                    tracing::debug!(timeout = %value, "Statement timeout requested (not enforced)");
+                }
+                "client_encoding" => {
+                    let normalized = value.trim_matches('\'').to_uppercase();
+                    if normalized != "UTF8" && normalized != "UTF-8" && normalized != "DEFAULT" {
+                        tracing::warn!(
+                            encoding = %value,
+                            "Non-UTF8 encoding requested (k8sql is UTF-8 only)"
+                        );
+                    }
+                }
+                "_other" => {
+                    tracing::trace!(statement = %value, "SET statement accepted");
+                }
+                _ => {
+                    tracing::trace!(param = %name, value = %value, "SET parameter accepted");
+                }
+            }
+            return Some(Ok(Response::EmptyQuery));
+        }
+
+        None
+    }
+}
+
+impl Default for SetConfigHook {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait]
+impl QueryHook for SetConfigHook {
+    async fn handle_simple_query(
+        &self,
+        statement: &Statement,
+        _session_context: &SessionContext,
+        _client: &mut (dyn ClientInfo + Send + Sync),
+    ) -> Option<PgWireResult<Response>> {
+        self.handle_set(statement)
+    }
+
+    async fn handle_extended_parse_query(
+        &self,
+        statement: &Statement,
+        _session_context: &SessionContext,
+        _client: &(dyn ClientInfo + Send + Sync),
+    ) -> Option<PgWireResult<LogicalPlan>> {
+        // For SET commands, return a dummy plan
+        if Self::extract_set_params(statement).is_some() {
+            let schema = Arc::new(Schema::empty());
+            let result = schema
+                .to_dfschema()
+                .map(|df_schema| {
+                    LogicalPlan::EmptyRelation(datafusion::logical_expr::EmptyRelation {
+                        produce_one_row: false,
+                        schema: Arc::new(df_schema),
+                    })
+                })
+                .map_err(|e| PgWireError::ApiError(Box::new(e)));
+            return Some(result);
+        }
+        None
+    }
+
+    async fn handle_extended_query(
+        &self,
+        statement: &Statement,
+        _logical_plan: &LogicalPlan,
+        _params: &ParamValues,
+        _session_context: &SessionContext,
+        _client: &mut (dyn ClientInfo + Send + Sync),
+    ) -> Option<PgWireResult<Response>> {
+        self.handle_set(statement)
+    }
+}
 
 /// Hook to handle SHOW TABLES command with clean output
 pub struct ShowTablesHook;

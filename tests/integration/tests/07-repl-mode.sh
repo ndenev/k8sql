@@ -148,4 +148,126 @@ repl_contains "Invalid SQL shows error" "$TEST_CONTEXT1" \
 repl_contains "Invalid table shows error" "$TEST_CONTEXT1" \
     "SELECT * FROM nonexistent_table_xyz;" "Error"
 
+echo ""
+echo "=== Context Selection Behavior ==="
+
+# Config file location (k8sql always uses ~/.k8sql)
+CONFIG_DIR="$HOME/.k8sql"
+CONFIG_FILE="$CONFIG_DIR/config.json"
+BACKUP_FILE="$CONFIG_DIR/config.json.bak"
+
+# Helper to run REPL without -c flag
+run_repl_no_context() {
+    local commands="$*"
+    echo -e "$commands\n\\q" | $K8SQL_BIN 2>&1
+}
+
+# Test: --context is a temporary override (doesn't persist)
+# First, clear any existing saved config
+if [[ -f "$CONFIG_FILE" ]]; then
+    cp "$CONFIG_FILE" "$BACKUP_FILE"
+fi
+rm -f "$CONFIG_FILE"
+
+# Run REPL with explicit -c flag
+run_repl "$TEST_CONTEXT1" "SELECT 1;" >/dev/null 2>&1
+
+# Check if config was created (it shouldn't be, -c doesn't persist)
+if [[ ! -f "$CONFIG_FILE" ]] || ! grep -q "$TEST_CONTEXT1" "$CONFIG_FILE" 2>/dev/null; then
+    echo -e "${GREEN}✓${NC} --context flag does not persist to config"
+    PASS=$((PASS + 1))
+else
+    echo -e "${RED}✗${NC} --context flag incorrectly persisted to config"
+    FAIL=$((FAIL + 1))
+fi
+
+# Restore original config
+if [[ -f "$BACKUP_FILE" ]]; then
+    mv "$BACKUP_FILE" "$CONFIG_FILE"
+fi
+
+# Test: USE command DOES persist (only in REPL mode)
+if [[ "$TEST_CONTEXT1" != "$TEST_CONTEXT2" ]]; then
+    # Backup existing config
+    if [[ -f "$CONFIG_FILE" ]]; then
+        cp "$CONFIG_FILE" "$BACKUP_FILE"
+    fi
+    rm -f "$CONFIG_FILE"
+
+    # Run REPL and USE a context
+    run_repl "$TEST_CONTEXT1" "USE $TEST_CONTEXT2;" >/dev/null 2>&1
+
+    # Check if config was created with the USE context
+    if [[ -f "$CONFIG_FILE" ]] && grep -q "$TEST_CONTEXT2" "$CONFIG_FILE" 2>/dev/null; then
+        echo -e "${GREEN}✓${NC} USE command persists to config"
+        PASS=$((PASS + 1))
+    else
+        echo -e "${RED}✗${NC} USE command should persist to config"
+        FAIL=$((FAIL + 1))
+    fi
+
+    # Restore original config
+    if [[ -f "$BACKUP_FILE" ]]; then
+        mv "$BACKUP_FILE" "$CONFIG_FILE"
+    else
+        rm -f "$CONFIG_FILE"
+    fi
+fi
+
+# Test: Without --context, saved config is restored
+if [[ -f "$CONFIG_FILE" ]]; then
+    cp "$CONFIG_FILE" "$BACKUP_FILE"
+fi
+
+# Create a saved config with our test context
+mkdir -p "$CONFIG_DIR"
+echo "{\"selected_contexts\": [\"$TEST_CONTEXT1\"]}" > "$CONFIG_FILE"
+
+# Run REPL without -c and check it uses saved config
+output=$(run_repl_no_context "SELECT DISTINCT _cluster FROM namespaces LIMIT 1;")
+
+# Restore original config
+if [[ -f "$BACKUP_FILE" ]]; then
+    mv "$BACKUP_FILE" "$CONFIG_FILE"
+else
+    rm -f "$CONFIG_FILE"
+fi
+
+if echo "$output" | grep -q "$TEST_CONTEXT1"; then
+    echo -e "${GREEN}✓${NC} REPL without -c restores saved config"
+    PASS=$((PASS + 1))
+else
+    echo -e "${RED}✗${NC} REPL without -c should restore saved config"
+    echo "    Output: $(echo "$output" | head -5)"
+    FAIL=$((FAIL + 1))
+fi
+
+# Test: --context overrides saved config temporarily
+if [[ "$TEST_CONTEXT1" != "$TEST_CONTEXT2" ]]; then
+    # Backup and create saved config
+    if [[ -f "$CONFIG_FILE" ]]; then
+        cp "$CONFIG_FILE" "$BACKUP_FILE"
+    fi
+    mkdir -p "$CONFIG_DIR"
+    echo "{\"selected_contexts\": [\"$TEST_CONTEXT2\"]}" > "$CONFIG_FILE"
+
+    # Run with explicit -c that differs from saved config
+    output=$(run_repl "$TEST_CONTEXT1" "SELECT DISTINCT _cluster FROM namespaces LIMIT 1;")
+
+    # Restore
+    if [[ -f "$BACKUP_FILE" ]]; then
+        mv "$BACKUP_FILE" "$CONFIG_FILE"
+    else
+        rm -f "$CONFIG_FILE"
+    fi
+
+    if echo "$output" | grep -q "$TEST_CONTEXT1"; then
+        echo -e "${GREEN}✓${NC} --context overrides saved config"
+        PASS=$((PASS + 1))
+    else
+        echo -e "${RED}✗${NC} --context should override saved config"
+        FAIL=$((FAIL + 1))
+    fi
+fi
+
 print_summary

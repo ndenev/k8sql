@@ -577,16 +577,68 @@ This is useful for:
 - Quickly switching between environment sets (all prod, all staging, etc.)
 - Maintaining consistent multi-cluster workflows across sessions
 
+## Context Behavior by Mode
+
+k8sql supports multi-cluster queries in all modes. Here's how context selection works:
+
+| Mode | `--context` specified | No `--context` | Persists? |
+|------|----------------------|----------------|-----------|
+| **REPL** | Temporary override | Restores saved config, or kubeconfig default | Only `USE` command persists |
+| **Batch** | Uses specified | Kubeconfig default | Never |
+| **Daemon** | Uses specified | Kubeconfig default | Never |
+
+**Key behaviors:**
+- `--context` is always a **temporary override** - it never persists to config
+- Only the `USE` command in REPL mode persists your selection
+- Batch and Daemon modes are **explicit** - they don't read saved REPL config
+- Without `--context`, batch/daemon always use kubeconfig's current context
+
+This design ensures predictability:
+- REPL is convenient: your `USE` selections persist across sessions
+- Batch is predictable: `k8sql -q "..."` always uses kubeconfig default unless you specify `--context`
+- Daemon is explicit: no surprise clusters from saved REPL state
+
+### Examples
+
+```bash
+# REPL: restores saved context selection from previous session
+k8sql
+
+# REPL: temporary override, doesn't change saved config
+k8sql --context prod
+
+# Batch: uses kubeconfig default context
+k8sql -q "SELECT * FROM pods"
+
+# Batch: queries specific cluster(s)
+k8sql --context "prod-*" -q "SELECT * FROM pods"
+
+# Daemon: uses kubeconfig default
+k8sql daemon
+
+# Daemon: serves queries for specific cluster(s)
+k8sql daemon --context "prod,staging"
+```
+
 ## Daemon Mode
 
 Run as a PostgreSQL-compatible server:
 
 ```bash
+# Default: uses kubeconfig's current context
 k8sql daemon --port 15432
+
+# Multi-cluster: serve queries across multiple clusters
+k8sql daemon --port 15432 --context "prod-*"
 
 # Connect with psql
 psql -h localhost -p 15432
+
+# Connect with any PostgreSQL client (DBeaver, pgAdmin, etc.)
+# Host: localhost, Port: 15432, User: postgres
 ```
+
+The daemon supports the same `--context` patterns as other modes (globs, comma-separated). Connected clients can query the `_cluster` column to filter or aggregate across clusters.
 
 ## Built With
 

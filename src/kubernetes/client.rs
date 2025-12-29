@@ -91,7 +91,7 @@ impl K8sClientPool {
 
     /// Create a new client pool without connecting (fast, no I/O)
     /// Call `initialize()` after subscribing to progress events
-    pub fn new(context: Option<&str>, _namespace: &str) -> Result<Self> {
+    pub fn new(context: Option<&str>) -> Result<Self> {
         let kubeconfig = Kubeconfig::read()?;
 
         let context_name = context
@@ -127,6 +127,37 @@ impl K8sClientPool {
         self.discover_resources_for_context(&context_name, false)
             .await?;
         Ok(())
+    }
+
+    /// Create and initialize a pool with a context spec that supports globs and comma-separated lists
+    /// Examples: "prod", "prod-*", "prod,staging", "*", or None for current context
+    pub async fn with_context_spec(context_spec: Option<&str>) -> Result<Arc<Self>> {
+        // Check if context spec contains patterns or multiple contexts
+        let is_multi_or_pattern = context_spec
+            .map(|s| s.contains(',') || s.contains('*') || s.contains('?'))
+            .unwrap_or(false);
+
+        // For initialization, extract the first concrete context name from the spec
+        // This avoids passing a pattern to new() which validates context names
+        let initial_context = if is_multi_or_pattern {
+            context_spec.and_then(|s| {
+                s.split(',')
+                    .map(str::trim)
+                    .find(|c| !c.contains('*') && !c.contains('?'))
+            })
+        } else {
+            context_spec
+        };
+
+        let pool = Arc::new(Self::new(initial_context)?);
+        pool.initialize().await?;
+
+        // If context spec has multiple contexts or patterns, switch to all of them
+        if is_multi_or_pattern && let Some(spec) = context_spec {
+            pool.switch_context(spec, false).await?;
+        }
+
+        Ok(pool)
     }
 
     /// Discover all available resources for a context
