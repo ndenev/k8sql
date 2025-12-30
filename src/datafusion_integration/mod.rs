@@ -9,6 +9,7 @@
 mod context;
 mod convert;
 mod execution;
+mod filter_extraction;
 mod hooks;
 mod preprocess;
 mod provider;
