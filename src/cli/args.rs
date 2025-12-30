@@ -20,10 +20,6 @@ pub struct Args {
     #[arg(short, long, value_name = "CONTEXT")]
     pub context: Option<String>,
 
-    /// Default namespace
-    #[arg(short, long, default_value = "default")]
-    pub namespace: String,
-
     /// Output format
     #[arg(short, long, value_enum, default_value = "table")]
     pub output: OutputFormat,

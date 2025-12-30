@@ -51,7 +51,6 @@ k8sql -q "SELECT * FROM deployments" -o json
 ```
 -q, --query <SQL>       Execute a SQL query directly
 -c, --context <CTX>     Kubernetes context(s): name, comma-separated, or glob pattern
--n, --namespace <NS>    Default namespace (default: "default")
 -o, --output <FMT>      Output format: table, json, csv, yaml (default: table)
 -f, --file <PATH>       Execute queries from a file
     --no-headers        Omit column headers in output
