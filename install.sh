@@ -9,6 +9,9 @@ set -e
 
 # Cleanup on exit
 cleanup() {
+    if [ -f "k8sql" ]; then
+        rm -f k8sql
+    fi
     if [ -f "k8sql.sha256" ]; then
         rm -f k8sql.sha256
     fi
@@ -20,10 +23,15 @@ OS="$(uname -s)"
 case "$OS" in
     Linux*)     OS="linux" ;;
     Darwin*)    OS="macos" ;;
-    MINGW*|MSYS*|CYGWIN*) OS="windows" ;;
+    MINGW*|MSYS*|CYGWIN*)
+        echo "Error: Native Windows is not supported"
+        echo "Please use Windows Subsystem for Linux (WSL)"
+        exit 1
+        ;;
     *)
         echo "Error: Unsupported operating system: $OS"
-        echo "Supported: Linux, macOS, Windows (via WSL)"
+        echo "Supported: Linux, macOS"
+        echo "Windows users: use WSL"
         exit 1
         ;;
 esac
@@ -41,11 +49,7 @@ case "$ARCH" in
 esac
 
 # Construct binary name
-if [ "$OS" = "windows" ]; then
-    BINARY_NAME="k8sql-${OS}-${ARCH}.exe"
-else
-    BINARY_NAME="k8sql-${OS}-${ARCH}"
-fi
+BINARY_NAME="k8sql-${OS}-${ARCH}"
 
 # Get latest release version from GitHub API
 echo "Fetching latest release..."
@@ -80,68 +84,70 @@ fi
 echo "Verifying checksum..."
 CHECKSUM_URL="${DOWNLOAD_URL}.sha256"
 if ! curl -sSfL "$CHECKSUM_URL" -o k8sql.sha256; then
-    echo "Warning: Could not download checksum file"
-    echo "Proceeding without verification (not recommended)"
+    echo "Error: Could not download checksum file"
     echo "URL: $CHECKSUM_URL"
-else
-    # Verify checksum (extract hash from "hash  filename" format)
-    EXPECTED_HASH=$(awk '{print $1}' k8sql.sha256)
-    if command -v sha256sum >/dev/null 2>&1; then
-        # Linux
-        ACTUAL_HASH=$(sha256sum k8sql | awk '{print $1}')
-        if [ "$EXPECTED_HASH" != "$ACTUAL_HASH" ]; then
-            echo "Error: Checksum verification failed"
-            echo "Expected: $EXPECTED_HASH"
-            echo "Got:      $ACTUAL_HASH"
-            exit 1
-        fi
-        echo "Checksum verified successfully"
-    elif command -v shasum >/dev/null 2>&1; then
-        # macOS
-        ACTUAL_HASH=$(shasum -a 256 k8sql | awk '{print $1}')
-        if [ "$EXPECTED_HASH" != "$ACTUAL_HASH" ]; then
-            echo "Error: Checksum verification failed"
-            echo "Expected: $EXPECTED_HASH"
-            echo "Got:      $ACTUAL_HASH"
-            exit 1
-        fi
-        echo "Checksum verified successfully"
-    else
-        echo "Warning: sha256sum/shasum not found, cannot verify checksum"
+    exit 1
+fi
+
+# Verify checksum (extract hash from "hash  filename" format)
+EXPECTED_HASH=$(awk '{print $1}' k8sql.sha256)
+if command -v sha256sum >/dev/null 2>&1; then
+    # Linux
+    ACTUAL_HASH=$(sha256sum k8sql | awk '{print $1}')
+    if [ "$EXPECTED_HASH" != "$ACTUAL_HASH" ]; then
+        echo "Error: Checksum verification failed"
+        echo "Expected: $EXPECTED_HASH"
+        echo "Got:      $ACTUAL_HASH"
+        exit 1
     fi
+    echo "Checksum verified successfully"
+elif command -v shasum >/dev/null 2>&1; then
+    # macOS
+    ACTUAL_HASH=$(shasum -a 256 k8sql | awk '{print $1}')
+    if [ "$EXPECTED_HASH" != "$ACTUAL_HASH" ]; then
+        echo "Error: Checksum verification failed"
+        echo "Expected: $EXPECTED_HASH"
+        echo "Got:      $ACTUAL_HASH"
+        exit 1
+    fi
+    echo "Checksum verified successfully"
+else
+    echo "Error: sha256sum or shasum not found"
+    exit 1
 fi
 
 # Verify it's actually a binary (not an HTML error page)
-if ! file k8sql 2>/dev/null | grep -q "executable\|ELF\|Mach-O"; then
-    if command -v file >/dev/null 2>&1; then
+if command -v file >/dev/null 2>&1; then
+    FILE_TYPE=$(file k8sql 2>/dev/null || echo "unknown")
+    if ! echo "$FILE_TYPE" | grep -q "executable\|ELF\|Mach-O"; then
         echo "Error: Downloaded file is not a valid executable"
-        echo "File type: $(file k8sql)"
+        echo "File type: $FILE_TYPE"
         exit 1
     fi
-    # If 'file' command not available, skip verification
 fi
 
 # Make executable
 chmod +x k8sql
 
-# Determine install location
-if [ -w /usr/local/bin ]; then
+# Install - try system location first, fall back to user location
+if mv k8sql /usr/local/bin/k8sql 2>/dev/null; then
     INSTALL_DIR="/usr/local/bin"
+    echo "Installed to /usr/local/bin/k8sql"
 else
     INSTALL_DIR="$HOME/.local/bin"
     mkdir -p "$INSTALL_DIR"
+    mv k8sql "${INSTALL_DIR}/k8sql"
+    echo "Installed to ${INSTALL_DIR}/k8sql"
 fi
-
-# Install
-echo "Installing to ${INSTALL_DIR}/k8sql..."
-mv k8sql "${INSTALL_DIR}/k8sql"
 
 # Verify installation
 if command -v k8sql >/dev/null 2>&1; then
     echo ""
     echo "✓ k8sql ${LATEST_VERSION} installed successfully!"
     echo ""
-    k8sql --version
+    if ! k8sql --version; then
+        echo "Warning: k8sql --version failed (may be missing dependencies)"
+    fi
     echo ""
     echo "Run 'k8sql --help' to get started."
 else
