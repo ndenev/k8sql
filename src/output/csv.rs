@@ -1,12 +1,12 @@
-use super::QueryResult;
+use super::{FormatOptions, OutputFormatter, QueryResult};
 
 pub struct CsvFormatter;
 
-impl CsvFormatter {
-    pub fn format(result: &QueryResult, no_headers: bool) -> String {
+impl OutputFormatter for CsvFormatter {
+    fn format(result: &QueryResult, options: &FormatOptions) -> String {
         let mut lines = Vec::new();
 
-        if !no_headers {
+        if !options.no_headers {
             lines.push(result.columns.join(","));
         }
 

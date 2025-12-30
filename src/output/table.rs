@@ -3,7 +3,7 @@ use std::collections::HashSet;
 
 use comfy_table::{Table, presets::ASCII_BORDERS_ONLY_CONDENSED};
 
-use super::QueryResult;
+use super::{FormatOptions, OutputFormatter, QueryResult};
 
 /// Maximum width for JSON columns (spec, status, labels, annotations, data)
 pub const MAX_JSON_COLUMN_WIDTH: usize = 60;
@@ -23,8 +23,8 @@ pub fn truncate_value(s: &str, max_len: usize) -> Cow<'_, str> {
 
 pub struct TableFormatter;
 
-impl TableFormatter {
-    pub fn format(result: &QueryResult, no_headers: bool) -> String {
+impl OutputFormatter for TableFormatter {
+    fn format(result: &QueryResult, options: &FormatOptions) -> String {
         if result.rows.is_empty() {
             return "(0 rows)".to_string();
         }
@@ -47,7 +47,7 @@ impl TableFormatter {
             })
             .collect();
 
-        if !no_headers {
+        if !options.no_headers {
             table.set_header(&result.columns);
         }
 
@@ -122,7 +122,7 @@ mod tests {
             ]],
         };
 
-        let output = TableFormatter::format(&result, false);
+        let output = TableFormatter::format(&result, &FormatOptions::new());
         // The output should NOT contain the full 80 char string
         assert!(!output.contains(&"a".repeat(80)));
         // Should contain truncated version with ...
@@ -140,7 +140,7 @@ mod tests {
             ]],
         };
 
-        let output = TableFormatter::format(&result, false);
+        let output = TableFormatter::format(&result, &FormatOptions::new());
         // The full string should be present
         assert!(output.contains(&"a".repeat(80)));
     }

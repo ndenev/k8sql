@@ -10,6 +10,30 @@ pub use yaml::YamlFormatter;
 
 use crate::cli::OutputFormat;
 
+/// Options for formatting query results
+#[derive(Debug, Clone, Default)]
+pub struct FormatOptions {
+    /// Whether to suppress column headers
+    pub no_headers: bool,
+}
+
+impl FormatOptions {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_no_headers(mut self, no_headers: bool) -> Self {
+        self.no_headers = no_headers;
+        self
+    }
+}
+
+/// Trait for formatting query results into different output formats
+pub trait OutputFormatter {
+    /// Format a query result with the given options
+    fn format(result: &QueryResult, options: &FormatOptions) -> String;
+}
+
 #[derive(Debug, Clone)]
 pub struct QueryResult {
     pub columns: Vec<String>,
@@ -18,11 +42,12 @@ pub struct QueryResult {
 
 impl QueryResult {
     pub fn format(&self, format: &OutputFormat, no_headers: bool) -> String {
+        let options = FormatOptions::new().with_no_headers(no_headers);
         match format {
-            OutputFormat::Table => TableFormatter::format(self, no_headers),
-            OutputFormat::Json => JsonFormatter::format(self),
-            OutputFormat::Csv => CsvFormatter::format(self, no_headers),
-            OutputFormat::Yaml => YamlFormatter::format(self),
+            OutputFormat::Table => TableFormatter::format(self, &options),
+            OutputFormat::Json => JsonFormatter::format(self, &options),
+            OutputFormat::Csv => CsvFormatter::format(self, &options),
+            OutputFormat::Yaml => YamlFormatter::format(self, &options),
         }
     }
 
