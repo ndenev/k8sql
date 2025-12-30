@@ -12,7 +12,7 @@ use rustyline::history::DefaultHistory;
 use rustyline::validate::{ValidationContext, ValidationResult, Validator};
 use rustyline::{Context, Editor, Helper};
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
 use tokio::sync::broadcast;
@@ -183,36 +183,25 @@ impl CompletionCache {
             ..Default::default()
         };
 
-        // Get tables from DataFusion's information_schema
-        if let Ok(result) = session
-            .execute_sql_to_strings(
-                "SELECT table_name FROM information_schema.tables WHERE table_schema = 'default'",
-            )
-            .await
-        {
-            for row in &result.rows {
-                if let Some(table_name) = row.first() {
-                    cache.tables.push(table_name.clone());
-                }
-            }
-        }
+        // Get tables and columns from the K8s resource registry (not from information_schema
+        // because DataFusion doesn't populate it for dynamically registered tables)
+        if let Ok(registry) = pool.get_registry(None).await {
+            for resource_info in registry.list_tables() {
+                cache.tables.push(resource_info.table_name.clone());
 
-        // Get columns from DataFusion's information_schema
-        if let Ok(result) = session
-            .execute_sql_to_strings(
-                "SELECT table_name, column_name FROM information_schema.columns WHERE table_schema = 'default'",
-            )
-            .await
-        {
-            for row in &result.rows {
-                if row.len() >= 2 {
-                    let table_name = &row[0];
-                    let column_name = &row[1];
-                    cache
-                        .columns
-                        .entry(table_name.clone())
-                        .or_default()
-                        .push(column_name.clone());
+                // Generate schema for this resource to get column names
+                let column_defs = crate::kubernetes::discovery::generate_schema(resource_info);
+                let column_names: Vec<String> =
+                    column_defs.iter().map(|col| col.name.clone()).collect();
+
+                // Insert columns for the main table name
+                cache
+                    .columns
+                    .insert(resource_info.table_name.clone(), column_names.clone());
+
+                // Also add columns for aliases
+                for alias in &resource_info.aliases {
+                    cache.columns.insert(alias.clone(), column_names.clone());
                 }
             }
         }
@@ -263,6 +252,17 @@ impl CompletionCache {
         let table_lower = table.to_lowercase();
         let table_name = self.aliases.get(&table_lower).unwrap_or(&table_lower);
         self.columns.get(table_name)
+    }
+
+    /// Get all unique column names across all tables (for when table is unknown)
+    fn get_all_columns(&self) -> Vec<String> {
+        let mut all_cols: HashSet<String> = HashSet::new();
+        for cols in self.columns.values() {
+            all_cols.extend(cols.iter().cloned());
+        }
+        let mut result: Vec<String> = all_cols.into_iter().collect();
+        result.sort();
+        result
     }
 }
 
@@ -477,6 +477,9 @@ impl Completer for SqlHelper {
 
         let mut matches: Vec<Pair> = Vec::new();
 
+        // Track if we're in General context (for filtering logic later)
+        let is_general_context = matches!(context, CompletionContext::General);
+
         // Get cache (read lock)
         let cache = self.cache.read().unwrap();
 
@@ -545,19 +548,29 @@ impl Completer for SqlHelper {
             }
 
             CompletionContext::ColumnName { table } => {
-                // If we know the table, use its columns; otherwise use general columns
-                let cols = table
-                    .as_ref()
-                    .and_then(|t| cache.get_columns(t))
-                    .or_else(|| cache.columns.get("pods")); // Default to pods columns
-
-                if let Some(columns) = cols {
-                    for col in columns {
-                        if col.starts_with(&prefix_lower) {
-                            matches.push(Pair {
-                                display: col.clone(),
-                                replacement: col.clone(),
-                            });
+                // Get columns based on whether we know the specific table
+                match table.as_ref().and_then(|t| cache.get_columns(t)) {
+                    Some(columns) => {
+                        // Known table - use its specific columns
+                        for col in columns {
+                            if col.starts_with(&prefix_lower) {
+                                matches.push(Pair {
+                                    display: col.clone(),
+                                    replacement: col.clone(),
+                                });
+                            }
+                        }
+                    }
+                    None => {
+                        // Unknown table (e.g., after SELECT, before FROM) - suggest all columns
+                        let all_columns = cache.get_all_columns();
+                        for col in &all_columns {
+                            if col.starts_with(&prefix_lower) {
+                                matches.push(Pair {
+                                    display: col.clone(),
+                                    replacement: col.clone(),
+                                });
+                            }
                         }
                     }
                 }
@@ -640,8 +653,9 @@ impl Completer for SqlHelper {
             }
         }
 
-        // If no prefix yet, don't show completions (avoid noise)
-        if prefix.is_empty() && matches.len() > 20 {
+        // In General context with no prefix, limit completions to avoid overwhelming noise
+        // But in specific contexts (ColumnName, TableName, etc.), show all matches even without prefix
+        if prefix.is_empty() && is_general_context && matches.len() > 20 {
             return Ok((pos, vec![]));
         }
 
