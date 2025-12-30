@@ -9,9 +9,6 @@ set -e
 
 # Cleanup on exit
 cleanup() {
-    if [ -f "k8sql.tmp" ]; then
-        rm -f k8sql.tmp
-    fi
     if [ -f "k8sql.sha256" ]; then
         rm -f k8sql.sha256
     fi
@@ -87,19 +84,28 @@ if ! curl -sSfL "$CHECKSUM_URL" -o k8sql.sha256; then
     echo "Proceeding without verification (not recommended)"
     echo "URL: $CHECKSUM_URL"
 else
-    # Verify checksum
+    # Verify checksum (extract hash from "hash  filename" format)
+    EXPECTED_HASH=$(awk '{print $1}' k8sql.sha256)
     if command -v sha256sum >/dev/null 2>&1; then
         # Linux
-        echo "$(cat k8sql.sha256)  k8sql" | sha256sum -c - || {
+        ACTUAL_HASH=$(sha256sum k8sql | awk '{print $1}')
+        if [ "$EXPECTED_HASH" != "$ACTUAL_HASH" ]; then
             echo "Error: Checksum verification failed"
+            echo "Expected: $EXPECTED_HASH"
+            echo "Got:      $ACTUAL_HASH"
             exit 1
-        }
+        fi
+        echo "Checksum verified successfully"
     elif command -v shasum >/dev/null 2>&1; then
         # macOS
-        echo "$(cat k8sql.sha256)  k8sql" | shasum -a 256 -c - || {
+        ACTUAL_HASH=$(shasum -a 256 k8sql | awk '{print $1}')
+        if [ "$EXPECTED_HASH" != "$ACTUAL_HASH" ]; then
             echo "Error: Checksum verification failed"
+            echo "Expected: $EXPECTED_HASH"
+            echo "Got:      $ACTUAL_HASH"
             exit 1
-        }
+        fi
+        echo "Checksum verified successfully"
     else
         echo "Warning: sha256sum/shasum not found, cannot verify checksum"
     fi
