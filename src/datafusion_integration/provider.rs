@@ -645,7 +645,6 @@ mod tests {
     use datafusion::common::Column;
     use datafusion::logical_expr::BinaryExpr;
     use datafusion::logical_expr::expr::InList;
-    use k8s_openapi::apimachinery::pkg::apis::meta::v1::APIResource;
     use kube::discovery::{ApiCapabilities, ApiResource, Scope};
 
     /// Helper to create a K8sTableProvider for testing

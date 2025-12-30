@@ -26,7 +26,7 @@ use crate::output::{
 };
 use crate::progress::ProgressUpdate;
 
-// SQL keywords from sqlparser (comprehensive list)
+// SQL keywords from sqlparser (for completion)
 use datafusion::sql::sqlparser::keywords::ALL_KEYWORDS;
 
 // For extracting function signatures
@@ -268,28 +268,11 @@ impl CompletionCache {
 
 struct SqlHelper {
     cache: Arc<RwLock<CompletionCache>>,
-    /// Pre-compiled regexes for keyword highlighting (avoids recompiling on every keystroke)
-    keyword_patterns: Vec<(regex::Regex, &'static str)>,
 }
 
 impl SqlHelper {
     fn new(cache: Arc<RwLock<CompletionCache>>) -> Self {
-        // Pre-compile keyword regexes once at startup
-        let keyword_patterns: Vec<_> = ALL_KEYWORDS
-            .iter()
-            .filter_map(|&kw| {
-                regex::RegexBuilder::new(&format!(r"\b{}\b", regex::escape(kw)))
-                    .case_insensitive(true)
-                    .build()
-                    .ok()
-                    .map(|re| (re, kw))
-            })
-            .collect();
-
-        Self {
-            cache,
-            keyword_patterns,
-        }
+        Self { cache }
     }
 }
 
@@ -668,18 +651,20 @@ impl Completer for SqlHelper {
 
 impl Highlighter for SqlHelper {
     fn highlight<'l>(&self, line: &'l str, _pos: usize) -> Cow<'l, str> {
-        // Use pre-compiled regex patterns for fast keyword highlighting
-        let mut result = line.to_string();
+        use datafusion::sql::sqlparser::tokenizer::Tokenizer;
 
-        for (re, kw) in &self.keyword_patterns {
-            result = re
-                .replace_all(&result, |_caps: &regex::Captures| {
-                    format!("\x1b[1;34m{}\x1b[0m", kw)
-                })
-                .to_string();
-        }
+        let dialect = datafusion::sql::sqlparser::dialect::GenericDialect {};
+        let mut tokenizer = Tokenizer::new(&dialect, line);
 
-        Cow::Owned(result)
+        let tokens = match tokenizer.tokenize() {
+            Ok(tokens) => tokens,
+            Err(_) => {
+                // Tokenization failed - try partial highlighting up to last whitespace
+                return Self::partial_highlight(line);
+            }
+        };
+
+        Cow::Owned(Self::highlight_tokens(&tokens))
     }
 
     fn highlight_prompt<'b, 's: 'b, 'p: 'b>(
@@ -692,6 +677,262 @@ impl Highlighter for SqlHelper {
 
     fn highlight_char(&self, _line: &str, _pos: usize, _kind: CmdKind) -> bool {
         true
+    }
+}
+
+impl SqlHelper {
+    /// Highlight a vector of tokens using context-aware keyword detection
+    fn highlight_tokens(tokens: &[datafusion::sql::sqlparser::tokenizer::Token]) -> String {
+        use datafusion::sql::sqlparser::keywords::Keyword;
+        use datafusion::sql::sqlparser::tokenizer::Token;
+
+        let mut result = String::new();
+
+        for (i, token) in tokens.iter().enumerate() {
+            let highlighted = match token {
+                // Words - check context to determine if keyword or identifier
+                Token::Word(w) if w.keyword != Keyword::NoKeyword => {
+                    let is_identifier_context = Self::is_identifier_context(&w.keyword, tokens, i);
+
+                    if is_identifier_context {
+                        w.value.to_string()
+                    } else {
+                        format!("\x1b[1;34m{}\x1b[0m", w.value.to_uppercase())
+                    }
+                }
+                // String literals - green
+                Token::SingleQuotedString(s) => format!("\x1b[32m'{}'\x1b[0m", s),
+                Token::DoubleQuotedString(s) => format!("\x1b[32m\"{}\"\x1b[0m", s),
+                Token::SingleQuotedByteStringLiteral(s) => format!("\x1b[32mb'{}'\x1b[0m", s),
+                Token::DoubleQuotedByteStringLiteral(s) => format!("\x1b[32mb\"{}\"\x1b[0m", s),
+                Token::NationalStringLiteral(s) => format!("\x1b[32mN'{}'\x1b[0m", s),
+                Token::HexStringLiteral(s) => format!("\x1b[32mX'{}'\x1b[0m", s),
+                // Numbers - cyan
+                Token::Number(n, _) => format!("\x1b[36m{}\x1b[0m", n),
+                // Everything else - no highlighting
+                _ => token.to_string(),
+            };
+            result.push_str(&highlighted);
+        }
+
+        result
+    }
+
+    /// Partial highlighting when full tokenization fails
+    /// Tokenizes up to the last whitespace, then appends incomplete part
+    fn partial_highlight(line: &str) -> Cow<'_, str> {
+        use datafusion::sql::sqlparser::tokenizer::Tokenizer;
+
+        // Find last whitespace position
+        if let Some(last_ws_pos) = line.rfind(char::is_whitespace) {
+            let complete_part = &line[..=last_ws_pos];
+            let incomplete_part = &line[last_ws_pos + 1..];
+
+            // Try to tokenize the complete part
+            let dialect = datafusion::sql::sqlparser::dialect::GenericDialect {};
+            let mut tokenizer = Tokenizer::new(&dialect, complete_part);
+
+            if let Ok(tokens) = tokenizer.tokenize() {
+                let mut result = Self::highlight_tokens(&tokens);
+
+                // Append incomplete part with minimal highlighting
+                if incomplete_part.starts_with('\'') || incomplete_part.starts_with('"') {
+                    // Incomplete string - highlight in yellow
+                    result.push_str(&format!("\x1b[33m{}\x1b[0m", incomplete_part));
+                } else {
+                    // Just append as-is
+                    result.push_str(incomplete_part);
+                }
+
+                return Cow::Owned(result);
+            }
+        }
+
+        // Can't tokenize anything - return as-is
+        Cow::Borrowed(line)
+    }
+
+    /// Determine if a keyword token is actually being used as an identifier
+    /// by analyzing the surrounding tokens (skipping whitespace)
+    fn is_identifier_context(
+        keyword: &datafusion::sql::sqlparser::keywords::Keyword,
+        tokens: &[datafusion::sql::sqlparser::tokenizer::Token],
+        current_index: usize,
+    ) -> bool {
+        use datafusion::sql::sqlparser::keywords::Keyword;
+        use datafusion::sql::sqlparser::tokenizer::Token;
+
+        // Helper to find next non-whitespace token
+        let find_next_non_ws = |start: usize| -> Option<&Token> {
+            tokens[start..]
+                .iter()
+                .find(|t| !matches!(t, Token::Whitespace(_)))
+        };
+
+        // Helper to find previous non-whitespace token
+        let find_prev_non_ws = |end: usize| -> Option<&Token> {
+            tokens[..end]
+                .iter()
+                .rev()
+                .find(|t| !matches!(t, Token::Whitespace(_)))
+        };
+
+        // Check next non-whitespace token
+        if let Some(next) = find_next_non_ws(current_index + 1) {
+            match next {
+                // If followed by comparison operators, it's likely a column reference
+                Token::Eq
+                | Token::Neq
+                | Token::Lt
+                | Token::Gt
+                | Token::LtEq
+                | Token::GtEq
+                | Token::Spaceship => {
+                    return true; // Identifier in comparison
+                }
+                // If followed by period, it's a schema/table qualifier
+                Token::Period => {
+                    return true; // Identifier used as qualifier
+                }
+                // If followed by FROM, we're in SELECT column list
+                Token::Word(w) if matches!(w.keyword, Keyword::FROM) => {
+                    return true; // Column in SELECT list
+                }
+                // If followed by comma, could be in SELECT list or other contexts
+                Token::Comma => {
+                    // Check if we're between SELECT and FROM
+                    if Self::is_between_select_and_from(tokens, current_index) {
+                        return true; // Column in SELECT list
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // Check previous non-whitespace token
+        if let Some(prev) = find_prev_non_ws(current_index) {
+            match prev {
+                // After SELECT, likely a column name
+                Token::Word(w) if w.keyword == Keyword::SELECT => {
+                    return true; // Column in SELECT list
+                }
+                // After comma in SELECT context
+                Token::Comma => {
+                    if Self::is_between_select_and_from(tokens, current_index) {
+                        return true; // Column in SELECT list
+                    }
+                }
+                // After FROM/JOIN, this is a table name
+                Token::Word(w) if matches!(w.keyword, Keyword::FROM | Keyword::JOIN) => {
+                    return true; // Table name
+                }
+                // After comparison operators, it's a value/column reference
+                Token::Eq | Token::Neq | Token::Lt | Token::Gt | Token::LtEq | Token::GtEq => {
+                    return true; // Right side of comparison
+                }
+                // After period, it's part of a qualified name
+                Token::Period => {
+                    return true; // Part of qualified identifier
+                }
+                _ => {}
+            }
+        }
+
+        // If context is ambiguous, check if it's a structural keyword
+        // These are almost certainly keywords unless context says otherwise (checked above)
+        let structural_keyword = matches!(
+            keyword,
+            Keyword::SELECT
+                | Keyword::FROM
+                | Keyword::WHERE
+                | Keyword::ORDER
+                | Keyword::GROUP
+                | Keyword::HAVING
+                | Keyword::LIMIT
+                | Keyword::OFFSET
+                | Keyword::JOIN
+                | Keyword::LEFT
+                | Keyword::RIGHT
+                | Keyword::INNER
+                | Keyword::OUTER
+                | Keyword::CROSS
+                | Keyword::ON
+                | Keyword::USING
+                | Keyword::UNION
+                | Keyword::INTERSECT
+                | Keyword::EXCEPT
+                | Keyword::INSERT
+                | Keyword::UPDATE
+                | Keyword::DELETE
+                | Keyword::CREATE
+                | Keyword::DROP
+                | Keyword::ALTER
+                | Keyword::TABLE
+                | Keyword::INDEX
+                | Keyword::VIEW
+                | Keyword::DISTINCT
+                | Keyword::ALL
+                | Keyword::BY
+                | Keyword::ASC
+                | Keyword::DESC
+                | Keyword::NULLS
+                | Keyword::FIRST
+                | Keyword::LAST
+                | Keyword::CASE
+                | Keyword::WHEN
+                | Keyword::THEN
+                | Keyword::ELSE
+                | Keyword::END
+                | Keyword::AND
+                | Keyword::OR
+                | Keyword::NOT
+                | Keyword::IN
+                | Keyword::EXISTS
+                | Keyword::BETWEEN
+                | Keyword::LIKE
+                | Keyword::IS
+                | Keyword::NULL
+                | Keyword::AS
+                | Keyword::INTO
+                | Keyword::VALUES
+                | Keyword::SET
+                | Keyword::SHOW
+                | Keyword::DESCRIBE
+                | Keyword::USE
+        );
+
+        // Default: treat structural keywords as keywords, others as identifiers
+        !structural_keyword
+    }
+
+    /// Check if current position is between SELECT and FROM (column list context)
+    fn is_between_select_and_from(
+        tokens: &[datafusion::sql::sqlparser::tokenizer::Token],
+        current_index: usize,
+    ) -> bool {
+        use datafusion::sql::sqlparser::keywords::Keyword;
+        use datafusion::sql::sqlparser::tokenizer::Token;
+
+        // Look backwards to see if SELECT appears anywhere before current position
+        let has_select_before = tokens[..current_index]
+            .iter()
+            .rev()
+            .filter_map(|t| match t {
+                Token::Word(w) => Some(w.keyword),
+                _ => None,
+            })
+            .any(|kw| kw == Keyword::SELECT);
+
+        // Look forwards to see if FROM appears anywhere after current position
+        let has_from_after = tokens[current_index..]
+            .iter()
+            .filter_map(|t| match t {
+                Token::Word(w) => Some(w.keyword),
+                _ => None,
+            })
+            .any(|kw| kw == Keyword::FROM);
+
+        has_select_before && !has_from_after
     }
 }
 
