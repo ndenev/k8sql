@@ -113,6 +113,10 @@ impl<'a> ColumnBuilder<'a> {
     }
 
     /// Build a simple string column by extracting values from JSON
+    ///
+    /// Note: Uses extract_field_value() which handles JSON value formatting,
+    /// while timestamp/integer builders use get_nested_value() to access raw
+    /// JSON values for type-specific parsing.
     fn build_string_array(&self) -> Result<(ArrayRef, Field)> {
         let mut builder = StringBuilder::new();
 

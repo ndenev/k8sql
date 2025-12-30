@@ -50,11 +50,11 @@ impl<'a> ContextMatcher<'a> {
             } else {
                 // Exact match
                 let pattern_str = pattern.to_string();
-                if self.available_contexts.contains(&pattern_str)
-                    && !matched_contexts.contains(&pattern_str)
-                {
-                    matched_contexts.push(pattern_str);
-                } else if !self.available_contexts.contains(&pattern.to_string()) {
+                if self.available_contexts.contains(&pattern_str) {
+                    if !matched_contexts.contains(&pattern_str) {
+                        matched_contexts.push(pattern_str);
+                    }
+                } else {
                     return Err(anyhow!("Context '{}' not found", pattern));
                 }
             }

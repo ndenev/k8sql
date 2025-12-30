@@ -26,6 +26,7 @@ pub enum ColumnDataType {
     Integer,
 }
 
+/// Convert ColumnDataType to string representation (always lowercase)
 impl std::fmt::Display for ColumnDataType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {

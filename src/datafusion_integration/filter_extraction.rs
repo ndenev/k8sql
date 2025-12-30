@@ -72,6 +72,8 @@ impl<'a, F: FilterValue> FilterExtractor<'a, F> {
                     let values = deduplicate(values);
 
                     // Check for special values first
+                    // Note: Special values (e.g., "*" for all clusters) take precedence
+                    // over literal matches when found in multi-value expressions
                     for value in &values {
                         if let Some(special) = F::handle_special(value) {
                             return Some(special);
@@ -118,6 +120,7 @@ impl<'a, F: FilterValue> FilterExtractor<'a, F> {
                         }
 
                         // Check for special values
+                        // Note: Special values take precedence in multi-value expressions
                         for value in &values {
                             if let Some(special) = F::handle_special(value) {
                                 return Some(special);
@@ -200,6 +203,7 @@ mod tests {
         Default,
         Single(String),
         Multiple(Vec<String>),
+        Special,
     }
 
     impl FilterValue for TestFilter {
@@ -213,6 +217,14 @@ mod tests {
 
         fn from_multiple(values: Vec<String>) -> Self {
             TestFilter::Multiple(values)
+        }
+
+        fn handle_special(value: &str) -> Option<Self> {
+            if value == "*" {
+                Some(TestFilter::Special)
+            } else {
+                None
+            }
         }
     }
 
@@ -249,5 +261,29 @@ mod tests {
             result,
             TestFilter::Multiple(vec!["a".to_string(), "b".to_string()])
         );
+    }
+
+    #[test]
+    fn test_special_value_single() {
+        let extractor = FilterExtractor::<TestFilter>::new("test_col");
+        let expr = col("test_col").eq(lit("*"));
+
+        let result = extractor.extract(&[expr]);
+        assert_eq!(result, TestFilter::Special);
+    }
+
+    #[test]
+    fn test_special_value_in_or() {
+        let extractor = FilterExtractor::<TestFilter>::new("test_col");
+        // test_col = 'a' OR test_col = '*'
+        // Special value should take precedence
+        let expr = Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(col("test_col").eq(lit("a"))),
+            op: Operator::Or,
+            right: Box::new(col("test_col").eq(lit("*"))),
+        });
+
+        let result = extractor.extract(&[expr]);
+        assert_eq!(result, TestFilter::Special);
     }
 }
