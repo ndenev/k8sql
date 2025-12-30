@@ -91,12 +91,105 @@ fn build_column_array(
         // Special case: _cluster is injected, not from JSON
         "_cluster" => build_cluster_column(cluster, resources.len()),
 
-        // Dispatch based on data_type
-        _ => match col.data_type {
-            ColumnDataType::Timestamp => build_timestamp_column(col, resources),
-            ColumnDataType::Integer => build_integer_column(col, resources),
-            ColumnDataType::Text => build_string_column(col, resources),
-        },
+        // Use ColumnBuilder for all other columns
+        _ => ColumnBuilder { col, resources }.build(),
+    }
+}
+
+/// Encapsulates column building logic for different data types
+struct ColumnBuilder<'a> {
+    col: &'a ColumnDef,
+    resources: &'a [serde_json::Value],
+}
+
+impl<'a> ColumnBuilder<'a> {
+    /// Build the appropriate array based on column data type
+    fn build(self) -> Result<(ArrayRef, Field)> {
+        match self.col.data_type {
+            ColumnDataType::Text => self.build_string_array(),
+            ColumnDataType::Timestamp => self.build_timestamp_array(),
+            ColumnDataType::Integer => self.build_integer_array(),
+        }
+    }
+
+    /// Build a simple string column by extracting values from JSON
+    fn build_string_array(&self) -> Result<(ArrayRef, Field)> {
+        let mut builder = StringBuilder::new();
+
+        for resource in self.resources {
+            match extract_field_value(resource, &self.col.name, self.col.json_path.as_deref()) {
+                Some(value) => builder.append_value(&value),
+                None => builder.append_null(),
+            }
+        }
+
+        let array = Arc::new(builder.finish()) as ArrayRef;
+        let field = Field::new(&self.col.name, DataType::Utf8, true);
+        Ok((array, field))
+    }
+
+    /// Build a timestamp column by parsing RFC 3339 datetime strings from JSON
+    /// Kubernetes uses RFC 3339 format: "2024-01-15T10:30:00Z"
+    fn build_timestamp_array(&self) -> Result<(ArrayRef, Field)> {
+        let mut builder = TimestampMillisecondBuilder::new();
+
+        for resource in self.resources {
+            let path = self.col.json_path.as_deref().unwrap_or(&self.col.name);
+            let value = get_nested_value(resource, path);
+
+            match value.as_str() {
+                Some(s) => {
+                    // Parse RFC 3339 timestamp (Kubernetes format)
+                    match DateTime::parse_from_rfc3339(s) {
+                        Ok(dt) => {
+                            let utc: DateTime<Utc> = dt.into();
+                            builder.append_value(utc.timestamp_millis());
+                        }
+                        Err(_) => builder.append_null(),
+                    }
+                }
+                None => builder.append_null(),
+            }
+        }
+
+        let array = Arc::new(builder.finish()) as ArrayRef;
+        let data_type = DataType::Timestamp(TimeUnit::Millisecond, None);
+        let field = Field::new(&self.col.name, data_type, true);
+        Ok((array, field))
+    }
+
+    /// Build an integer column by extracting numeric values from JSON
+    fn build_integer_array(&self) -> Result<(ArrayRef, Field)> {
+        let mut builder = Int64Builder::new();
+
+        for resource in self.resources {
+            let path = self.col.json_path.as_deref().unwrap_or(&self.col.name);
+            let value = get_nested_value(resource, path);
+
+            match &value {
+                serde_json::Value::Number(n) => {
+                    if let Some(i) = n.as_i64() {
+                        builder.append_value(i);
+                    } else if let Some(u) = n.as_u64() {
+                        // Handle unsigned that fits in i64
+                        builder.append_value(u as i64);
+                    } else {
+                        builder.append_null();
+                    }
+                }
+                serde_json::Value::Null => builder.append_null(),
+                // Try to parse string as integer (shouldn't happen with K8s API)
+                serde_json::Value::String(s) => match s.parse::<i64>() {
+                    Ok(i) => builder.append_value(i),
+                    Err(_) => builder.append_null(),
+                },
+                _ => builder.append_null(),
+            }
+        }
+
+        let array = Arc::new(builder.finish()) as ArrayRef;
+        let field = Field::new(&self.col.name, DataType::Int64, true);
+        Ok((array, field))
     }
 }
 
@@ -108,95 +201,6 @@ fn build_cluster_column(cluster: &str, num_rows: usize) -> Result<(ArrayRef, Fie
     }
     let array = Arc::new(builder.finish()) as ArrayRef;
     let field = Field::new("_cluster", DataType::Utf8, true);
-    Ok((array, field))
-}
-
-/// Build a simple string column by extracting values from JSON
-fn build_string_column(
-    col: &ColumnDef,
-    resources: &[serde_json::Value],
-) -> Result<(ArrayRef, Field)> {
-    let mut builder = StringBuilder::new();
-
-    for resource in resources {
-        match extract_field_value(resource, &col.name, col.json_path.as_deref()) {
-            Some(value) => builder.append_value(&value),
-            None => builder.append_null(),
-        }
-    }
-
-    let array = Arc::new(builder.finish()) as ArrayRef;
-    let field = Field::new(&col.name, DataType::Utf8, true);
-    Ok((array, field))
-}
-
-/// Build a timestamp column by parsing RFC 3339 datetime strings from JSON
-/// Kubernetes uses RFC 3339 format: "2024-01-15T10:30:00Z"
-fn build_timestamp_column(
-    col: &ColumnDef,
-    resources: &[serde_json::Value],
-) -> Result<(ArrayRef, Field)> {
-    let mut builder = TimestampMillisecondBuilder::new();
-
-    for resource in resources {
-        let path = col.json_path.as_deref().unwrap_or(&col.name);
-        let value = get_nested_value(resource, path);
-
-        match value.as_str() {
-            Some(s) => {
-                // Parse RFC 3339 timestamp (Kubernetes format)
-                match DateTime::parse_from_rfc3339(s) {
-                    Ok(dt) => {
-                        let utc: DateTime<Utc> = dt.into();
-                        builder.append_value(utc.timestamp_millis());
-                    }
-                    Err(_) => builder.append_null(),
-                }
-            }
-            None => builder.append_null(),
-        }
-    }
-
-    let array = Arc::new(builder.finish()) as ArrayRef;
-    let data_type = DataType::Timestamp(TimeUnit::Millisecond, None);
-    let field = Field::new(&col.name, data_type, true);
-    Ok((array, field))
-}
-
-/// Build an integer column by extracting numeric values from JSON
-fn build_integer_column(
-    col: &ColumnDef,
-    resources: &[serde_json::Value],
-) -> Result<(ArrayRef, Field)> {
-    let mut builder = Int64Builder::new();
-
-    for resource in resources {
-        let path = col.json_path.as_deref().unwrap_or(&col.name);
-        let value = get_nested_value(resource, path);
-
-        match &value {
-            serde_json::Value::Number(n) => {
-                if let Some(i) = n.as_i64() {
-                    builder.append_value(i);
-                } else if let Some(u) = n.as_u64() {
-                    // Handle unsigned that fits in i64
-                    builder.append_value(u as i64);
-                } else {
-                    builder.append_null();
-                }
-            }
-            serde_json::Value::Null => builder.append_null(),
-            // Try to parse string as integer (shouldn't happen with K8s API)
-            serde_json::Value::String(s) => match s.parse::<i64>() {
-                Ok(i) => builder.append_value(i),
-                Err(_) => builder.append_null(),
-            },
-            _ => builder.append_null(),
-        }
-    }
-
-    let array = Arc::new(builder.finish()) as ArrayRef;
-    let field = Field::new(&col.name, DataType::Int64, true);
     Ok((array, field))
 }
 
@@ -482,7 +486,12 @@ mod tests {
             serde_json::json!({"metadata": {}}), // missing name
         ];
 
-        let (array, field) = build_string_column(&col, &resources).unwrap();
+        let (array, field) = ColumnBuilder {
+            col: &col,
+            resources: &resources,
+        }
+        .build()
+        .unwrap();
 
         assert_eq!(field.name(), "name");
         assert_eq!(field.data_type(), &DataType::Utf8);
