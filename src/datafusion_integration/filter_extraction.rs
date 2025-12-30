@@ -14,15 +14,13 @@ pub trait FilterValue: Sized {
 
     /// Handle special values (e.g., "*" for clusters)
     /// Returns Some(filter) if the value should be treated specially, None otherwise
-    fn handle_special(value: &str) -> Option<Self> {
-        let _ = value;
+    fn handle_special(_value: &str) -> Option<Self> {
         None
     }
 
     /// Construct from negated list (e.g., NOT IN)
     /// Returns Some(filter) if negation is supported, None otherwise
-    fn from_negated(values: Vec<String>) -> Option<Self> {
-        let _ = values;
+    fn from_negated(_values: Vec<String>) -> Option<Self> {
         None
     }
 }
