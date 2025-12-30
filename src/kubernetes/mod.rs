@@ -1,5 +1,6 @@
 mod cache;
 mod client;
+mod context_matcher;
 pub mod discovery;
 
 pub use cache::ResourceCache;

@@ -4,7 +4,6 @@
 //! DataFusion TableProvider implementation for Kubernetes resources
 
 use std::any::Any;
-use std::collections::HashSet;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -23,32 +22,7 @@ use crate::kubernetes::discovery::{ResourceInfo, generate_schema};
 
 use super::convert::to_arrow_schema;
 use super::execution::{K8sExecutionPlan, QueryTarget};
-
-/// Extract string literals from an IN list expression
-fn extract_string_literals(in_list: &datafusion::logical_expr::expr::InList) -> Vec<String> {
-    in_list
-        .list
-        .iter()
-        .filter_map(|e| {
-            if let Expr::Literal(lit, _) = e
-                && let datafusion::common::ScalarValue::Utf8(Some(s)) = lit
-            {
-                Some(s.clone())
-            } else {
-                None
-            }
-        })
-        .collect()
-}
-
-/// Deduplicate a list of strings while preserving order
-fn deduplicate(values: Vec<String>) -> Vec<String> {
-    let mut seen = HashSet::new();
-    values
-        .into_iter()
-        .filter(|v| seen.insert(v.clone()))
-        .collect()
-}
+use super::filter_extraction::{FilterExtractor, FilterValue};
 
 /// Represents how clusters should be selected for a query
 #[derive(Debug, Clone)]
@@ -72,6 +46,48 @@ enum NamespaceFilter {
     Single(String),
     /// Multiple namespaces (namespace IN ('x', 'y')) - parallel queries
     Multiple(Vec<String>),
+}
+
+// FilterValue trait implementations for generic filter extraction
+
+impl FilterValue for ClusterFilter {
+    fn default() -> Self {
+        ClusterFilter::Default
+    }
+
+    fn from_single(value: String) -> Self {
+        ClusterFilter::Include(vec![value])
+    }
+
+    fn from_multiple(values: Vec<String>) -> Self {
+        ClusterFilter::Include(values)
+    }
+
+    fn handle_special(value: &str) -> Option<Self> {
+        if value == "*" {
+            Some(ClusterFilter::All)
+        } else {
+            None
+        }
+    }
+
+    fn from_negated(values: Vec<String>) -> Option<Self> {
+        Some(ClusterFilter::Exclude(values))
+    }
+}
+
+impl FilterValue for NamespaceFilter {
+    fn default() -> Self {
+        NamespaceFilter::All
+    }
+
+    fn from_single(value: String) -> Self {
+        NamespaceFilter::Single(value)
+    }
+
+    fn from_multiple(values: Vec<String>) -> Self {
+        NamespaceFilter::Multiple(values)
+    }
 }
 
 /// A DataFusion TableProvider that fetches data from Kubernetes
@@ -99,202 +115,13 @@ impl K8sTableProvider {
     /// Extract namespace filter from DataFusion expressions
     /// Supports: namespace = 'x', namespace IN (...), and OR chains
     fn extract_namespace_filter(&self, filters: &[Expr]) -> NamespaceFilter {
-        for filter in filters {
-            if let Some(result) = self.extract_namespace_filter_from_expr(filter) {
-                return result;
-            }
-        }
-        NamespaceFilter::All
-    }
-
-    /// Recursively extract namespace filter from a single expression
-    /// Handles AND expressions by checking both sides
-    fn extract_namespace_filter_from_expr(&self, expr: &Expr) -> Option<NamespaceFilter> {
-        match expr {
-            // Handle AND expressions - check both sides
-            Expr::BinaryExpr(binary) if binary.op == Operator::And => {
-                if let Some(result) = self.extract_namespace_filter_from_expr(&binary.left) {
-                    return Some(result);
-                }
-                self.extract_namespace_filter_from_expr(&binary.right)
-            }
-            // Handle OR expressions - DataFusion transforms IN lists to OR chains
-            // e.g., namespace IN ('a', 'b') becomes (namespace = 'a') OR (namespace = 'b')
-            Expr::BinaryExpr(binary) if binary.op == Operator::Or => {
-                let mut namespaces = Vec::new();
-                if self.collect_namespace_values_from_or(expr, &mut namespaces)
-                    && !namespaces.is_empty()
-                {
-                    let namespaces = deduplicate(namespaces);
-                    if namespaces.len() == 1 {
-                        return Some(NamespaceFilter::Single(
-                            namespaces.into_iter().next().unwrap(),
-                        ));
-                    }
-                    return Some(NamespaceFilter::Multiple(namespaces));
-                }
-                None
-            }
-            // Handle namespace = 'value'
-            Expr::BinaryExpr(binary)
-                if matches!(binary.op, Operator::Eq)
-                    && matches!(binary.left.as_ref(), Expr::Column(col) if col.name == "namespace") =>
-            {
-                if let Expr::Literal(lit, _) = binary.right.as_ref()
-                    && let datafusion::common::ScalarValue::Utf8(Some(ns)) = lit
-                {
-                    return Some(NamespaceFilter::Single(ns.clone()));
-                }
-                None
-            }
-            // Handle namespace IN ('a', 'b', 'c')
-            // Note: DataFusion often rewrites IN to OR, but keep this for completeness
-            Expr::InList(in_list) => {
-                if let Expr::Column(col) = in_list.expr.as_ref()
-                    && col.name == "namespace"
-                    && !in_list.negated
-                {
-                    let namespaces = deduplicate(extract_string_literals(in_list));
-                    if !namespaces.is_empty() {
-                        if namespaces.len() == 1 {
-                            return Some(NamespaceFilter::Single(
-                                namespaces.into_iter().next().unwrap(),
-                            ));
-                        }
-                        return Some(NamespaceFilter::Multiple(namespaces));
-                    }
-                }
-                None
-            }
-            _ => None,
-        }
-    }
-
-    /// Recursively collect namespace values from an OR expression tree
-    /// Returns true if all leaves are `namespace = 'value'` patterns
-    fn collect_namespace_values_from_or(&self, expr: &Expr, namespaces: &mut Vec<String>) -> bool {
-        match expr {
-            Expr::BinaryExpr(binary) if binary.op == Operator::Or => {
-                // Recursively collect from both sides
-                self.collect_namespace_values_from_or(&binary.left, namespaces)
-                    && self.collect_namespace_values_from_or(&binary.right, namespaces)
-            }
-            Expr::BinaryExpr(binary)
-                if matches!(binary.op, Operator::Eq)
-                    && matches!(binary.left.as_ref(), Expr::Column(col) if col.name == "namespace") =>
-            {
-                // Extract the namespace value
-                if let Expr::Literal(lit, _) = binary.right.as_ref()
-                    && let datafusion::common::ScalarValue::Utf8(Some(ns)) = lit
-                {
-                    namespaces.push(ns.clone());
-                    return true;
-                }
-                false
-            }
-            _ => false, // Not a valid namespace pattern
-        }
+        FilterExtractor::new("namespace").extract(filters)
     }
 
     /// Extract _cluster filter from DataFusion expressions
     /// Supports: _cluster = 'x', _cluster = '*', _cluster IN (...), _cluster NOT IN (...)
     fn extract_cluster_filter(&self, filters: &[Expr]) -> ClusterFilter {
-        for filter in filters {
-            if let Some(result) = self.extract_cluster_filter_from_expr(filter) {
-                return result;
-            }
-        }
-        ClusterFilter::Default
-    }
-
-    /// Recursively extract _cluster filter from a single expression
-    /// Handles AND expressions by checking both sides
-    fn extract_cluster_filter_from_expr(&self, expr: &Expr) -> Option<ClusterFilter> {
-        match expr {
-            // Handle AND expressions - check both sides
-            Expr::BinaryExpr(binary) if binary.op == Operator::And => {
-                if let Some(result) = self.extract_cluster_filter_from_expr(&binary.left) {
-                    return Some(result);
-                }
-                self.extract_cluster_filter_from_expr(&binary.right)
-            }
-            // Handle OR expressions - DataFusion transforms IN lists to OR chains
-            // e.g., _cluster IN ('a', 'b') becomes (_cluster = 'a') OR (_cluster = 'b')
-            Expr::BinaryExpr(binary) if binary.op == Operator::Or => {
-                let mut clusters = Vec::new();
-                if self.collect_cluster_values_from_or(expr, &mut clusters) && !clusters.is_empty()
-                {
-                    // Check if '*' is in the list - treat as All
-                    if clusters.iter().any(|c| c == "*") {
-                        return Some(ClusterFilter::All);
-                    }
-                    return Some(ClusterFilter::Include(clusters));
-                }
-                None
-            }
-            // Handle _cluster = 'value' or _cluster = '*'
-            Expr::BinaryExpr(binary)
-                if matches!(binary.op, Operator::Eq)
-                    && matches!(binary.left.as_ref(), Expr::Column(col) if col.name == "_cluster") =>
-            {
-                if let Expr::Literal(lit, _) = binary.right.as_ref()
-                    && let datafusion::common::ScalarValue::Utf8(Some(cluster)) = lit
-                {
-                    if cluster == "*" {
-                        return Some(ClusterFilter::All);
-                    }
-                    return Some(ClusterFilter::Include(vec![cluster.clone()]));
-                }
-                None
-            }
-            // Handle _cluster IN ('a', 'b', 'c') or _cluster NOT IN ('a', 'b')
-            // Note: DataFusion often rewrites IN to OR, but keep this for completeness
-            Expr::InList(in_list) => {
-                if let Expr::Column(col) = in_list.expr.as_ref()
-                    && col.name == "_cluster"
-                {
-                    let clusters = extract_string_literals(in_list);
-                    if !clusters.is_empty() {
-                        if in_list.negated {
-                            return Some(ClusterFilter::Exclude(clusters));
-                        }
-                        // Check if '*' is in the list - treat as All
-                        if clusters.iter().any(|c| c == "*") {
-                            return Some(ClusterFilter::All);
-                        }
-                        return Some(ClusterFilter::Include(clusters));
-                    }
-                }
-                None
-            }
-            _ => None,
-        }
-    }
-
-    /// Recursively collect cluster values from an OR expression tree
-    /// Returns true if all leaves are `_cluster = 'value'` patterns
-    fn collect_cluster_values_from_or(&self, expr: &Expr, clusters: &mut Vec<String>) -> bool {
-        match expr {
-            Expr::BinaryExpr(binary) if binary.op == Operator::Or => {
-                // Recursively collect from both sides
-                self.collect_cluster_values_from_or(&binary.left, clusters)
-                    && self.collect_cluster_values_from_or(&binary.right, clusters)
-            }
-            Expr::BinaryExpr(binary)
-                if matches!(binary.op, Operator::Eq)
-                    && matches!(binary.left.as_ref(), Expr::Column(col) if col.name == "_cluster") =>
-            {
-                // Extract the cluster value
-                if let Expr::Literal(lit, _) = binary.right.as_ref()
-                    && let datafusion::common::ScalarValue::Utf8(Some(cluster)) = lit
-                {
-                    clusters.push(cluster.clone());
-                    return true;
-                }
-                false
-            }
-            _ => false, // Not a valid _cluster pattern
-        }
+        FilterExtractor::new("_cluster").extract(filters)
     }
 
     /// Extract label selectors from DataFusion expressions
@@ -423,9 +250,14 @@ impl TableProvider for K8sTableProvider {
                     // Check for OR chains: (_cluster = 'a') OR (_cluster = 'b')
                     // DataFusion rewrites IN lists to OR chains before calling us
                     if binary.op == Operator::Or {
-                        let mut clusters = Vec::new();
-                        if self.collect_cluster_values_from_or(f, &mut clusters)
-                            && !clusters.is_empty()
+                        // Try to extract cluster or namespace filter from OR expression
+                        let cluster_filter = FilterExtractor::<ClusterFilter>::new("_cluster")
+                            .extract(&[(*f).clone()]);
+                        let namespace_filter = FilterExtractor::<NamespaceFilter>::new("namespace")
+                            .extract(&[(*f).clone()]);
+
+                        if !matches!(cluster_filter, ClusterFilter::Default)
+                            || !matches!(namespace_filter, NamespaceFilter::All)
                         {
                             return TableProviderFilterPushDown::Exact;
                         }
