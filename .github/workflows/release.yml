@@ -168,6 +168,16 @@ jobs:
           path: artifacts
           merge-multiple: true
 
+      - name: Generate SHA256 checksums
+        run: |
+          cd artifacts
+          for file in k8sql-*; do
+            sha256sum "$file" > "$file.sha256"
+            echo "Generated checksum for $file:"
+            cat "$file.sha256"
+          done
+          cd ..
+
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
@@ -185,6 +195,14 @@ jobs:
           path: artifacts
           merge-multiple: true
 
+      - name: Generate SHA256 checksums
+        run: |
+          cd artifacts
+          for file in k8sql-*; do
+            sha256sum "$file" > "$file.sha256"
+          done
+          cd ..
+
       - name: Summary
         run: |
           echo "=== DRY RUN COMPLETE ==="
@@ -193,5 +211,8 @@ jobs:
           echo ""
           echo "Built artifacts:"
           ls -la artifacts/
+          echo ""
+          echo "Checksums:"
+          cat artifacts/*.sha256
           echo ""
           echo "To perform a real release, run without dry_run checked."
