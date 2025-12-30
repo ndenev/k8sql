@@ -913,32 +913,24 @@ impl SqlHelper {
         use datafusion::sql::sqlparser::keywords::Keyword;
         use datafusion::sql::sqlparser::tokenizer::Token;
 
-        // Look backwards for SELECT
+        // Look backwards to see if SELECT appears anywhere before current position
         let has_select_before = tokens[..current_index]
             .iter()
             .rev()
-            .find(|t| matches!(t, Token::Word(_)))
-            .map(|t| {
-                if let Token::Word(w) = t {
-                    w.keyword == Keyword::SELECT
-                } else {
-                    false
-                }
+            .filter_map(|t| match t {
+                Token::Word(w) => Some(w.keyword),
+                _ => None,
             })
-            .unwrap_or(false);
+            .any(|kw| kw == Keyword::SELECT);
 
-        // Look forwards for FROM
+        // Look forwards to see if FROM appears anywhere after current position
         let has_from_after = tokens[current_index..]
             .iter()
-            .find(|t| matches!(t, Token::Word(_)))
-            .map(|t| {
-                if let Token::Word(w) = t {
-                    w.keyword == Keyword::FROM
-                } else {
-                    false
-                }
+            .filter_map(|t| match t {
+                Token::Word(w) => Some(w.keyword),
+                _ => None,
             })
-            .unwrap_or(false);
+            .any(|kw| kw == Keyword::FROM);
 
         has_select_before && !has_from_after
     }
