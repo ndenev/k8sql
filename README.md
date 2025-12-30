@@ -12,11 +12,23 @@ Query Kubernetes clusters using SQL. Powered by [Apache DataFusion](https://data
 
 ## Installation
 
+### Quick Install (Linux/macOS)
+
+```bash
+curl -sSfL https://raw.githubusercontent.com/ndenev/k8sql/master/install.sh | sh
+```
+
+The script automatically detects your OS and architecture, downloads the latest release, and installs to `/usr/local/bin` or `~/.local/bin`.
+
+### From Cargo
+
 ```bash
 cargo install k8sql
 ```
 
-Or download binaries from [GitHub Releases](https://github.com/ndenev/k8sql/releases).
+### Manual Download
+
+Download pre-built binaries for Linux, macOS, and Windows from [GitHub Releases](https://github.com/ndenev/k8sql/releases).
 
 ## Quick Start
 
