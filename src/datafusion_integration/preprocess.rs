@@ -27,15 +27,24 @@ use datafusion::sql::sqlparser::parser::Parser;
 use regex::Regex;
 use std::sync::LazyLock;
 
-/// Regex to fix ->> operator precedence when followed by comparison operators.
-/// This is a workaround for DataFusion's parser incorrectly parsing:
-///   `col->>'key' = 'val'` as `col->>('key' = 'val')`
-/// We wrap it as `(col->>'key') = 'val'`
+/// Regex to fix -> and ->> operator precedence when followed by comparison operators.
+///
+/// Workaround for upstream bug: https://github.com/apache/datafusion-sqlparser-rs/issues/814
+/// The parser uses outdated PostgreSQL 7.0 precedence rules where comparison operators
+/// (=, IN, IS NULL, etc.) incorrectly bind more tightly than JSON arrow operators.
+///
+/// Examples of incorrect parsing without this fix:
+///   `col->>'key' = 'val'` parsed as `col->>('key' = 'val')`  ← WRONG
+///   `col->'field' IN (...)` parsed as `col->('field' IN (...))` ← WRONG
+///
+/// We wrap the arrow expression in parentheses before parsing:
+///   `col->>'key' = 'val'` becomes `(col->>'key') = 'val'` ← CORRECT
+///   `col->'field' IN (...)` becomes `(col->'field') IN (...)` ← CORRECT
 ///
 /// Note: This must be done at string level before parsing because the parser
-/// gets the precedence wrong.
+/// gets the precedence wrong during tokenization.
 static JSON_ARROW_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"(?i)((?:\w+\.)?\w+)\s*->>\s*'([^']+)'\s*(=|!=|<>|<=|>=|<|>|NOT\s+ILIKE|NOT\s+LIKE|ILIKE|LIKE)"#).unwrap()
+    Regex::new(r#"(?i)((?:\w+\.)?\w+)\s*->>?\s*'([^']+)'\s*(=|!=|<>|<=|>=|<|>|NOT\s+ILIKE|NOT\s+LIKE|ILIKE|LIKE|IS\s+NOT\s+NULL|IS\s+NULL|NOT\s+IN|IN)"#).unwrap()
 });
 
 /// Pre-parse fix for ->> operator precedence
@@ -199,6 +208,56 @@ mod tests {
         let result = preprocess_sql(sql);
         assert!(result.contains("(labels->>'app') = 'nginx'"));
         assert!(result.contains("(labels->>'env') = 'prod'"));
+    }
+
+    #[test]
+    fn test_json_arrow_precedence_in() {
+        let sql = "SELECT name FROM pods WHERE status->>'phase' IN ('Running', 'Succeeded')";
+        let result = preprocess_sql(sql);
+        assert_eq!(
+            result,
+            "SELECT name FROM pods WHERE (status->>'phase') IN ('Running', 'Succeeded')"
+        );
+    }
+
+    #[test]
+    fn test_json_arrow_precedence_not_in() {
+        let sql = "SELECT name FROM pods WHERE status->>'phase' NOT IN ('Failed', 'Unknown')";
+        let result = preprocess_sql(sql);
+        assert_eq!(
+            result,
+            "SELECT name FROM pods WHERE (status->>'phase') NOT IN ('Failed', 'Unknown')"
+        );
+    }
+
+    #[test]
+    fn test_json_arrow_precedence_in_labels() {
+        let sql = "SELECT name FROM pods WHERE labels->>'app' IN ('nginx', 'apache')";
+        let result = preprocess_sql(sql);
+        assert_eq!(
+            result,
+            "SELECT name FROM pods WHERE (labels->>'app') IN ('nginx', 'apache')"
+        );
+    }
+
+    #[test]
+    fn test_json_arrow_precedence_is_null() {
+        let sql = "SELECT name FROM pods WHERE status->>'phase' IS NULL";
+        let result = preprocess_sql(sql);
+        assert_eq!(
+            result,
+            "SELECT name FROM pods WHERE (status->>'phase') IS NULL"
+        );
+    }
+
+    #[test]
+    fn test_json_arrow_precedence_is_not_null() {
+        let sql = "SELECT name FROM pods WHERE labels->>'app' IS NOT NULL";
+        let result = preprocess_sql(sql);
+        assert_eq!(
+            result,
+            "SELECT name FROM pods WHERE (labels->>'app') IS NOT NULL"
+        );
     }
 
     // Tests for validate_read_only
