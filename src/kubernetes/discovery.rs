@@ -26,6 +26,29 @@ pub enum ColumnDataType {
     Integer,
 }
 
+impl std::fmt::Display for ColumnDataType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ColumnDataType::Text => write!(f, "text"),
+            ColumnDataType::Timestamp => write!(f, "timestamp"),
+            ColumnDataType::Integer => write!(f, "integer"),
+        }
+    }
+}
+
+impl std::str::FromStr for ColumnDataType {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "text" => Ok(ColumnDataType::Text),
+            "timestamp" => Ok(ColumnDataType::Timestamp),
+            "integer" => Ok(ColumnDataType::Integer),
+            _ => Err(anyhow::anyhow!("Unknown column data type: {}", s)),
+        }
+    }
+}
+
 /// Column definition for schema
 #[derive(Debug, Clone)]
 pub struct ColumnDef {
@@ -852,4 +875,75 @@ pub fn generate_schema(info: &ResourceInfo) -> Vec<ColumnDef> {
     }
 
     columns
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::str::FromStr;
+
+    #[test]
+    fn test_column_data_type_display() {
+        assert_eq!(ColumnDataType::Text.to_string(), "text");
+        assert_eq!(ColumnDataType::Timestamp.to_string(), "timestamp");
+        assert_eq!(ColumnDataType::Integer.to_string(), "integer");
+    }
+
+    #[test]
+    fn test_column_data_type_from_str() {
+        assert_eq!(
+            ColumnDataType::from_str("text").unwrap(),
+            ColumnDataType::Text
+        );
+        assert_eq!(
+            ColumnDataType::from_str("timestamp").unwrap(),
+            ColumnDataType::Timestamp
+        );
+        assert_eq!(
+            ColumnDataType::from_str("integer").unwrap(),
+            ColumnDataType::Integer
+        );
+    }
+
+    #[test]
+    fn test_column_data_type_from_str_case_insensitive() {
+        assert_eq!(
+            ColumnDataType::from_str("TEXT").unwrap(),
+            ColumnDataType::Text
+        );
+        assert_eq!(
+            ColumnDataType::from_str("TimeStamp").unwrap(),
+            ColumnDataType::Timestamp
+        );
+        assert_eq!(
+            ColumnDataType::from_str("INTEGER").unwrap(),
+            ColumnDataType::Integer
+        );
+    }
+
+    #[test]
+    fn test_column_data_type_from_str_invalid() {
+        let result = ColumnDataType::from_str("invalid");
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Unknown column data type")
+        );
+    }
+
+    #[test]
+    fn test_column_data_type_roundtrip() {
+        // Test that Display + FromStr roundtrip correctly
+        for data_type in [
+            ColumnDataType::Text,
+            ColumnDataType::Timestamp,
+            ColumnDataType::Integer,
+        ] {
+            let string = data_type.to_string();
+            let parsed = ColumnDataType::from_str(&string).unwrap();
+            assert_eq!(parsed, data_type);
+        }
+    }
 }
