@@ -683,37 +683,9 @@ impl K8sClientPool {
             .map(|c| c.name.clone())
             .collect();
 
-        // Parse the context specification (comma-separated, with optional glob patterns)
-        let mut matched_contexts = Vec::new();
-
-        for part in context_spec.split(',') {
-            let pattern = part.trim();
-            if pattern.is_empty() {
-                continue;
-            }
-
-            // Check if it's a glob pattern
-            if pattern.contains('*') || pattern.contains('?') {
-                // Use simple glob matching
-                for ctx in &all_contexts {
-                    if Self::glob_match(pattern, ctx) && !matched_contexts.contains(ctx) {
-                        matched_contexts.push(ctx.clone());
-                    }
-                }
-            } else {
-                // Exact match
-                let pattern_str = pattern.to_string();
-                if all_contexts.contains(&pattern_str) && !matched_contexts.contains(&pattern_str) {
-                    matched_contexts.push(pattern_str);
-                } else if !all_contexts.contains(&pattern.to_string()) {
-                    return Err(anyhow!("Context '{}' not found", pattern));
-                }
-            }
-        }
-
-        if matched_contexts.is_empty() {
-            return Err(anyhow!("No contexts matched pattern '{}'", context_spec));
-        }
+        // Resolve context specification to concrete context names
+        let matched_contexts =
+            super::context_matcher::ContextMatcher::new(&all_contexts).resolve(context_spec)?;
 
         // Ensure we have clients and discovered resources for all contexts IN PARALLEL
         let discovery_futures: Vec<_> = matched_contexts
@@ -747,47 +719,6 @@ impl K8sClientPool {
         *self.current_contexts.write().await = matched_contexts;
 
         Ok(())
-    }
-
-    /// Simple glob pattern matching (supports * and ?)
-    /// Uses an efficient iterative algorithm without allocations
-    fn glob_match(pattern: &str, text: &str) -> bool {
-        let pattern: Vec<char> = pattern.chars().collect();
-        let text: Vec<char> = text.chars().collect();
-
-        let mut pi = 0; // pattern index
-        let mut ti = 0; // text index
-        let mut star_pi = None; // position of last '*' in pattern
-        let mut star_ti = 0; // position in text when we saw last '*'
-
-        while ti < text.len() {
-            if pi < pattern.len() && (pattern[pi] == '?' || pattern[pi] == text[ti]) {
-                // Character match or '?' wildcard
-                pi += 1;
-                ti += 1;
-            } else if pi < pattern.len() && pattern[pi] == '*' {
-                // '*' wildcard - remember position and try matching zero chars
-                star_pi = Some(pi);
-                star_ti = ti;
-                pi += 1;
-            } else if let Some(sp) = star_pi {
-                // Mismatch, but we have a previous '*' - backtrack
-                // Try matching one more character with the '*'
-                pi = sp + 1;
-                star_ti += 1;
-                ti = star_ti;
-            } else {
-                // Mismatch and no '*' to backtrack to
-                return false;
-            }
-        }
-
-        // Check remaining pattern characters (must all be '*')
-        while pi < pattern.len() && pattern[pi] == '*' {
-            pi += 1;
-        }
-
-        pi == pattern.len()
     }
 
     /// Fetch a single page with retry logic
