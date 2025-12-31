@@ -175,6 +175,25 @@ impl K8sTableProvider {
         }
     }
 
+    /// Helper to extract label key from json_get_str(labels, 'key') or labels->>'key' expression
+    /// Returns Some(key) if the expression matches the label accessor pattern
+    fn extract_label_key_from_json_accessor(&self, expr: &Expr) -> Option<String> {
+        if let Expr::ScalarFunction(func) = expr {
+            let func_name = func.name();
+
+            if (func_name == "json_get_str" || func_name == "json_as_text")
+                && func.args.len() >= 2
+                && let Expr::Column(col) = &func.args[0]
+                && col.name == "labels"
+                && let Expr::Literal(key_lit, _) = &func.args[1]
+                && let datafusion::common::ScalarValue::Utf8(Some(key)) = key_lit
+            {
+                return Some(key.clone());
+            }
+        }
+        None
+    }
+
     /// Extract a label selector from labels->>'key' = 'value' pattern
     /// (labels->>'key' is internally json_as_text; json_get_str is also supported)
     fn extract_label_selector(
@@ -188,30 +207,23 @@ impl K8sTableProvider {
             "Analyzing binary expression for label selector"
         );
 
-        // Handle json_get_str(labels, 'key') = 'value' or labels->>'key' = 'value' pattern
-        // Note: ->> is internally represented as json_as_text by datafusion-functions-json
-        if let Expr::ScalarFunction(func) = binary.left.as_ref() {
-            let func_name = func.name();
-            debug!(func_name = %func_name, args_len = func.args.len(), "Found ScalarFunction on left side");
+        // Extract label key using helper
+        let key = self.extract_label_key_from_json_accessor(binary.left.as_ref())?;
 
-            if (func_name == "json_get_str" || func_name == "json_as_text")
-                && func.args.len() >= 2
-                && let Expr::Column(col) = &func.args[0]
-                && col.name == "labels"
-                && let Expr::Literal(key_lit, _) = &func.args[1]
-                && let datafusion::common::ScalarValue::Utf8(Some(key)) = key_lit
-                && let Expr::Literal(val_lit, _) = binary.right.as_ref()
-                && let datafusion::common::ScalarValue::Utf8(Some(value)) = val_lit
-            {
-                debug!(key = %key, value = %value, "Extracted label selector via json_get_str");
-                return Some(format!("{}{}{}", key, op, value));
-            }
+        // Validate right side is a string literal
+        if let Expr::Literal(val_lit, _) = binary.right.as_ref()
+            && let datafusion::common::ScalarValue::Utf8(Some(value)) = val_lit
+        {
+            debug!(key = %key, value = %value, "Extracted label selector");
+            return Some(format!("{}{}{}", key, op, value));
         }
         None
     }
 
     /// Extract a label selector from labels->>'key' IN ('val1', 'val2') pattern
     /// Supports both IN and NOT IN for K8s set-based label selectors
+    ///
+    /// Reference: https://kubernetes.io/docs/concepts/overview/working-with-objects/labels/#set-based-requirement
     fn extract_label_selector_from_inlist(
         &self,
         in_list: &datafusion::logical_expr::expr::InList,
@@ -223,45 +235,34 @@ impl K8sTableProvider {
             "Analyzing InList expression for label selector"
         );
 
-        // Check if this is a label accessor: json_get_str(labels, 'key') or labels->>'key'
-        if let Expr::ScalarFunction(func) = in_list.expr.as_ref() {
-            let func_name = func.name();
+        // Extract label key using helper
+        let key = self.extract_label_key_from_json_accessor(in_list.expr.as_ref())?;
 
-            if (func_name == "json_get_str" || func_name == "json_as_text")
-                && func.args.len() >= 2
-                && let Expr::Column(col) = &func.args[0]
-                && col.name == "labels"
-                && let Expr::Literal(key_lit, _) = &func.args[1]
-                && let datafusion::common::ScalarValue::Utf8(Some(key)) = key_lit
+        // Extract string literal values from the list
+        let mut values = Vec::new();
+        for item in &in_list.list {
+            if let Expr::Literal(val_lit, _) = item
+                && let datafusion::common::ScalarValue::Utf8(Some(value)) = val_lit
             {
-                // Extract string literal values from the list
-                let mut values = Vec::new();
-                for item in &in_list.list {
-                    if let Expr::Literal(val_lit, _) = item
-                        && let datafusion::common::ScalarValue::Utf8(Some(value)) = val_lit
-                    {
-                        values.push(value.clone());
-                    } else {
-                        // Non-literal in list, cannot push down
-                        debug!("Non-literal value in IN list, cannot push down");
-                        return None;
-                    }
-                }
-
-                // Empty list not supported by K8s
-                if values.is_empty() {
-                    debug!("Empty IN list, cannot push down");
-                    return None;
-                }
-
-                // Build K8s set-based label selector
-                let operator = if in_list.negated { "notin" } else { "in" };
-                let selector = format!("{} {} ({})", key, operator, values.join(","));
-                debug!(selector = %selector, "Extracted set-based label selector");
-                return Some(selector);
+                values.push(value.clone());
+            } else {
+                // Non-literal in list, cannot push down
+                debug!("Non-literal value in IN list, cannot push down");
+                return None;
             }
         }
-        None
+
+        // Empty list not supported by K8s
+        if values.is_empty() {
+            debug!("Empty IN list, cannot push down");
+            return None;
+        }
+
+        // Build K8s set-based label selector
+        let operator = if in_list.negated { "notin" } else { "in" };
+        let selector = format!("{} {} ({})", key, operator, values.join(","));
+        debug!(selector = %selector, "Extracted set-based label selector");
+        Some(selector)
     }
 
     /// Extract field selectors from DataFusion expressions
@@ -471,10 +472,7 @@ impl TableProvider for K8sTableProvider {
         // - namespace IN (...) -> Parallel queries to each namespace
         // - _cluster = 'x' -> Queries specific cluster
         // - _cluster IN (...) / NOT IN (...) -> Queries specific clusters
-        // - labels->>'key' = 'value' -> K8s label selector (equality)
-        // - labels->>'key' != 'value' -> K8s label selector (inequality)
-        // - labels->>'key' IN ('val1', 'val2') -> K8s set-based label selector
-        // - labels->>'key' NOT IN ('val1', 'val2') -> K8s set-based label selector
+        // - labels->>'key' = 'value' -> K8s label selector
         // - status->>'phase' = 'Running' -> K8s field selector (resource-specific)
         // - name = 'pod-123' -> K8s field selector (metadata.name)
         // Other filters will be handled by DataFusion
@@ -1610,17 +1608,26 @@ mod tests {
     }
 
     #[test]
-    fn test_label_selector_in_basic() {
-        // NOTE: These tests verify the internal logic works correctly.
-        // Integration tests with actual SQL queries would require a running k8s cluster
-        // and are better suited for end-to-end testing.
+    fn test_label_selector_in_not_in_documentation() {
+        // Documentation test: Demonstrates supported queries and K8s API format
+        // Reference: https://kubernetes.io/docs/concepts/overview/working-with-objects/labels/#set-based-requirement
+        //
+        // Supported SQL queries:
+        // 1. SELECT * FROM pods WHERE labels->>'env' IN ('prod', 'staging')
+        //    -> K8s API: labelSelector=env in (prod,staging)
+        //
+        // 2. SELECT * FROM pods WHERE labels->>'tier' NOT IN ('debug', 'test')
+        //    -> K8s API: labelSelector=tier notin (debug,test)
+        //
+        // 3. Combined: SELECT * FROM pods WHERE labels->>'app' = 'nginx' AND labels->>'env' IN ('prod', 'staging')
+        //    -> K8s API: labelSelector=app=nginx,env in (prod,staging)
+        //
+        // Edge cases (NOT pushed down):
+        // - Empty list: labels->>'env' IN ()
+        // - Non-literal values: labels->>'env' IN ('prod', some_column)
+        // - Mixed types: labels->>'env' IN (1, 'string')
 
-        // Test: labels->>'env' IN (...) patterns are correctly detected
-        // The actual SQL -> Expr conversion is tested through integration tests
-        let _provider = create_test_provider();
-
-        // This test documents that IN/NOT IN on labels are supported
-        // Real validation happens through manual integration testing with queries like:
-        // SELECT * FROM pods WHERE labels->>'env' IN ('prod', 'staging')
+        // This test primarily serves as documentation
+        // Full integration testing requires a real K8s cluster
     }
 }
