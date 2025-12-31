@@ -606,6 +606,55 @@ Located in `src/**/*_test.rs` modules, these cover:
 - Multiple iterations for statistical significance
 - Warm-up runs to stabilize caches
 
+## Test Environment Requirements
+
+### Kubernetes Cluster Setup
+
+The integration tests require a properly configured Kubernetes environment:
+
+**Minimum Requirements:**
+- At least **2 Kubernetes clusters** configured in your kubeconfig
+  - Required for multi-cluster test validation (suites 02, 09, 18)
+  - Single-cluster setups will cause some tests to fail or not properly validate cross-cluster features
+- k3d clusters named:
+  - `k3d-k8sql-test-1` (primary test cluster)
+  - `k3d-k8sql-test-2` (secondary for multi-cluster tests)
+
+**Why Multiple Clusters Matter:**
+- Suite 18 (data-validation.sh) verifies cross-cluster aggregations don't double-count
+- Tests validate that `_cluster = '*'` count >= single cluster count
+- With only one cluster, multi-cluster validation becomes a tautology (single = all)
+
+**CI Environment:**
+- GitHub Actions workflow automatically provisions 2 k3d clusters
+- See `.github/workflows/test.yml` for cluster setup configuration
+
+**Local Testing:**
+```bash
+# Create test clusters (if not using CI)
+k3d cluster create k8sql-test-1
+k3d cluster create k8sql-test-2
+
+# Verify clusters are accessible
+kubectl config get-contexts | grep k3d-k8sql-test
+```
+
+### Test Data Requirements
+
+Some tests make assumptions about cluster state:
+
+**Namespace Requirements:**
+- `default` namespace must exist (standard in all K8s clusters)
+- `kube-system` namespace must exist (standard in all K8s clusters)
+
+**Resource Assumptions:**
+- Tests expect some pods to exist in `kube-system` (standard system pods)
+- Tests may create temporary resources (CRDs, ConfigMaps) during execution
+
+**Data Resilience:**
+- Most tests use `assert_success` to be resilient to varying cluster states
+- Data validation tests (suite 18) verify correctness properties that hold regardless of specific resource counts
+
 ## Running Tests
 
 ### Unit Tests
