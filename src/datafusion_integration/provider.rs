@@ -165,8 +165,33 @@ impl K8sTableProvider {
                     selectors.push(selector);
                 }
             }
+            // Handle IN/NOT IN: labels->>'key' IN ('val1', 'val2')
+            Expr::InList(in_list) => {
+                if let Some(selector) = self.extract_label_selector_from_inlist(in_list) {
+                    selectors.push(selector);
+                }
+            }
             _ => {}
         }
+    }
+
+    /// Helper to extract label key from json_get_str(labels, 'key') or labels->>'key' expression
+    /// Returns Some(key) if the expression matches the label accessor pattern
+    fn extract_label_key_from_json_accessor(&self, expr: &Expr) -> Option<String> {
+        if let Expr::ScalarFunction(func) = expr {
+            let func_name = func.name();
+
+            if (func_name == "json_get_str" || func_name == "json_as_text")
+                && func.args.len() >= 2
+                && let Expr::Column(col) = &func.args[0]
+                && col.name == "labels"
+                && let Expr::Literal(key_lit, _) = &func.args[1]
+                && let datafusion::common::ScalarValue::Utf8(Some(key)) = key_lit
+            {
+                return Some(key.clone());
+            }
+        }
+        None
     }
 
     /// Extract a label selector from labels->>'key' = 'value' pattern
@@ -182,26 +207,62 @@ impl K8sTableProvider {
             "Analyzing binary expression for label selector"
         );
 
-        // Handle json_get_str(labels, 'key') = 'value' or labels->>'key' = 'value' pattern
-        // Note: ->> is internally represented as json_as_text by datafusion-functions-json
-        if let Expr::ScalarFunction(func) = binary.left.as_ref() {
-            let func_name = func.name();
-            debug!(func_name = %func_name, args_len = func.args.len(), "Found ScalarFunction on left side");
+        // Extract label key using helper
+        let key = self.extract_label_key_from_json_accessor(binary.left.as_ref())?;
 
-            if (func_name == "json_get_str" || func_name == "json_as_text")
-                && func.args.len() >= 2
-                && let Expr::Column(col) = &func.args[0]
-                && col.name == "labels"
-                && let Expr::Literal(key_lit, _) = &func.args[1]
-                && let datafusion::common::ScalarValue::Utf8(Some(key)) = key_lit
-                && let Expr::Literal(val_lit, _) = binary.right.as_ref()
-                && let datafusion::common::ScalarValue::Utf8(Some(value)) = val_lit
-            {
-                debug!(key = %key, value = %value, "Extracted label selector via json_get_str");
-                return Some(format!("{}{}{}", key, op, value));
-            }
+        // Validate right side is a string literal
+        if let Expr::Literal(val_lit, _) = binary.right.as_ref()
+            && let datafusion::common::ScalarValue::Utf8(Some(value)) = val_lit
+        {
+            debug!(key = %key, value = %value, "Extracted label selector");
+            return Some(format!("{}{}{}", key, op, value));
         }
         None
+    }
+
+    /// Extract a label selector from labels->>'key' IN ('val1', 'val2') pattern
+    /// Supports both IN and NOT IN for K8s set-based label selectors
+    ///
+    /// Reference: https://kubernetes.io/docs/concepts/overview/working-with-objects/labels/#set-based-requirement
+    fn extract_label_selector_from_inlist(
+        &self,
+        in_list: &datafusion::logical_expr::expr::InList,
+    ) -> Option<String> {
+        debug!(
+            expr = ?in_list.expr,
+            list_len = in_list.list.len(),
+            negated = in_list.negated,
+            "Analyzing InList expression for label selector"
+        );
+
+        // Extract label key using helper
+        let key = self.extract_label_key_from_json_accessor(in_list.expr.as_ref())?;
+
+        // Extract string literal values from the list
+        let mut values = Vec::new();
+        for item in &in_list.list {
+            if let Expr::Literal(val_lit, _) = item
+                && let datafusion::common::ScalarValue::Utf8(Some(value)) = val_lit
+            {
+                values.push(value.clone());
+            } else {
+                // Non-literal in list, cannot push down
+                debug!("Non-literal value in IN list, cannot push down");
+                return None;
+            }
+        }
+
+        // Empty list not supported by K8s
+        if values.is_empty() {
+            debug!("Empty IN list, cannot push down");
+            return None;
+        }
+
+        // Build K8s set-based label selector
+        let operator = if in_list.negated { "notin" } else { "in" };
+        let selector = format!("{} {} ({})", key, operator, values.join(","));
+        debug!(selector = %selector, "Extracted set-based label selector");
+        Some(selector)
     }
 
     /// Extract field selectors from DataFusion expressions
@@ -427,6 +488,38 @@ impl TableProvider for K8sTableProvider {
                 {
                     return TableProviderFilterPushDown::Exact;
                 }
+
+                // Check for labels->>'key' IN (...) or NOT IN (...)
+                // K8s supports set-based label selectors: env in (prod,staging)
+                if let Expr::InList(in_list) = f
+                    && let Expr::ScalarFunction(func) = in_list.expr.as_ref()
+                {
+                    let func_name = func.name();
+                    if (func_name == "json_get_str" || func_name == "json_as_text")
+                        && func.args.len() >= 2
+                        && let Expr::Column(col) = &func.args[0]
+                        && col.name == "labels"
+                        && let Expr::Literal(_, _) = &func.args[1]
+                    {
+                        // Verify all values in list are string literals
+                        let all_literals = in_list.list.iter().all(|item| {
+                            matches!(
+                                item,
+                                Expr::Literal(datafusion::common::ScalarValue::Utf8(_), _)
+                            )
+                        });
+
+                        if all_literals && !in_list.list.is_empty() {
+                            // NOT IN needs Inexact to ensure SQL NULL semantics
+                            // (same reasoning as label != operator)
+                            if in_list.negated {
+                                return TableProviderFilterPushDown::Inexact;
+                            }
+                            return TableProviderFilterPushDown::Exact;
+                        }
+                    }
+                }
+
                 if let Expr::BinaryExpr(binary) = f {
                     // Check for OR chains: (_cluster = 'a') OR (_cluster = 'b')
                     // DataFusion rewrites IN lists to OR chains before calling us
@@ -1358,12 +1451,6 @@ mod tests {
     fn test_field_selector_integer_string_value() {
         // Test that field selectors work with integer values as strings
         // Example: status.replicas = "3" (K8s API accepts string representation)
-        // This tests that our current implementation (which uses string literals)
-        // will work correctly with integer field selectors when we add them
-
-        // Simulate what would happen with json_get_str(status, 'replicas') = '3'
-        // We can't easily construct ScalarFunction expressions, but we can verify
-        // the registry knows about status.replicas for replicasets
         use crate::kubernetes::FIELD_SELECTOR_REGISTRY;
 
         assert!(FIELD_SELECTOR_REGISTRY.is_supported("replicasets", "status.replicas"));
@@ -1386,8 +1473,6 @@ mod tests {
     fn test_field_selector_boolean_string_value() {
         // Test that field selectors work with boolean values as strings
         // Example: spec.unschedulable = "true" (K8s API accepts string representation)
-
-        // Verify the registry knows about spec.unschedulable for nodes
         use crate::kubernetes::FIELD_SELECTOR_REGISTRY;
 
         assert!(FIELD_SELECTOR_REGISTRY.is_supported("nodes", "spec.unschedulable"));
