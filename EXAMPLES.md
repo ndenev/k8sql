@@ -527,7 +527,7 @@ SELECT name, namespace,
        json_get_array(spec, 'rules') as rules
 FROM ingresses
 WHERE json_get_array(spec, 'tls') IS NULL
-   OR json_length(json_get_array(spec, 'tls')) = 0;
+   OR json_length(spec->>'tls') = 0;
 ```
 
 Find ingresses serving unencrypted traffic.
@@ -819,19 +819,18 @@ WHERE json_get_str(status, 'containerStatuses', 0, 'lastState', 'terminated', 'r
 
 Memory limit violations.
 
-### 8. Services with no matching pods
+### 8. Services without endpoints
 
 ```sql
-SELECT s.name, s.namespace,
-       json_get_str(s.spec, 'selector') as selector
+SELECT s.name, s.namespace
 FROM services s
-LEFT JOIN pods p ON s.namespace = p.namespace
-  AND json_get_str(s.spec, 'selector', 'app') = p.labels->>'app'
-WHERE p.name IS NULL
-  AND s.namespace <> 'kube-system';
+LEFT JOIN endpoints e ON s.name = e.name AND s.namespace = e.namespace
+WHERE e.name IS NULL
+  AND s.namespace <> 'kube-system'
+  AND json_get_str(s.spec, 'type') <> 'ExternalName';
 ```
 
-Service discovery issues.
+Find services that have no endpoint objects. Simplified to avoid complex JSON comparisons in JOIN conditions.
 
 ### 9. PersistentVolumeClaims without bound volumes
 
@@ -982,13 +981,13 @@ Ranking for comparative analysis.
 
 ```sql
 SELECT name, namespace,
-       json_length(json_get_array(spec, 'containers')) as container_count
+       json_length(spec->>'containers') as container_count
 FROM pods
 ORDER BY container_count DESC
 LIMIT 10;
 ```
 
-Find pods with many containers.
+Find pods with many containers. Uses `spec->>'containers'` to get the JSON array as a string for `json_length()`.
 
 ### 6. Extract nested OwnerReferences
 
