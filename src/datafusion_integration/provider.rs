@@ -1563,4 +1563,86 @@ mod tests {
         let extracted = provider.extract_field_selectors(&[or_filter]);
         assert!(extracted.is_none());
     }
+
+    #[tokio::test]
+    async fn test_projection_pushdown() {
+        use datafusion::prelude::SessionContext;
+
+        let provider = create_test_provider();
+        let ctx = SessionContext::new();
+
+        // Test 1: Non-empty projection should push down
+        // Request only columns 0 (_cluster) and 3 (name)
+        let projection = Some(vec![0, 3]);
+
+        let plan = provider
+            .scan(&ctx.state(), projection.as_ref(), &[], None)
+            .await
+            .unwrap();
+
+        // The schema should contain only the projected columns
+        let schema = plan.schema();
+        assert_eq!(
+            schema.fields().len(),
+            2,
+            "Projected schema should have 2 fields"
+        );
+        assert_eq!(schema.field(0).name(), "_cluster");
+        assert_eq!(schema.field(1).name(), "name");
+    }
+
+    #[tokio::test]
+    async fn test_projection_pushdown_empty() {
+        use datafusion::prelude::SessionContext;
+
+        let provider = create_test_provider();
+        let ctx = SessionContext::new();
+
+        // Test 2: Empty projection (COUNT(*)) should use ProjectionExec wrapper
+        let projection = Some(vec![]);
+
+        let plan = provider
+            .scan(&ctx.state(), projection.as_ref(), &[], None)
+            .await
+            .unwrap();
+
+        // For empty projection, we wrap with ProjectionExec
+        // The schema should be empty (0 columns)
+        let schema = plan.schema();
+        assert_eq!(
+            schema.fields().len(),
+            0,
+            "Empty projection should have 0 fields in schema"
+        );
+
+        // Verify it's a ProjectionExec
+        assert_eq!(plan.name(), "ProjectionExec");
+    }
+
+    #[tokio::test]
+    async fn test_projection_pushdown_none() {
+        use datafusion::prelude::SessionContext;
+
+        let provider = create_test_provider();
+        let ctx = SessionContext::new();
+
+        // Test 3: No projection (None) should use full schema
+        let projection: Option<&Vec<usize>> = None;
+
+        let plan = provider
+            .scan(&ctx.state(), projection, &[], None)
+            .await
+            .unwrap();
+
+        // The schema should contain all columns (16 for pods)
+        let schema = plan.schema();
+        assert_eq!(
+            schema.fields().len(),
+            16,
+            "Full schema should have all 16 fields"
+        );
+
+        // Verify it's our K8sExec plan (not wrapped)
+        assert_eq!(plan.name(), "K8sExec");
+    }
 }
