@@ -750,29 +750,43 @@ impl TableProvider for K8sTableProvider {
         // Projection pushdown optimization: filter columns before conversion.
         // For queries like "SELECT name FROM pods", we skip parsing large JSON fields.
         //
-        // Exception: COUNT(*) queries pass empty projection. We can't push those down
-        // because Arrow requires ≥1 column. Use ProjectionExec wrapper for those.
-        let should_pushdown_projection = projection
-            .as_ref()
-            .map(|proj| !proj.is_empty())
-            .unwrap_or(false);
+        // Three cases:
+        // 1. Non-empty projection: Convert only requested columns (optimization)
+        // 2. Empty projection (COUNT(*)): Convert minimal column, wrap with ProjectionExec
+        // 3. No projection (None): Convert all columns
+        let (exec_schema, exec_columns) = match projection {
+            Some(proj) if !proj.is_empty() => {
+                // Non-empty projection: push down column filtering
+                let fields: Vec<_> = proj.iter().map(|&i| self.schema.field(i).clone()).collect();
+                let columns: Vec<_> = proj.iter().map(|&i| self.columns[i].clone()).collect();
 
-        let (exec_schema, exec_columns) = if should_pushdown_projection {
-            let proj = projection.unwrap(); // Safe: checked above
-            let fields: Vec<_> = proj.iter().map(|&i| self.schema.field(i).clone()).collect();
-            let columns: Vec<_> = proj.iter().map(|&i| self.columns[i].clone()).collect();
+                debug!(
+                    table = %self.resource_info.table_name,
+                    total_columns = self.columns.len(),
+                    projected_columns = columns.len(),
+                    "Projection pushdown - converting only requested columns"
+                );
 
-            debug!(
-                table = %self.resource_info.table_name,
-                total_columns = self.columns.len(),
-                projected_columns = columns.len(),
-                "Projection pushdown - converting only requested columns"
-            );
+                (Arc::new(Schema::new(fields)), Arc::new(columns))
+            }
+            Some(_) => {
+                // Empty projection (COUNT(*)): convert only minimal column for efficiency.
+                // Use _cluster (column 0) since it's small and always present.
+                // ProjectionExec will discard it to produce 0-column output.
+                let fields = vec![self.schema.field(0).clone()];
+                let columns = vec![self.columns[0].clone()];
 
-            (Arc::new(Schema::new(fields)), Arc::new(columns))
-        } else {
-            // No projection or empty projection - use full schema
-            (self.schema.clone(), self.columns.clone())
+                debug!(
+                    table = %self.resource_info.table_name,
+                    "Empty projection (COUNT(*)) - converting minimal column"
+                );
+
+                (Arc::new(Schema::new(fields)), Arc::new(columns))
+            }
+            None => {
+                // No projection: use full schema
+                (self.schema.clone(), self.columns.clone())
+            }
         };
 
         // Create lazy execution plan - data will be fetched when partitions are executed.
@@ -793,7 +807,7 @@ impl TableProvider for K8sTableProvider {
         );
 
         // Handle empty projection (COUNT(*)) with ProjectionExec wrapper.
-        // We return all columns from K8sExec, and ProjectionExec handles the empty output.
+        // We return the minimal column from K8sExec, and ProjectionExec discards it to produce empty output.
         if let Some(proj) = projection
             && proj.is_empty()
         {
