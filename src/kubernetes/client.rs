@@ -882,7 +882,18 @@ impl K8sClientPool {
 
             loop {
                 // Build params for this page
-                let mut params = base_params.clone().limit(PAGE_SIZE);
+                // If we have a limit, only request what we need (up to PAGE_SIZE)
+                let page_limit = if let Some(max_limit) = limit {
+                    let remaining = max_limit.saturating_sub(total_fetched);
+                    if remaining == 0 {
+                        break; // We've fetched enough, stop pagination
+                    }
+                    PAGE_SIZE.min(remaining as u32)
+                } else {
+                    PAGE_SIZE
+                };
+
+                let mut params = base_params.clone().limit(page_limit);
                 if let Some(ref token) = continue_token {
                     params = params.continue_token(token);
                 }
@@ -900,17 +911,23 @@ impl K8sClientPool {
                 page_count += 1;
 
                 // Convert items to JSON values with apiVersion and kind
+                // Only insert if not already present (K8s API usually includes them)
                 let mut values: Vec<serde_json::Value> = list
                     .items
                     .into_iter()
                     .map(|item| {
                         let mut value = serde_json::to_value(item).unwrap_or(serde_json::Value::Null);
                         if let serde_json::Value::Object(ref mut map) = value {
-                            map.insert(
-                                "apiVersion".to_string(),
-                                serde_json::Value::String(api_version.clone()),
-                            );
-                            map.insert("kind".to_string(), serde_json::Value::String(kind.clone()));
+                            // Only insert if missing (avoid redundant work)
+                            if !map.contains_key("apiVersion") {
+                                map.insert(
+                                    "apiVersion".to_string(),
+                                    serde_json::Value::String(api_version.clone()),
+                                );
+                            }
+                            if !map.contains_key("kind") {
+                                map.insert("kind".to_string(), serde_json::Value::String(kind.clone()));
+                            }
                         }
                         value
                     })

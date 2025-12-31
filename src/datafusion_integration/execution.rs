@@ -7,26 +7,29 @@
 //! allowing DataFusion to control parallelism and enabling streaming execution.
 //! Results are streamed as pages arrive from the K8s API for optimal memory usage.
 //!
-//! # LIMIT Behavior with Multiple Partitions
+//! # LIMIT Pushdown Behavior
 //!
-//! When querying multiple clusters/namespaces (multiple partitions) with a LIMIT:
+//! LIMIT pushdown to the Kubernetes API is only enabled for single-partition queries
+//! (single cluster/namespace). This ensures correctness when combined with ORDER BY.
 //!
-//! - Each partition independently applies the limit as an optimization hint
-//! - For `SELECT * FROM pods WHERE _cluster = '*' LIMIT 10` across 3 clusters:
-//!   - Partition 0 (cluster1): fetches up to 10 rows
-//!   - Partition 1 (cluster2): fetches up to 10 rows
-//!   - Partition 2 (cluster3): fetches up to 10 rows
-//!   - K8sExec returns up to 30 rows total
-//!   - DataFusion's LimitExec (above K8sExec) then takes the first 10
+//! ## Single Partition (Optimized)
+//! - `SELECT * FROM pods WHERE namespace = 'default' LIMIT 10`
+//! - LIMIT is pushed to K8s API (fetches only 10 items)
+//! - 50x reduction in network transfer for small limits
 //!
-//! This is the expected behavior for partitioned scans with limit pushdown.
-//! We cannot know which partition will provide the "first" N rows until
-//! execution, so each partition optimistically fetches up to N rows.
-//! The final LIMIT is always correctly enforced by DataFusion's LimitExec.
+//! ## Multiple Partitions (Correctness-First)
+//! - `SELECT * FROM pods WHERE _cluster = '*' LIMIT 10` (3 clusters)
+//! - LIMIT is NOT pushed to K8s API
+//! - All rows fetched from all clusters
+//! - DataFusion's LimitExec enforces the final LIMIT correctly
 //!
-//! The benefit: instead of fetching ALL rows from all partitions, we fetch
-//! at most `limit * num_partitions` rows, which is still a significant
-//! reduction for large result sets.
+//! **Why?** Pushing LIMIT to each partition breaks ORDER BY semantics:
+//! - `SELECT * FROM pods ORDER BY created DESC LIMIT 10` across 3 clusters
+//! - If we fetch 10 per cluster, the correct top 10 might all be in one cluster
+//! - We'd miss rows that should be in the result
+//!
+//! Priority #1 is correctness. Single-partition queries get the optimization,
+//! multi-partition queries maintain correct semantics.
 
 use std::any::Any;
 use std::fmt;
@@ -46,7 +49,7 @@ use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, Pla
 use futures::Stream;
 use tracing::debug;
 
-use crate::kubernetes::discovery::ResourceInfo;
+use crate::kubernetes::discovery::ColumnDef;
 use crate::kubernetes::{ApiFilters, K8sClientPool};
 
 use super::convert::json_to_record_batch;
@@ -80,8 +83,6 @@ pub struct QueryTarget {
 pub struct K8sExecutionPlan {
     /// Table name for logging and progress reporting
     table_name: String,
-    /// Resource metadata for schema generation
-    resource_info: ResourceInfo,
     /// Query targets - one per partition
     targets: Vec<QueryTarget>,
     /// API filters (labels, field selectors)
@@ -96,18 +97,21 @@ pub struct K8sExecutionPlan {
     fetch_limit: Option<usize>,
     /// Execution metrics for EXPLAIN ANALYZE
     metrics: ExecutionPlanMetricsSet,
+    /// Cached column definitions (passed to conversion, avoids regenerating)
+    columns: Arc<Vec<ColumnDef>>,
 }
 
 impl K8sExecutionPlan {
     /// Create a new K8sExecutionPlan
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         table_name: String,
-        resource_info: ResourceInfo,
         targets: Vec<QueryTarget>,
         api_filters: ApiFilters,
         pool: Arc<K8sClientPool>,
         schema: SchemaRef,
         fetch_limit: Option<usize>,
+        columns: Arc<Vec<ColumnDef>>,
     ) -> Self {
         // Compute plan properties
         let partitioning = Partitioning::UnknownPartitioning(targets.len().max(1));
@@ -121,7 +125,6 @@ impl K8sExecutionPlan {
 
         Self {
             table_name,
-            resource_info,
             targets,
             api_filters,
             pool,
@@ -129,6 +132,7 @@ impl K8sExecutionPlan {
             plan_properties,
             fetch_limit,
             metrics: ExecutionPlanMetricsSet::new(),
+            columns,
         }
     }
 
@@ -139,7 +143,6 @@ impl K8sExecutionPlan {
     fn with_new_fetch(&self, fetch: Option<usize>) -> Self {
         Self {
             table_name: self.table_name.clone(),
-            resource_info: self.resource_info.clone(),
             targets: self.targets.clone(),
             api_filters: self.api_filters.clone(),
             pool: self.pool.clone(),
@@ -147,6 +150,7 @@ impl K8sExecutionPlan {
             plan_properties: self.plan_properties.clone(),
             fetch_limit: fetch,
             metrics: self.metrics.clone(),
+            columns: self.columns.clone(),
         }
     }
 }
@@ -227,7 +231,18 @@ impl ExecutionPlan for K8sExecutionPlan {
     }
 
     fn with_fetch(&self, fetch: Option<usize>) -> Option<Arc<dyn ExecutionPlan>> {
-        Some(Arc::new(self.with_new_fetch(fetch)))
+        // Only push LIMIT to K8s API for single-partition queries.
+        // For multi-partition queries (multiple clusters/namespaces), pushing LIMIT
+        // to each partition breaks ORDER BY semantics - we'd fetch N rows per partition
+        // but the correct top N might all be in one partition.
+        // DataFusion's LimitExec above us will handle the final limit correctly.
+        if self.targets.len() > 1 {
+            // Multi-partition: don't push limit, let DataFusion handle it
+            None
+        } else {
+            // Single partition: safe to push limit to K8s API
+            Some(Arc::new(self.with_new_fetch(fetch)))
+        }
     }
 
     fn fetch(&self) -> Option<usize> {
@@ -259,11 +274,11 @@ impl ExecutionPlan for K8sExecutionPlan {
         // Get the target for this partition
         let target = self.targets[partition].clone();
         let table_name = self.table_name.clone();
-        let resource_info = self.resource_info.clone();
         let api_filters = self.api_filters.clone();
         let pool = self.pool.clone();
         let schema = self.schema.clone();
         let fetch_limit = self.fetch_limit;
+        let columns = self.columns.clone();
 
         // Set up metrics for this partition
         let rows_fetched = MetricBuilder::new(&self.metrics).counter("rows_fetched", partition);
@@ -284,10 +299,10 @@ impl ExecutionPlan for K8sExecutionPlan {
             pool,
             table_name,
             target,
-            resource_info,
             api_filters,
             schema.clone(),
             fetch_limit,
+            columns,
             rows_fetched,
             pages_fetched,
             fetch_time,
@@ -303,10 +318,10 @@ fn create_streaming_execution(
     pool: Arc<K8sClientPool>,
     table_name: String,
     target: QueryTarget,
-    resource_info: ResourceInfo,
     api_filters: ApiFilters,
     schema: SchemaRef,
     fetch_limit: Option<usize>,
+    columns: Arc<Vec<ColumnDef>>,
     rows_fetched: datafusion::physical_plan::metrics::Count,
     pages_fetched: datafusion::physical_plan::metrics::Count,
     fetch_time: datafusion::physical_plan::metrics::Time,
@@ -347,7 +362,7 @@ fn create_streaming_execution(
 
                     // Convert page to RecordBatch and yield
                     if !items.is_empty() {
-                        let batch = json_to_record_batch(&target.cluster, &resource_info, items)?;
+                        let batch = json_to_record_batch(&target.cluster, &columns, items)?;
                         yield batch;
                     }
                 }

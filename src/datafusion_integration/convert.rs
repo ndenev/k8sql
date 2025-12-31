@@ -20,7 +20,7 @@ use datafusion::arrow::array::{
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use datafusion::error::Result;
 
-use crate::kubernetes::discovery::{ColumnDataType, ColumnDef, ResourceInfo, generate_schema};
+use crate::kubernetes::discovery::{ColumnDataType, ColumnDef};
 
 // NOTE: spec/status columns are stored as UTF8 JSON strings rather than native Arrow structs.
 // This is because DataFusion's query planner needs the schema at planning time, but K8s
@@ -52,17 +52,17 @@ pub fn to_arrow_schema(columns: &[ColumnDef]) -> SchemaRef {
 
 /// Convert K8s JSON resources to Arrow RecordBatch
 ///
-/// Takes the cluster name, resource info, and JSON values from the K8s API
+/// Takes the cluster name, cached column definitions, and JSON values from the K8s API
 /// and converts them to an Arrow RecordBatch suitable for DataFusion.
+///
+/// The columns are pre-computed and cached to avoid regenerating schema for every batch.
 pub fn json_to_record_batch(
     cluster: &str,
-    resource_info: &ResourceInfo,
+    columns: &[ColumnDef],
     resources: Vec<serde_json::Value>,
 ) -> Result<RecordBatch> {
-    let columns = generate_schema(resource_info);
-
     if resources.is_empty() {
-        let schema = to_arrow_schema(&columns);
+        let schema = to_arrow_schema(columns);
         return Ok(RecordBatch::new_empty(schema));
     }
 
@@ -70,7 +70,7 @@ pub fn json_to_record_batch(
     let mut arrays: Vec<ArrayRef> = Vec::with_capacity(columns.len());
     let mut fields: Vec<Field> = Vec::with_capacity(columns.len());
 
-    for col in &columns {
+    for col in columns {
         let (array, field) = build_column_array(cluster, col, &resources)?;
         arrays.push(array);
         fields.push(field);
@@ -118,7 +118,33 @@ impl<'a> ColumnBuilder<'a> {
     /// while timestamp/integer builders use get_nested_value() to access raw
     /// JSON values for type-specific parsing.
     fn build_string_array(&self) -> Result<(ArrayRef, Field)> {
-        let mut builder = StringBuilder::new();
+        // Pre-allocate capacity to avoid reallocations during build
+        let num_rows = self.resources.len();
+
+        // Estimate total string capacity by sampling (avoids double iteration)
+        // We sample first few rows to estimate average string length
+        let sample_size = num_rows.min(10);
+        let mut sample_total_len = 0usize;
+        let mut sample_non_null_count = 0usize;
+        for i in 0..sample_size {
+            if let Some(value) = extract_field_value(
+                &self.resources[i],
+                &self.col.name,
+                self.col.json_path.as_deref(),
+            ) {
+                sample_total_len += value.len();
+                sample_non_null_count += 1;
+            }
+        }
+        // Calculate average based on non-null values to avoid underestimation
+        let avg_len = if sample_non_null_count > 0 {
+            sample_total_len / sample_non_null_count
+        } else {
+            32 // Fallback if all sampled values are null
+        };
+        let estimated_capacity = avg_len * num_rows;
+
+        let mut builder = StringBuilder::with_capacity(num_rows, estimated_capacity);
 
         for resource in self.resources {
             match extract_field_value(resource, &self.col.name, self.col.json_path.as_deref()) {
