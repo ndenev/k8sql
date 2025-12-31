@@ -196,7 +196,7 @@ impl<'a> ColumnBuilder<'a> {
             let path = self.col.json_path.as_deref().unwrap_or(&self.col.name);
             let value = get_nested_value(resource, path);
 
-            match &value {
+            match value {
                 serde_json::Value::Number(n) => {
                     if let Some(i) = n.as_i64() {
                         builder.append_value(i);
@@ -243,11 +243,11 @@ fn extract_field_value(
 ) -> Option<String> {
     let path = json_path.unwrap_or(field_name);
     let value = get_nested_value(resource, path);
-    format_json_value(&value)
+    format_json_value(value)
 }
 
 /// Navigate a dotted path in a JSON value
-fn get_nested_value(value: &serde_json::Value, path: &str) -> serde_json::Value {
+fn get_nested_value<'a>(value: &'a serde_json::Value, path: &str) -> &'a serde_json::Value {
     let mut current = value;
 
     for part in path.split('.') {
@@ -264,7 +264,7 @@ fn get_nested_value(value: &serde_json::Value, path: &str) -> serde_json::Value 
         };
     }
 
-    current.clone()
+    current
 }
 
 /// Format a JSON value as a string for storage/display
@@ -299,15 +299,15 @@ mod tests {
         });
 
         assert_eq!(
-            get_nested_value(&json, "metadata.name"),
+            *get_nested_value(&json, "metadata.name"),
             serde_json::json!("test-pod")
         );
         assert_eq!(
-            get_nested_value(&json, "status.phase"),
+            *get_nested_value(&json, "status.phase"),
             serde_json::json!("Running")
         );
         assert_eq!(
-            get_nested_value(&json, "nonexistent"),
+            *get_nested_value(&json, "nonexistent"),
             serde_json::Value::Null
         );
     }
@@ -326,15 +326,15 @@ mod tests {
         assert_eq!(first_container["name"], "nginx");
 
         let second_name = get_nested_value(&json, "containers.1.name");
-        assert_eq!(second_name, "sidecar");
+        assert_eq!(*second_name, "sidecar");
 
         // Out of bounds returns null
         let oob = get_nested_value(&json, "containers.10");
-        assert_eq!(oob, serde_json::Value::Null);
+        assert_eq!(*oob, serde_json::Value::Null);
 
         // Non-numeric index on array returns null
         let invalid = get_nested_value(&json, "containers.invalid");
-        assert_eq!(invalid, serde_json::Value::Null);
+        assert_eq!(*invalid, serde_json::Value::Null);
     }
 
     #[test]
@@ -355,7 +355,7 @@ mod tests {
         });
 
         let cpu = get_nested_value(&json, "spec.containers.0.resources.limits.cpu");
-        assert_eq!(cpu, "100m");
+        assert_eq!(*cpu, "100m");
     }
 
     #[test]
@@ -366,7 +366,7 @@ mod tests {
         });
 
         let result = get_nested_value(&json, "name.nested");
-        assert_eq!(result, serde_json::Value::Null);
+        assert_eq!(*result, serde_json::Value::Null);
     }
 
     #[test]
