@@ -257,7 +257,7 @@ Detect version inconsistencies across clusters for the same application.
 ```sql
 SELECT name, namespace, status->>'phase' as phase
 FROM pods
-WHERE status->>'phase' != 'Running';
+WHERE status->>'phase' <> 'Running';
 ```
 
 Server-side field selector pushdown for efficiency (uses K8s API `status.phase!=Running`).
@@ -473,7 +473,7 @@ SELECT name, namespace, type, created,
        CURRENT_TIMESTAMP - created as age
 FROM secrets
 WHERE created < CURRENT_TIMESTAMP - INTERVAL '90 days'
-  AND type != 'kubernetes.io/service-account-token'
+  AND type <> 'kubernetes.io/service-account-token'
 ORDER BY created;
 ```
 
@@ -828,7 +828,7 @@ FROM services s
 LEFT JOIN pods p ON s.namespace = p.namespace
   AND json_get_str(s.spec, 'selector', 'app') = p.labels->>'app'
 WHERE p.name IS NULL
-  AND s.namespace != 'kube-system';
+  AND s.namespace <> 'kube-system';
 ```
 
 Service discovery issues.
@@ -840,7 +840,7 @@ SELECT name, namespace,
        json_get_str(spec, 'storageClassName') as storage_class,
        json_get_str(status, 'phase') as phase
 FROM persistentvolumeclaims
-WHERE json_get_str(status, 'phase') != 'Bound';
+WHERE json_get_str(status, 'phase') <> 'Bound';
 ```
 
 Unbound storage claims.
