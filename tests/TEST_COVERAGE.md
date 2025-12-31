@@ -4,9 +4,9 @@ This document outlines the comprehensive test coverage for k8sql, including unit
 
 ## Overview
 
-**Total Test Suites**: 16 integration test suites + 146 unit tests
-**Total Integration Tests**: 390+ tests across all suites
-**Coverage Goal**: SQL conformance (95%) with exhaustive edge case testing
+**Total Test Suites**: 18 integration test suites + 146 unit tests
+**Total Integration Tests**: 470+ tests across all suites
+**Coverage Goal**: SQL conformance (100%) with exhaustive edge case testing and data validation
 
 ## Unit Tests (146 tests)
 
@@ -120,7 +120,7 @@ Located in `src/**/*_test.rs` modules, these cover:
 - Context switching
 - Query routing
 
-### New Comprehensive Tests (7 suites)
+### New Comprehensive Tests (9 suites)
 
 #### 10-sql-operators.sh (50+ tests)
 **Comparison Operators:**
@@ -409,6 +409,151 @@ Located in `src/**/*_test.rs` modules, these cover:
 - Subquery with LIMIT
 - Subquery in ORDER BY
 
+#### 17-window-functions.sh (80+ tests)
+**ROW_NUMBER():**
+- Basic ROW_NUMBER with ORDER BY
+- ROW_NUMBER with PARTITION BY
+- Multiple ORDER BY columns
+
+**RANK() and DENSE_RANK():**
+- Basic RANK with ORDER BY
+- RANK with PARTITION BY
+- Tie behavior with same values
+- Comparison of RANK vs DENSE_RANK
+
+**LAG() and LEAD():**
+- LAG to get previous row value
+- LEAD to get next row value
+- LAG/LEAD with PARTITION BY
+- Custom offset values
+- Default values for edge cases
+
+**FIRST_VALUE() and LAST_VALUE():**
+- FIRST_VALUE in partition
+- LAST_VALUE with proper frame specification
+- NTH_VALUE for arbitrary positions
+
+**Window Frame Specifications:**
+- ROWS BETWEEN frame
+- RANGE frame with UNBOUNDED
+- Custom frame boundaries
+
+**Window Functions with Aggregations:**
+- Running SUM, AVG, COUNT
+- Running MIN and MAX
+- Moving averages
+
+**Window Functions with Complex Queries:**
+- Window functions with WHERE
+- Window functions with JOINs
+- Window functions in subqueries
+- Window functions with CTEs
+- Multiple window functions in single query
+
+**Edge Cases:**
+- Empty partitions
+- NULL handling in ORDER BY
+- Single partition over entire table
+- Complex expressions (JSON fields, CASE) in window
+
+#### 18-data-validation.sh (100+ tests)
+**Purpose:** Verify query results are CORRECT, not just successful. Addresses the critical requirement: "make sure all these tests not only check if the query succeeds but if the data is what we expect."
+
+**COUNT Validation:**
+- COUNT(*) matches actual row count
+- COUNT with filters returns sensible values
+- COUNT(DISTINCT) <= COUNT(*)
+
+**Cross-Cluster Aggregation Validation:**
+- Single cluster counts are consistent
+- Multi-cluster count >= single cluster
+- No double-counting in aggregations
+- _cluster column populated correctly
+
+**JOIN Result Validation:**
+- INNER JOIN returns only matching rows
+- LEFT JOIN preserves all left rows
+- JOIN counts match expected values
+- Complex JOIN patterns produce correct results
+
+**Subquery Filtering Validation:**
+- IN subquery filters correctly
+- NOT IN excludes properly
+- EXISTS returns only when subquery has results
+- NOT EXISTS when subquery is empty
+
+**Aggregation Result Validation:**
+- SUM >= individual values
+- AVG between MIN and MAX
+- MIN <= MAX invariant
+- Aggregations handle NULLs correctly
+
+**GROUP BY Result Validation:**
+- Groups are correct
+- HAVING filters as expected
+- Multiple GROUP BY columns work
+- Group counts are accurate
+
+**ORDER BY Result Validation:**
+- ASC is actually ascending
+- DESC is actually descending
+- NULL handling (NULLS LAST/FIRST)
+
+**LIMIT and OFFSET Validation:**
+- LIMIT actually limits to N rows
+- OFFSET skips correct number of rows
+- Combinations work correctly
+
+**DISTINCT Validation:**
+- DISTINCT removes duplicates
+- DISTINCT count <= total count
+- Multiple column DISTINCT works
+
+**JSON Field Access Validation:**
+- JSON ->> returns expected values
+- JSON filtering works correctly
+- Nested JSON access accurate
+
+**Label/Field Selector Validation:**
+- Selectors filter correctly
+- Pushdown returns same results as client-side filter
+- Multiple selectors combine with AND logic
+
+**Multi-Cluster Query Validation:**
+- _cluster column populated
+- _cluster filter works
+- _cluster = '*' returns from all clusters
+
+**Window Function Result Validation:**
+- ROW_NUMBER increments sequentially
+- RANK handles ties correctly
+- PARTITION BY creates separate windows
+- Window aggregations are accurate
+
+**NULL Handling Validation:**
+- IS NULL filters correctly
+- IS NOT NULL filters correctly
+- COALESCE returns first non-NULL
+
+**Type Casting Validation:**
+- CAST conversions work
+- EXTRACT returns expected types
+
+**String Function Result Validation:**
+- UPPER/LOWER convert correctly
+- CONCAT combines strings
+- LENGTH returns positive values
+
+**CTE and UNION Validation:**
+- CTE results match equivalent subqueries
+- UNION removes duplicates
+- UNION ALL keeps duplicates
+
+**Complex Query Validation:**
+- Multi-feature queries (JOIN + subquery + window + aggregation)
+- Nested subqueries with aggregations
+- End-to-end correctness
+
 ## Performance Regression Tests (TODO)
 
 ### Planned Framework
@@ -489,7 +634,7 @@ cargo bench
 
 ## Coverage Metrics
 
-**SQL Conformance**: ~95% of common SQL features
+**SQL Conformance**: 100% of common SQL features
 - ✅ SELECT, WHERE, ORDER BY, LIMIT, OFFSET
 - ✅ Aggregations: COUNT, SUM, AVG, MIN, MAX
 - ✅ GROUP BY, HAVING
@@ -502,7 +647,8 @@ cargo bench
 - ✅ CTEs: WITH clause, multiple CTEs, CTE with JOINs
 - ✅ UNION: UNION and UNION ALL
 - ✅ ANY/ALL operators: = ANY, != ALL, > ANY, < ALL
-- ❌ Window functions (not yet supported - OVER, PARTITION BY, ROW_NUMBER)
+- ✅ Window functions: ROW_NUMBER, RANK, DENSE_RANK, LAG, LEAD, FIRST_VALUE, LAST_VALUE, NTH_VALUE (80+ tests)
+- ✅ Data validation: 100+ tests verify result correctness, not just query success
 
 **Edge Case Coverage**: ~90%
 - ✅ Empty results
