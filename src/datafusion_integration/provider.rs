@@ -7,7 +7,7 @@ use std::any::Any;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use datafusion::arrow::datatypes::SchemaRef;
+use datafusion::arrow::datatypes::{Schema, SchemaRef};
 use datafusion::catalog::Session;
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::error::Result;
@@ -747,9 +747,30 @@ impl TableProvider for K8sTableProvider {
             .progress()
             .start_query(&self.resource_info.table_name, num_targets);
 
-        // Create lazy execution plan - data will be fetched when partitions are executed
-        // Each partition corresponds to one QueryTarget (cluster, namespace pair)
-        // DataFusion controls parallelism via its thread pool
+        // Filter columns based on projection to avoid converting unrequested fields.
+        // This is a critical optimization: for queries like "SELECT name FROM pods",
+        // we skip parsing and converting the large spec/status JSON fields entirely.
+        let (projected_schema, projected_columns) = if let Some(proj) = projection {
+            // Build schema and columns for only the requested fields
+            let fields: Vec<_> = proj.iter().map(|&i| self.schema.field(i).clone()).collect();
+            let columns: Vec<_> = proj.iter().map(|&i| self.columns[i].clone()).collect();
+
+            debug!(
+                table = %self.resource_info.table_name,
+                total_columns = self.columns.len(),
+                projected_columns = columns.len(),
+                "Applying projection pushdown - converting only requested columns"
+            );
+
+            (Arc::new(Schema::new(fields)), Arc::new(columns))
+        } else {
+            // No projection - use full schema and all columns
+            (self.schema.clone(), self.columns.clone())
+        };
+
+        // Create lazy execution plan - data will be fetched when partitions are executed.
+        // Each partition corresponds to one QueryTarget (cluster, namespace pair).
+        // DataFusion controls parallelism via its thread pool.
         //
         // Note: DataFusion only passes `limit` when it's safe to apply at the source.
         // This is determined by supports_filters_pushdown() - we return Unsupported for
@@ -759,39 +780,12 @@ impl TableProvider for K8sTableProvider {
             query_targets,
             api_filters,
             self.pool.clone(),
-            self.schema.clone(),
+            projected_schema,
             limit,
-            self.columns.clone(),
+            projected_columns,
         );
 
-        // Handle projection if specified
-        if let Some(proj) = projection {
-            // Create a ProjectionExec to handle column projection
-            use datafusion::physical_plan::projection::ProjectionExec;
-
-            let input_plan: Arc<dyn ExecutionPlan> = Arc::new(plan);
-            let projected_exprs: Result<Vec<_>> = proj
-                .iter()
-                .map(|&i| {
-                    let field = self.schema.field(i);
-                    let col =
-                        datafusion::physical_expr::expressions::col(field.name(), &self.schema)
-                            .map_err(|e| {
-                                datafusion::error::DataFusionError::Internal(format!(
-                                    "Column {} not found in schema: {}",
-                                    field.name(),
-                                    e
-                                ))
-                            })?;
-                    Ok((col, field.name().to_string()))
-                })
-                .collect();
-
-            let projection_plan = ProjectionExec::try_new(projected_exprs?, input_plan)?;
-            Ok(Arc::new(projection_plan))
-        } else {
-            Ok(Arc::new(plan))
-        }
+        Ok(Arc::new(plan))
     }
 }
 
