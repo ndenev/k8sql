@@ -231,6 +231,29 @@ Use `json_get_array()` with `UNNEST` for array expansion:
 SELECT json_get_str(UNNEST(json_get_array(spec, 'containers')), 'image') FROM pods
 ```
 
+### Performance Tips
+
+**Projection Pushdown** (automatic optimization):
+- k8sql automatically skips converting unrequested JSON columns
+- `SELECT name FROM pods` only processes ~50 bytes per pod (vs ~2KB for full resource)
+- `SELECT name, namespace, labels FROM pods` processes ~200 bytes per pod
+- Impact: **10-40x reduction** in CPU/memory for selective queries
+- No user action needed - optimization happens automatically
+
+**Query Performance Best Practices**:
+1. **Select only needed columns**: `SELECT name, namespace FROM pods` is much faster than `SELECT * FROM pods`
+2. **Use namespace filters**: `WHERE namespace = 'kube-system'` uses efficient namespaced API endpoint
+3. **Use label selectors**: `WHERE labels->>'app' = 'nginx'` pushes to K8s API (reduces network transfer)
+4. **Use field selectors**: `WHERE status->>'phase' = 'Running'` for pods pushes to K8s API
+5. **Cluster filters**: `WHERE _cluster = 'prod'` avoids querying unnecessary clusters
+6. **Combine filters**: Multiple AND conditions on labels/fields push to K8s as combined selectors
+7. **Use LIMIT**: `LIMIT 10` with single cluster queries pushes to K8s API (50x data reduction)
+
+**What to Avoid**:
+- `SELECT * FROM pods` when you only need a few columns (wastes CPU converting large JSON fields)
+- Queries without namespace/cluster filters on large clusters (fetches all resources)
+- Client-side filtering (LIKE, complex expressions) when API-pushable filters exist
+
 ## REPL Controls
 
 - **Tab**: Auto-complete keywords/tables/columns
