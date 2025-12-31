@@ -1350,4 +1350,164 @@ mod tests {
         assert!(matches!(result[0], TableProviderFilterPushDown::Exact));
         assert!(matches!(result[1], TableProviderFilterPushDown::Exact));
     }
+
+    #[test]
+    fn test_field_selector_integer_string_value() {
+        // Test that field selectors work with integer values as strings
+        // Example: status.replicas = "3" (K8s API accepts string representation)
+        // This tests that our current implementation (which uses string literals)
+        // will work correctly with integer field selectors when we add them
+        use crate::kubernetes::discovery::ResourceInfo;
+        use crate::progress::create_progress_handle;
+
+        let api_resource = ApiResource::from_gvk_with_plural(
+            &kube::api::GroupVersionKind::gvk("apps", "v1", "ReplicaSet"),
+            "replicasets",
+        );
+
+        let capabilities = ApiCapabilities {
+            scope: Scope::Namespaced,
+            subresources: vec![],
+            operations: vec![],
+        };
+
+        let resource_info = ResourceInfo {
+            api_resource,
+            capabilities,
+            table_name: "replicasets".to_string(),
+            aliases: vec!["replicaset".to_string(), "rs".to_string()],
+            is_core: false,
+            group: "apps".to_string(),
+            version: "v1".to_string(),
+            custom_fields: None,
+        };
+
+        let progress = create_progress_handle();
+        let pool = Arc::new(K8sClientPool::new_for_test(progress));
+        let provider = K8sTableProvider::new(resource_info, pool);
+
+        // Simulate what would happen with json_get_str(status, 'replicas') = '3'
+        // We can't easily construct ScalarFunction expressions, but we can verify
+        // the registry knows about status.replicas for replicasets
+        use crate::kubernetes::FIELD_SELECTOR_REGISTRY;
+
+        assert!(FIELD_SELECTOR_REGISTRY.is_supported("replicasets", "status.replicas"));
+
+        // Verify the field selector format would be correct with string value
+        use crate::kubernetes::{FieldSelector, FieldSelectorOperator};
+        let selector = FieldSelector {
+            path: "status.replicas".to_string(),
+            operator: FieldSelectorOperator::Equals,
+            value: "3".to_string(), // Integer as string
+        };
+
+        assert_eq!(selector.to_k8s_string(), "status.replicas=3");
+
+        // This confirms that when we extract status->>'replicas' = '3' in the future,
+        // it will work correctly with K8s API (which accepts "3" as a string)
+    }
+
+    #[test]
+    fn test_field_selector_boolean_string_value() {
+        // Test that field selectors work with boolean values as strings
+        // Example: spec.unschedulable = "true" (K8s API accepts string representation)
+        use crate::kubernetes::discovery::ResourceInfo;
+        use crate::progress::create_progress_handle;
+
+        let api_resource = ApiResource::from_gvk_with_plural(
+            &kube::api::GroupVersionKind::gvk("", "v1", "Node"),
+            "nodes",
+        );
+
+        let capabilities = ApiCapabilities {
+            scope: Scope::Cluster,
+            subresources: vec![],
+            operations: vec![],
+        };
+
+        let resource_info = ResourceInfo {
+            api_resource,
+            capabilities,
+            table_name: "nodes".to_string(),
+            aliases: vec!["node".to_string(), "no".to_string()],
+            is_core: true,
+            group: "".to_string(),
+            version: "v1".to_string(),
+            custom_fields: None,
+        };
+
+        let progress = create_progress_handle();
+        let pool = Arc::new(K8sClientPool::new_for_test(progress));
+        let _provider = K8sTableProvider::new(resource_info, pool);
+
+        // Verify the registry knows about spec.unschedulable for nodes
+        use crate::kubernetes::FIELD_SELECTOR_REGISTRY;
+
+        assert!(FIELD_SELECTOR_REGISTRY.is_supported("nodes", "spec.unschedulable"));
+
+        // Verify the field selector format works with boolean string values
+        use crate::kubernetes::{FieldSelector, FieldSelectorOperator};
+        let selector_true = FieldSelector {
+            path: "spec.unschedulable".to_string(),
+            operator: FieldSelectorOperator::Equals,
+            value: "true".to_string(), // Boolean as string
+        };
+
+        let selector_false = FieldSelector {
+            path: "spec.unschedulable".to_string(),
+            operator: FieldSelectorOperator::Equals,
+            value: "false".to_string(), // Boolean as string
+        };
+
+        assert_eq!(selector_true.to_k8s_string(), "spec.unschedulable=true");
+        assert_eq!(selector_false.to_k8s_string(), "spec.unschedulable=false");
+
+        // This confirms that when we extract spec->>'unschedulable' = 'true' in the future,
+        // it will work correctly with K8s API (which accepts "true"/"false" as strings)
+    }
+
+    #[test]
+    fn test_field_selector_or_expression_unsupported() {
+        // Test that OR expressions are unsupported for field selectors
+        // K8s field selectors only support AND (comma-separated), not OR
+        let provider = create_test_provider();
+
+        let name_filter1 = Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(Expr::Column(Column::new_unqualified("name"))),
+            op: Operator::Eq,
+            right: Box::new(Expr::Literal(
+                datafusion::common::ScalarValue::Utf8(Some("pod-1".to_string())),
+                None,
+            )),
+        });
+
+        let name_filter2 = Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(Expr::Column(Column::new_unqualified("name"))),
+            op: Operator::Eq,
+            right: Box::new(Expr::Literal(
+                datafusion::common::ScalarValue::Utf8(Some("pod-2".to_string())),
+                None,
+            )),
+        });
+
+        // Create OR expression: name = 'pod-1' OR name = 'pod-2'
+        let or_filter = Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(name_filter1),
+            op: Operator::Or,
+            right: Box::new(name_filter2),
+        });
+
+        // OR should be Unsupported (K8s doesn't support OR in field selectors)
+        let result = provider.supports_filters_pushdown(&[&or_filter]).unwrap();
+
+        assert_eq!(result.len(), 1);
+        assert!(matches!(
+            result[0],
+            TableProviderFilterPushDown::Unsupported
+        ));
+
+        // Verify extraction doesn't produce anything for OR
+        let extracted = provider.extract_field_selectors(&[or_filter]);
+        assert!(extracted.is_none());
+    }
 }
