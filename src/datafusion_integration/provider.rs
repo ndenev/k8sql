@@ -22,7 +22,7 @@ use crate::kubernetes::discovery::{ColumnDef, ResourceInfo, generate_schema};
 
 use super::convert::to_arrow_schema;
 use super::execution::{K8sExecutionPlan, QueryTarget};
-use super::filter_extraction::{FilterExtractor, FilterValue};
+use super::filter_extraction::{ExpressionVisitor, FilterExtractor, FilterValue, walk_expressions};
 
 /// Represents how clusters should be selected for a query
 #[derive(Debug, Clone)]
@@ -90,6 +90,98 @@ impl FilterValue for NamespaceFilter {
     }
 }
 
+/// Visitor that extracts label selectors from expressions
+struct LabelSelectorVisitor<'a> {
+    provider: &'a K8sTableProvider,
+    selectors: Vec<String>,
+}
+
+impl<'a> LabelSelectorVisitor<'a> {
+    fn new(provider: &'a K8sTableProvider) -> Self {
+        Self {
+            provider,
+            selectors: Vec::new(),
+        }
+    }
+
+    fn into_selectors(self) -> Vec<String> {
+        self.selectors
+    }
+}
+
+impl<'a> ExpressionVisitor for LabelSelectorVisitor<'a> {
+    fn visit_eq(&mut self, binary: &datafusion::logical_expr::BinaryExpr) {
+        if let Some(selector) = self.provider.extract_label_selector(binary, "=") {
+            self.selectors.push(selector);
+        }
+    }
+
+    fn visit_not_eq(&mut self, binary: &datafusion::logical_expr::BinaryExpr) {
+        if let Some(selector) = self.provider.extract_label_selector(binary, "!=") {
+            self.selectors.push(selector);
+        }
+    }
+
+    fn visit_in_list(&mut self, in_list: &datafusion::logical_expr::expr::InList) {
+        if let Some(selector) = self.provider.extract_label_selector_from_inlist(in_list) {
+            self.selectors.push(selector);
+        }
+    }
+}
+
+/// Visitor that extracts field selectors from expressions
+struct FieldSelectorVisitor<'a> {
+    provider: &'a K8sTableProvider,
+    registry: &'a crate::kubernetes::FieldSelectorRegistry,
+    selectors: Vec<crate::kubernetes::FieldSelector>,
+}
+
+impl<'a> FieldSelectorVisitor<'a> {
+    fn new(
+        provider: &'a K8sTableProvider,
+        registry: &'a crate::kubernetes::FieldSelectorRegistry,
+    ) -> Self {
+        Self {
+            provider,
+            registry,
+            selectors: Vec::new(),
+        }
+    }
+
+    fn into_selectors(self) -> Vec<crate::kubernetes::FieldSelector> {
+        self.selectors
+    }
+}
+
+impl<'a> ExpressionVisitor for FieldSelectorVisitor<'a> {
+    fn visit_eq(&mut self, binary: &datafusion::logical_expr::BinaryExpr) {
+        use crate::kubernetes::FieldSelectorOperator;
+        if let Some(selector) = self.provider.extract_field_selector(
+            binary,
+            FieldSelectorOperator::Equals,
+            self.registry,
+        ) {
+            self.selectors.push(selector);
+        }
+    }
+
+    fn visit_not_eq(&mut self, binary: &datafusion::logical_expr::BinaryExpr) {
+        use crate::kubernetes::FieldSelectorOperator;
+        if let Some(selector) = self.provider.extract_field_selector(
+            binary,
+            FieldSelectorOperator::NotEquals,
+            self.registry,
+        ) {
+            self.selectors.push(selector);
+        }
+    }
+
+    fn visit_in_list(&mut self, _in_list: &datafusion::logical_expr::expr::InList) {
+        // Field selectors don't support IN lists currently
+        // K8s API only supports = and != operators for field selectors
+    }
+}
+
 /// A DataFusion TableProvider that fetches data from Kubernetes
 pub struct K8sTableProvider {
     /// The resource info for this table
@@ -132,46 +224,17 @@ impl K8sTableProvider {
     /// (after SQL preprocessing converts `labels.key` to this form)
     /// Returns a K8s label selector string like "app=nginx,env=prod"
     fn extract_label_selectors(&self, filters: &[Expr]) -> Option<String> {
-        let mut selectors = Vec::new();
+        let mut visitor = LabelSelectorVisitor::new(self);
 
         for filter in filters {
-            self.collect_label_selectors(filter, &mut selectors);
+            walk_expressions(filter, &mut visitor);
         }
 
+        let selectors = visitor.into_selectors();
         if selectors.is_empty() {
             None
         } else {
             Some(selectors.join(","))
-        }
-    }
-
-    /// Recursively collect label selectors from an expression tree
-    fn collect_label_selectors(&self, expr: &Expr, selectors: &mut Vec<String>) {
-        match expr {
-            // Handle AND expressions - recurse into both sides
-            Expr::BinaryExpr(binary) if binary.op == Operator::And => {
-                self.collect_label_selectors(&binary.left, selectors);
-                self.collect_label_selectors(&binary.right, selectors);
-            }
-            // Handle equality: json_get_str(labels, 'key') = 'value'
-            Expr::BinaryExpr(binary) if binary.op == Operator::Eq => {
-                if let Some(selector) = self.extract_label_selector(binary, "=") {
-                    selectors.push(selector);
-                }
-            }
-            // Handle inequality: json_get_str(labels, 'key') != 'value'
-            Expr::BinaryExpr(binary) if binary.op == Operator::NotEq => {
-                if let Some(selector) = self.extract_label_selector(binary, "!=") {
-                    selectors.push(selector);
-                }
-            }
-            // Handle IN/NOT IN: labels->>'key' IN ('val1', 'val2')
-            Expr::InList(in_list) => {
-                if let Some(selector) = self.extract_label_selector_from_inlist(in_list) {
-                    selectors.push(selector);
-                }
-            }
-            _ => {}
         }
     }
 
@@ -271,12 +334,13 @@ impl K8sTableProvider {
     fn extract_field_selectors(&self, filters: &[Expr]) -> Option<String> {
         use crate::kubernetes::FIELD_SELECTOR_REGISTRY;
 
-        let mut selectors = Vec::new();
+        let mut visitor = FieldSelectorVisitor::new(self, &FIELD_SELECTOR_REGISTRY);
 
         for filter in filters {
-            self.collect_field_selectors(filter, &FIELD_SELECTOR_REGISTRY, &mut selectors);
+            walk_expressions(filter, &mut visitor);
         }
 
+        let mut selectors = visitor.into_selectors();
         if selectors.is_empty() {
             None
         } else {
@@ -298,41 +362,6 @@ impl K8sTableProvider {
                     .collect::<Vec<_>>()
                     .join(","),
             )
-        }
-    }
-
-    /// Recursively collect field selectors from an expression tree
-    fn collect_field_selectors(
-        &self,
-        expr: &Expr,
-        registry: &crate::kubernetes::FieldSelectorRegistry,
-        selectors: &mut Vec<crate::kubernetes::FieldSelector>,
-    ) {
-        use crate::kubernetes::FieldSelectorOperator;
-
-        match expr {
-            // Handle AND expressions - recurse into both sides
-            Expr::BinaryExpr(binary) if binary.op == Operator::And => {
-                self.collect_field_selectors(&binary.left, registry, selectors);
-                self.collect_field_selectors(&binary.right, registry, selectors);
-            }
-            // Handle equality: json_get_str(spec/status, 'key') = 'value' or name = 'value'
-            Expr::BinaryExpr(binary) if binary.op == Operator::Eq => {
-                if let Some(selector) =
-                    self.extract_field_selector(binary, FieldSelectorOperator::Equals, registry)
-                {
-                    selectors.push(selector);
-                }
-            }
-            // Handle inequality: json_get_str(spec/status, 'key') != 'value'
-            Expr::BinaryExpr(binary) if binary.op == Operator::NotEq => {
-                if let Some(selector) =
-                    self.extract_field_selector(binary, FieldSelectorOperator::NotEquals, registry)
-                {
-                    selectors.push(selector);
-                }
-            }
-            _ => {}
         }
     }
 

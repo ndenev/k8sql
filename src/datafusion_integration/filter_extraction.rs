@@ -1,6 +1,50 @@
 use datafusion::logical_expr::{Expr, Operator};
 use std::collections::HashSet;
 
+/// Trait for visiting expressions during recursive tree walking
+/// Implementations define how to process each type of expression
+pub trait ExpressionVisitor {
+    /// Visit a binary equality expression (column = value)
+    fn visit_eq(&mut self, binary: &datafusion::logical_expr::BinaryExpr);
+
+    /// Visit a binary inequality expression (column != value)
+    fn visit_not_eq(&mut self, binary: &datafusion::logical_expr::BinaryExpr);
+
+    /// Visit an IN list expression (column IN (val1, val2, ...))
+    fn visit_in_list(&mut self, in_list: &datafusion::logical_expr::expr::InList);
+}
+
+/// Recursively walk a DataFusion expression tree, calling visitor methods for each leaf expression
+/// Handles AND expressions by recursing into both sides
+/// Calls visitor methods for Eq, NotEq, and InList expressions
+pub fn walk_expressions<V: ExpressionVisitor>(
+    expr: &datafusion::logical_expr::Expr,
+    visitor: &mut V,
+) {
+    use datafusion::logical_expr::{Expr, Operator};
+
+    match expr {
+        // Handle AND expressions - recurse into both sides
+        Expr::BinaryExpr(binary) if binary.op == Operator::And => {
+            walk_expressions(&binary.left, visitor);
+            walk_expressions(&binary.right, visitor);
+        }
+        // Handle equality
+        Expr::BinaryExpr(binary) if binary.op == Operator::Eq => {
+            visitor.visit_eq(binary);
+        }
+        // Handle inequality
+        Expr::BinaryExpr(binary) if binary.op == Operator::NotEq => {
+            visitor.visit_not_eq(binary);
+        }
+        // Handle IN/NOT IN
+        Expr::InList(in_list) => {
+            visitor.visit_in_list(in_list);
+        }
+        _ => {}
+    }
+}
+
 /// Generic trait for filter types that can be extracted from DataFusion expressions
 pub trait FilterValue: Sized {
     /// The default value when no filter is found
