@@ -7,7 +7,7 @@ use std::any::Any;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use datafusion::arrow::datatypes::SchemaRef;
+use datafusion::arrow::datatypes::{Schema, SchemaRef};
 use datafusion::catalog::Session;
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::error::Result;
@@ -747,9 +747,51 @@ impl TableProvider for K8sTableProvider {
             .progress()
             .start_query(&self.resource_info.table_name, num_targets);
 
-        // Create lazy execution plan - data will be fetched when partitions are executed
-        // Each partition corresponds to one QueryTarget (cluster, namespace pair)
-        // DataFusion controls parallelism via its thread pool
+        // Projection pushdown optimization: filter columns before conversion.
+        // For queries like "SELECT name FROM pods", we skip parsing large JSON fields.
+        //
+        // Three cases:
+        // 1. Non-empty projection: Convert only requested columns (optimization)
+        // 2. Empty projection (COUNT(*)): Convert minimal column, wrap with ProjectionExec
+        // 3. No projection (None): Convert all columns
+        let (exec_schema, exec_columns) = match projection {
+            Some(proj) if !proj.is_empty() => {
+                // Non-empty projection: push down column filtering
+                let fields: Vec<_> = proj.iter().map(|&i| self.schema.field(i).clone()).collect();
+                let columns: Vec<_> = proj.iter().map(|&i| self.columns[i].clone()).collect();
+
+                debug!(
+                    table = %self.resource_info.table_name,
+                    total_columns = self.columns.len(),
+                    projected_columns = columns.len(),
+                    "Projection pushdown - converting only requested columns"
+                );
+
+                (Arc::new(Schema::new(fields)), Arc::new(columns))
+            }
+            Some(_) => {
+                // Empty projection (COUNT(*)): convert only minimal column for efficiency.
+                // Use _cluster (column 0) since it's small and always present.
+                // ProjectionExec will discard it to produce 0-column output.
+                let fields = vec![self.schema.field(0).clone()];
+                let columns = vec![self.columns[0].clone()];
+
+                debug!(
+                    table = %self.resource_info.table_name,
+                    "Empty projection (COUNT(*)) - converting minimal column"
+                );
+
+                (Arc::new(Schema::new(fields)), Arc::new(columns))
+            }
+            None => {
+                // No projection: use full schema
+                (self.schema.clone(), self.columns.clone())
+            }
+        };
+
+        // Create lazy execution plan - data will be fetched when partitions are executed.
+        // Each partition corresponds to one QueryTarget (cluster, namespace pair).
+        // DataFusion controls parallelism via its thread pool.
         //
         // Note: DataFusion only passes `limit` when it's safe to apply at the source.
         // This is determined by supports_filters_pushdown() - we return Unsupported for
@@ -759,39 +801,32 @@ impl TableProvider for K8sTableProvider {
             query_targets,
             api_filters,
             self.pool.clone(),
-            self.schema.clone(),
+            exec_schema,
             limit,
-            self.columns.clone(),
+            exec_columns,
         );
 
-        // Handle projection if specified
-        if let Some(proj) = projection {
-            // Create a ProjectionExec to handle column projection
+        // Handle empty projection (COUNT(*)) with ProjectionExec wrapper.
+        // We return the minimal column from K8sExec, and ProjectionExec discards it to produce empty output.
+        if let Some(proj) = projection
+            && proj.is_empty()
+        {
             use datafusion::physical_plan::projection::ProjectionExec;
 
-            let input_plan: Arc<dyn ExecutionPlan> = Arc::new(plan);
-            let projected_exprs: Result<Vec<_>> = proj
-                .iter()
-                .map(|&i| {
-                    let field = self.schema.field(i);
-                    let col =
-                        datafusion::physical_expr::expressions::col(field.name(), &self.schema)
-                            .map_err(|e| {
-                                datafusion::error::DataFusionError::Internal(format!(
-                                    "Column {} not found in schema: {}",
-                                    field.name(),
-                                    e
-                                ))
-                            })?;
-                    Ok((col, field.name().to_string()))
-                })
-                .collect();
+            debug!(
+                table = %self.resource_info.table_name,
+                "Empty projection (COUNT(*)) - using ProjectionExec wrapper"
+            );
 
-            let projection_plan = ProjectionExec::try_new(projected_exprs?, input_plan)?;
-            Ok(Arc::new(projection_plan))
-        } else {
-            Ok(Arc::new(plan))
+            let input_plan: Arc<dyn ExecutionPlan> = Arc::new(plan);
+            // Empty projection - no expressions needed
+            let empty_exprs: Vec<(Arc<dyn datafusion::physical_expr::PhysicalExpr>, String)> =
+                vec![];
+            let projection_plan = ProjectionExec::try_new(empty_exprs, input_plan)?;
+            return Ok(Arc::new(projection_plan));
         }
+
+        Ok(Arc::new(plan))
     }
 }
 
@@ -1541,5 +1576,87 @@ mod tests {
         // Verify extraction doesn't produce anything for OR
         let extracted = provider.extract_field_selectors(&[or_filter]);
         assert!(extracted.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_projection_pushdown() {
+        use datafusion::prelude::SessionContext;
+
+        let provider = create_test_provider();
+        let ctx = SessionContext::new();
+
+        // Test 1: Non-empty projection should push down
+        // Request only columns 0 (_cluster) and 3 (name)
+        let projection = Some(vec![0, 3]);
+
+        let plan = provider
+            .scan(&ctx.state(), projection.as_ref(), &[], None)
+            .await
+            .unwrap();
+
+        // The schema should contain only the projected columns
+        let schema = plan.schema();
+        assert_eq!(
+            schema.fields().len(),
+            2,
+            "Projected schema should have 2 fields"
+        );
+        assert_eq!(schema.field(0).name(), "_cluster");
+        assert_eq!(schema.field(1).name(), "name");
+    }
+
+    #[tokio::test]
+    async fn test_projection_pushdown_empty() {
+        use datafusion::prelude::SessionContext;
+
+        let provider = create_test_provider();
+        let ctx = SessionContext::new();
+
+        // Test 2: Empty projection (COUNT(*)) should use ProjectionExec wrapper
+        let projection = Some(vec![]);
+
+        let plan = provider
+            .scan(&ctx.state(), projection.as_ref(), &[], None)
+            .await
+            .unwrap();
+
+        // For empty projection, we wrap with ProjectionExec
+        // The schema should be empty (0 columns)
+        let schema = plan.schema();
+        assert_eq!(
+            schema.fields().len(),
+            0,
+            "Empty projection should have 0 fields in schema"
+        );
+
+        // Verify it's a ProjectionExec
+        assert_eq!(plan.name(), "ProjectionExec");
+    }
+
+    #[tokio::test]
+    async fn test_projection_pushdown_none() {
+        use datafusion::prelude::SessionContext;
+
+        let provider = create_test_provider();
+        let ctx = SessionContext::new();
+
+        // Test 3: No projection (None) should use full schema
+        let projection: Option<&Vec<usize>> = None;
+
+        let plan = provider
+            .scan(&ctx.state(), projection, &[], None)
+            .await
+            .unwrap();
+
+        // The schema should contain all columns (16 for pods)
+        let schema = plan.schema();
+        assert_eq!(
+            schema.fields().len(),
+            16,
+            "Full schema should have all 16 fields"
+        );
+
+        // Verify it's our K8sExec plan (not wrapped)
+        assert_eq!(plan.name(), "K8sExec");
     }
 }
