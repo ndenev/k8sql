@@ -88,7 +88,8 @@ src/
 │   ├── mod.rs                 # ApiFilters type for filter pushdown
 │   ├── cache.rs               # Resource discovery cache persistence
 │   ├── client.rs              # K8sClientPool - multi-cluster connection caching
-│   └── discovery.rs           # Dynamic resource discovery and schema generation
+│   ├── discovery.rs           # Dynamic resource discovery and schema generation
+│   └── field_selectors.rs     # Field selector registry and types for K8s API pushdown
 ├── output/
 │   ├── mod.rs                 # QueryResult type and format dispatch
 │   ├── table.rs               # Pretty table output
@@ -189,17 +190,39 @@ Special cases:
 
 | SQL Condition | K8s API Optimization |
 |---------------|---------------------|
-| `namespace = 'x'` | Uses namespaced API |
+| `namespace = 'x'` | Uses namespaced API endpoint |
 | `labels->>'app' = 'nginx'` | K8s label selector |
-| `labels->>'app' = 'x' AND labels->>'env' = 'y'` | Combined: `app=x,env=y` |
+| `labels->>'app' = 'x' AND labels->>'env' = 'y'` | Combined label selector: `app=x,env=y` |
+| `status->>'phase' = 'Running'` | K8s field selector (pods only) |
+| `spec->>'nodeName' = 'node-1'` | K8s field selector (pods only) |
+| `type = 'Opaque'` | K8s field selector (secrets only) |
+| `name = 'pod-123'` | K8s field selector (`metadata.name`) |
 | `_cluster = 'prod'` | Only queries that cluster |
 | `_cluster = '*'` | Queries all clusters in parallel |
 
+**Field Selectors** (`src/kubernetes/field_selectors.rs`):
+- Limited to `=` and `!=` operators (K8s restriction)
+- Resource-specific support (e.g., `status.phase` for pods, `type` for secrets)
+- Hardcoded registry based on K8s API documentation
+- Namespace field selector intentionally not used (namespaced API endpoints are more efficient)
+
+Supported resources and fields:
+- **All resources**: `metadata.name`
+- **Pods**: `spec.nodeName`, `spec.restartPolicy`, `spec.schedulerName`, `spec.serviceAccountName`, `spec.hostNetwork`, `status.phase`, `status.podIP`, `status.nominatedNodeName`
+- **Events**: `involvedObject.kind`, `involvedObject.name`, `reason`, `reportingComponent`, `source`, `type`
+- **Secrets**: `type`
+- **Namespaces**: `status.phase`
+- **ReplicaSets**: `status.replicas`
+- **Jobs**: `status.successful`
+- **Nodes**: `spec.unschedulable`
+- **CertificateSigningRequests**: `spec.signerName`
+
 ### Client-side (DataFusion):
-- JSON field access (`status->>'phase'` or `json_get_str(status, 'phase')`)
+- Unsupported field selectors (fields not in registry)
 - LIKE patterns
 - Complex expressions
 - ORDER BY, LIMIT, GROUP BY
+- Operators not supported by K8s field selectors (IN, NOT IN, etc.)
 
 ### JSON Array Access
 
