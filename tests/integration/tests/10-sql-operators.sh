@@ -9,17 +9,17 @@ echo "=== SQL Operators Conformance Tests ==="
 echo ""
 echo "--- Comparison Operators ---"
 
-# Greater than
-assert_min_row_count "Greater than (generation > 0)" "k3d-k8sql-test-1" \
-    "SELECT name FROM pods WHERE generation > 0" 1
+# Greater than (use timestamp to ensure matches)
+assert_min_row_count "Greater than (created > old timestamp)" "k3d-k8sql-test-1" \
+    "SELECT name FROM pods WHERE created > TIMESTAMP '2020-01-01'" 1
 
 # Less than
 assert_success "Less than (generation < 1000)" "k3d-k8sql-test-1" \
     "SELECT name FROM pods WHERE generation < 1000 LIMIT 5"
 
 # Greater than or equal
-assert_success "Greater than or equal (generation >= 1)" "k3d-k8sql-test-1" \
-    "SELECT name FROM pods WHERE generation >= 1 LIMIT 5"
+assert_min_row_count "Greater than or equal (generation >= 0)" "k3d-k8sql-test-1" \
+    "SELECT name FROM pods WHERE generation >= 0" 1
 
 # Less than or equal
 assert_success "Less than or equal (generation <= 10)" "k3d-k8sql-test-1" \
