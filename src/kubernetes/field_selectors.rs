@@ -11,7 +11,7 @@
 //! ## Field Selector Basics
 //!
 //! - Only `=` and `!=` operators are supported (no `in`, `notin`, `exists`)
-//! - All resources support `metadata.name` and `metadata.namespace`
+//! - All resources support `metadata.name` (metadata.namespace intentionally omitted - see below)
 //! - Additional fields vary by resource type (e.g., `status.phase` for pods)
 //! - Field selectors use dot notation: `status.phase=Running`
 //!
@@ -30,7 +30,7 @@ use std::collections::HashMap;
 use std::sync::LazyLock;
 
 /// Represents a field selector operator
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum FieldSelectorOperator {
     /// Equals operator (=)
     Equals,

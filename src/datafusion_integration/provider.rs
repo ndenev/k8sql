@@ -216,6 +216,16 @@ impl K8sTableProvider {
         if selectors.is_empty() {
             None
         } else {
+            // Deduplicate selectors to avoid redundant API parameters
+            // Sort first to group identical selectors together
+            selectors.sort_by(|a, b| {
+                a.path
+                    .cmp(&b.path)
+                    .then(a.operator.cmp(&b.operator))
+                    .then(a.value.cmp(&b.value))
+            });
+            selectors.dedup();
+
             // Join multiple selectors with commas
             Some(
                 selectors
@@ -883,6 +893,429 @@ mod tests {
 
         assert_eq!(result.len(), 1);
         assert!(matches!(result[0], TableProviderFilterPushDown::Exact));
+    }
+
+    #[test]
+    fn test_field_selector_static_registry_initialization() {
+        use crate::kubernetes::FIELD_SELECTOR_REGISTRY;
+
+        // Access registry multiple times to ensure it's initialized once
+        let first_access = FIELD_SELECTOR_REGISTRY.is_supported("pods", "status.phase");
+        let second_access = FIELD_SELECTOR_REGISTRY.is_supported("pods", "status.phase");
+
+        assert!(first_access);
+        assert!(second_access);
+
+        // Verify registry contains expected resources
+        assert!(FIELD_SELECTOR_REGISTRY.is_supported("pods", "metadata.name"));
+        assert!(FIELD_SELECTOR_REGISTRY.is_supported("secrets", "type"));
+        assert!(FIELD_SELECTOR_REGISTRY.is_supported("events", "reason"));
+    }
+
+    #[test]
+    fn test_field_selector_multiple_conditions_and() {
+        let provider = create_test_provider();
+
+        // Test AND with two field selectors: name = 'pod-1' AND status = 'Running'
+        // Note: We can't test status->>'phase' easily without ScalarFunction construction,
+        // but we can test top-level columns
+        let name_filter = Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(Expr::Column(Column::new_unqualified("name"))),
+            op: Operator::Eq,
+            right: Box::new(Expr::Literal(
+                datafusion::common::ScalarValue::Utf8(Some("pod-1".to_string())),
+                None,
+            )),
+        });
+
+        // Create a combined AND expression
+        let combined_filter = Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(name_filter.clone()),
+            op: Operator::And,
+            right: Box::new(Expr::Column(Column::new_unqualified("namespace"))),
+        });
+
+        let result = provider
+            .supports_filters_pushdown(&[&combined_filter])
+            .unwrap();
+
+        // The AND expression should be analyzed and both sides should be pushable
+        assert_eq!(result.len(), 1);
+    }
+
+    #[test]
+    fn test_field_selector_name_metadata_mapping() {
+        let provider = create_test_provider();
+
+        // Verify that 'name' column is correctly mapped to 'metadata.name'
+        let name_filter = Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(Expr::Column(Column::new_unqualified("name"))),
+            op: Operator::Eq,
+            right: Box::new(Expr::Literal(
+                datafusion::common::ScalarValue::Utf8(Some("my-pod".to_string())),
+                None,
+            )),
+        });
+
+        let result = provider.supports_filters_pushdown(&[&name_filter]).unwrap();
+
+        assert_eq!(result.len(), 1);
+        assert!(matches!(result[0], TableProviderFilterPushDown::Exact));
+    }
+
+    #[test]
+    fn test_field_selector_name_not_equals_inexact() {
+        let provider = create_test_provider();
+
+        // Test that name != 'x' uses Inexact pushdown for NULL semantics
+        let name_filter = Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(Expr::Column(Column::new_unqualified("name"))),
+            op: Operator::NotEq,
+            right: Box::new(Expr::Literal(
+                datafusion::common::ScalarValue::Utf8(Some("excluded-pod".to_string())),
+                None,
+            )),
+        });
+
+        let result = provider.supports_filters_pushdown(&[&name_filter]).unwrap();
+
+        assert_eq!(result.len(), 1);
+        assert!(matches!(result[0], TableProviderFilterPushDown::Inexact));
+    }
+
+    #[test]
+    fn test_field_selector_unsupported_operator_greater_than() {
+        let provider = create_test_provider();
+
+        // Field selectors don't support > operator
+        let filter = Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(Expr::Column(Column::new_unqualified("name"))),
+            op: Operator::Gt,
+            right: Box::new(Expr::Literal(
+                datafusion::common::ScalarValue::Utf8(Some("pod-a".to_string())),
+                None,
+            )),
+        });
+
+        let result = provider.supports_filters_pushdown(&[&filter]).unwrap();
+
+        assert_eq!(result.len(), 1);
+        assert!(matches!(
+            result[0],
+            TableProviderFilterPushDown::Unsupported
+        ));
+    }
+
+    #[test]
+    fn test_field_selector_unsupported_operator_like() {
+        let provider = create_test_provider();
+
+        // Field selectors don't support LIKE
+        let filter = Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(Expr::Column(Column::new_unqualified("name"))),
+            op: Operator::LikeMatch,
+            right: Box::new(Expr::Literal(
+                datafusion::common::ScalarValue::Utf8(Some("pod-%".to_string())),
+                None,
+            )),
+        });
+
+        let result = provider.supports_filters_pushdown(&[&filter]).unwrap();
+
+        assert_eq!(result.len(), 1);
+        assert!(matches!(
+            result[0],
+            TableProviderFilterPushDown::Unsupported
+        ));
+    }
+
+    #[test]
+    fn test_field_selector_no_state_leakage_across_queries() {
+        use crate::kubernetes::FIELD_SELECTOR_REGISTRY;
+
+        // Simulate multiple queries to ensure no state leakage
+        let provider1 = create_test_provider();
+        let provider2 = create_test_provider();
+
+        // First query
+        let filter1 = Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(Expr::Column(Column::new_unqualified("name"))),
+            op: Operator::Eq,
+            right: Box::new(Expr::Literal(
+                datafusion::common::ScalarValue::Utf8(Some("pod-1".to_string())),
+                None,
+            )),
+        });
+
+        let result1 = provider1.supports_filters_pushdown(&[&filter1]).unwrap();
+        assert!(matches!(result1[0], TableProviderFilterPushDown::Exact));
+
+        // Second query - registry should still work correctly
+        let filter2 = Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(Expr::Column(Column::new_unqualified("name"))),
+            op: Operator::Eq,
+            right: Box::new(Expr::Literal(
+                datafusion::common::ScalarValue::Utf8(Some("pod-2".to_string())),
+                None,
+            )),
+        });
+
+        let result2 = provider2.supports_filters_pushdown(&[&filter2]).unwrap();
+        assert!(matches!(result2[0], TableProviderFilterPushDown::Exact));
+
+        // Verify registry is still intact
+        assert!(FIELD_SELECTOR_REGISTRY.is_supported("pods", "status.phase"));
+        assert!(FIELD_SELECTOR_REGISTRY.is_supported("secrets", "type"));
+    }
+
+    #[test]
+    fn test_field_selector_extraction_format() {
+        let provider = create_test_provider();
+
+        // Create filters that should be extracted
+        let name_filter = Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(Expr::Column(Column::new_unqualified("name"))),
+            op: Operator::Eq,
+            right: Box::new(Expr::Literal(
+                datafusion::common::ScalarValue::Utf8(Some("my-pod".to_string())),
+                None,
+            )),
+        });
+
+        // Extract field selectors
+        let result = provider.extract_field_selectors(&[name_filter]);
+
+        // Should produce "metadata.name=my-pod"
+        assert!(result.is_some());
+        let field_selector_string = result.unwrap();
+        assert_eq!(field_selector_string, "metadata.name=my-pod");
+    }
+
+    #[test]
+    fn test_field_selector_resource_specific_secret_type() {
+        use crate::kubernetes::discovery::ResourceInfo;
+        use crate::progress::create_progress_handle;
+
+        // Create provider for secrets to test resource-specific field
+        let api_resource = ApiResource::from_gvk_with_plural(
+            &kube::api::GroupVersionKind::gvk("", "v1", "Secret"),
+            "secrets",
+        );
+
+        let capabilities = ApiCapabilities {
+            scope: Scope::Namespaced,
+            subresources: vec![],
+            operations: vec![],
+        };
+
+        let resource_info = ResourceInfo {
+            api_resource,
+            capabilities,
+            table_name: "secrets".to_string(),
+            aliases: vec!["secret".to_string()],
+            is_core: true,
+            group: "".to_string(),
+            version: "v1".to_string(),
+            custom_fields: None,
+        };
+
+        let progress = create_progress_handle();
+        let pool = Arc::new(K8sClientPool::new_for_test(progress));
+        let provider = K8sTableProvider::new(resource_info, pool);
+
+        // Test type field for secrets
+        let type_filter = Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(Expr::Column(Column::new_unqualified("type"))),
+            op: Operator::Eq,
+            right: Box::new(Expr::Literal(
+                datafusion::common::ScalarValue::Utf8(Some("Opaque".to_string())),
+                None,
+            )),
+        });
+
+        // Extract field selectors
+        let result = provider.extract_field_selectors(&[type_filter]);
+
+        // Should produce "type=Opaque"
+        assert!(result.is_some());
+        let field_selector_string = result.unwrap();
+        assert_eq!(field_selector_string, "type=Opaque");
+    }
+
+    #[test]
+    fn test_field_selector_scan_integration() {
+        use crate::kubernetes::ApiFilters;
+
+        let provider = create_test_provider();
+
+        // Create a filter that should extract field selector
+        let name_filter = Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(Expr::Column(Column::new_unqualified("name"))),
+            op: Operator::Eq,
+            right: Box::new(Expr::Literal(
+                datafusion::common::ScalarValue::Utf8(Some("test-pod".to_string())),
+                None,
+            )),
+        });
+
+        // Test extraction
+        let field_selector = provider.extract_field_selectors(&[name_filter]);
+
+        assert!(field_selector.is_some());
+        assert_eq!(field_selector.as_ref().unwrap(), "metadata.name=test-pod");
+
+        // Verify it can be used in ApiFilters
+        let api_filters = ApiFilters {
+            label_selector: None,
+            field_selector,
+        };
+
+        assert!(api_filters.field_selector.is_some());
+        assert_eq!(
+            api_filters.field_selector.unwrap(),
+            "metadata.name=test-pod"
+        );
+    }
+
+    #[test]
+    fn test_field_selector_multiple_combined() {
+        // For secrets, create a type filter
+        use crate::kubernetes::discovery::ResourceInfo;
+        use crate::progress::create_progress_handle;
+
+        let api_resource = ApiResource::from_gvk_with_plural(
+            &kube::api::GroupVersionKind::gvk("", "v1", "Secret"),
+            "secrets",
+        );
+
+        let capabilities = ApiCapabilities {
+            scope: Scope::Namespaced,
+            subresources: vec![],
+            operations: vec![],
+        };
+
+        let resource_info = ResourceInfo {
+            api_resource,
+            capabilities,
+            table_name: "secrets".to_string(),
+            aliases: vec!["secret".to_string()],
+            is_core: true,
+            group: "".to_string(),
+            version: "v1".to_string(),
+            custom_fields: None,
+        };
+
+        let progress = create_progress_handle();
+        let pool = Arc::new(K8sClientPool::new_for_test(progress));
+        let secret_provider = K8sTableProvider::new(resource_info, pool);
+
+        let name_filter_secret = Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(Expr::Column(Column::new_unqualified("name"))),
+            op: Operator::Eq,
+            right: Box::new(Expr::Literal(
+                datafusion::common::ScalarValue::Utf8(Some("my-secret".to_string())),
+                None,
+            )),
+        });
+
+        let type_filter = Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(Expr::Column(Column::new_unqualified("type"))),
+            op: Operator::Eq,
+            right: Box::new(Expr::Literal(
+                datafusion::common::ScalarValue::Utf8(Some("Opaque".to_string())),
+                None,
+            )),
+        });
+
+        // Extract both field selectors
+        let combined = secret_provider.extract_field_selectors(&[name_filter_secret, type_filter]);
+
+        assert!(combined.is_some());
+        let combined_str = combined.unwrap();
+
+        // Should contain both selectors, comma-separated
+        // Order may vary, so check both are present
+        assert!(combined_str.contains("metadata.name=my-secret"));
+        assert!(combined_str.contains("type=Opaque"));
+        assert!(combined_str.contains(","));
+    }
+
+    #[test]
+    fn test_field_selector_with_namespace_filter() {
+        let provider = create_test_provider();
+
+        // Combine namespace filter (uses scoped API) with field selector
+        let namespace_filter = Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(Expr::Column(Column::new_unqualified("namespace"))),
+            op: Operator::Eq,
+            right: Box::new(Expr::Literal(
+                datafusion::common::ScalarValue::Utf8(Some("default".to_string())),
+                None,
+            )),
+        });
+
+        let name_filter = Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(Expr::Column(Column::new_unqualified("name"))),
+            op: Operator::Eq,
+            right: Box::new(Expr::Literal(
+                datafusion::common::ScalarValue::Utf8(Some("my-pod".to_string())),
+                None,
+            )),
+        });
+
+        // Test pushdown - both should be Exact
+        let result = provider
+            .supports_filters_pushdown(&[&namespace_filter, &name_filter])
+            .unwrap();
+
+        assert_eq!(result.len(), 2);
+        assert!(matches!(result[0], TableProviderFilterPushDown::Exact));
+        assert!(matches!(result[1], TableProviderFilterPushDown::Exact));
+
+        // Test extraction - namespace handled separately, field selector extracted
+        let namespace_extracted = provider.extract_namespace_filter(&[namespace_filter]);
+        let field_selector = provider.extract_field_selectors(&[name_filter]);
+
+        // Namespace should be Single("default")
+        assert!(matches!(
+            namespace_extracted,
+            crate::datafusion_integration::provider::NamespaceFilter::Single(_)
+        ));
+
+        // Field selector should be metadata.name=my-pod
+        assert!(field_selector.is_some());
+        assert_eq!(field_selector.unwrap(), "metadata.name=my-pod");
+    }
+
+    #[test]
+    fn test_field_selector_deduplication() {
+        let provider = create_test_provider();
+
+        // Create duplicate filters: name = 'pod-1' AND name = 'pod-1'
+        let name_filter1 = Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(Expr::Column(Column::new_unqualified("name"))),
+            op: Operator::Eq,
+            right: Box::new(Expr::Literal(
+                datafusion::common::ScalarValue::Utf8(Some("pod-1".to_string())),
+                None,
+            )),
+        });
+
+        let name_filter2 = Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(Expr::Column(Column::new_unqualified("name"))),
+            op: Operator::Eq,
+            right: Box::new(Expr::Literal(
+                datafusion::common::ScalarValue::Utf8(Some("pod-1".to_string())),
+                None,
+            )),
+        });
+
+        // Extract should deduplicate
+        let field_selector = provider.extract_field_selectors(&[name_filter1, name_filter2]);
+
+        assert!(field_selector.is_some());
+        // Should only contain one instance, not "metadata.name=pod-1,metadata.name=pod-1"
+        assert_eq!(field_selector.unwrap(), "metadata.name=pod-1");
     }
 
     #[test]
