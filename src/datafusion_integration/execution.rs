@@ -46,7 +46,7 @@ use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, Pla
 use futures::Stream;
 use tracing::debug;
 
-use crate::kubernetes::discovery::{ColumnDef, ResourceInfo};
+use crate::kubernetes::discovery::ColumnDef;
 use crate::kubernetes::{ApiFilters, K8sClientPool};
 
 use super::convert::json_to_record_batch;
@@ -80,8 +80,6 @@ pub struct QueryTarget {
 pub struct K8sExecutionPlan {
     /// Table name for logging and progress reporting
     table_name: String,
-    /// Resource metadata for schema generation
-    resource_info: ResourceInfo,
     /// Query targets - one per partition
     targets: Vec<QueryTarget>,
     /// API filters (labels, field selectors)
@@ -96,7 +94,7 @@ pub struct K8sExecutionPlan {
     fetch_limit: Option<usize>,
     /// Execution metrics for EXPLAIN ANALYZE
     metrics: ExecutionPlanMetricsSet,
-    /// Cached column definitions (avoids regenerating for every batch)
+    /// Cached column definitions (passed to conversion, avoids regenerating)
     columns: Arc<Vec<ColumnDef>>,
 }
 
@@ -105,7 +103,6 @@ impl K8sExecutionPlan {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         table_name: String,
-        resource_info: ResourceInfo,
         targets: Vec<QueryTarget>,
         api_filters: ApiFilters,
         pool: Arc<K8sClientPool>,
@@ -125,7 +122,6 @@ impl K8sExecutionPlan {
 
         Self {
             table_name,
-            resource_info,
             targets,
             api_filters,
             pool,
@@ -144,7 +140,6 @@ impl K8sExecutionPlan {
     fn with_new_fetch(&self, fetch: Option<usize>) -> Self {
         Self {
             table_name: self.table_name.clone(),
-            resource_info: self.resource_info.clone(),
             targets: self.targets.clone(),
             api_filters: self.api_filters.clone(),
             pool: self.pool.clone(),
@@ -265,7 +260,6 @@ impl ExecutionPlan for K8sExecutionPlan {
         // Get the target for this partition
         let target = self.targets[partition].clone();
         let table_name = self.table_name.clone();
-        let resource_info = self.resource_info.clone();
         let api_filters = self.api_filters.clone();
         let pool = self.pool.clone();
         let schema = self.schema.clone();
@@ -291,7 +285,6 @@ impl ExecutionPlan for K8sExecutionPlan {
             pool,
             table_name,
             target,
-            resource_info,
             api_filters,
             schema.clone(),
             fetch_limit,
@@ -311,7 +304,6 @@ fn create_streaming_execution(
     pool: Arc<K8sClientPool>,
     table_name: String,
     target: QueryTarget,
-    _resource_info: ResourceInfo,
     api_filters: ApiFilters,
     schema: SchemaRef,
     fetch_limit: Option<usize>,

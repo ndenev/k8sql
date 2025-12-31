@@ -663,7 +663,6 @@ impl TableProvider for K8sTableProvider {
         // filters we don't push, so DataFusion adds FilterExec and won't push limit through it.
         let plan = K8sExecutionPlan::new(
             self.resource_info.table_name.clone(),
-            self.resource_info.clone(),
             query_targets,
             api_filters,
             self.pool.clone(),
