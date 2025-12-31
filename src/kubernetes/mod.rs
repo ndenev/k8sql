@@ -6,7 +6,9 @@ pub mod field_selectors;
 
 pub use cache::ResourceCache;
 pub use client::{K8sClientPool, extract_initial_context, is_multi_or_pattern_spec};
-pub use field_selectors::{FieldSelector, FieldSelectorOperator, FieldSelectorRegistry};
+pub use field_selectors::{
+    FIELD_SELECTOR_REGISTRY, FieldSelector, FieldSelectorOperator, FieldSelectorRegistry,
+};
 
 /// Parameters to push down to the Kubernetes API
 #[derive(Debug, Clone, Default)]

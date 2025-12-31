@@ -209,7 +209,7 @@ Special cases:
 Supported resources and fields:
 - **All resources**: `metadata.name`
 - **Pods**: `spec.nodeName`, `spec.restartPolicy`, `spec.schedulerName`, `spec.serviceAccountName`, `spec.hostNetwork`, `status.phase`, `status.podIP`, `status.nominatedNodeName`
-- **Events**: `involvedObject.kind`, `involvedObject.name`, `reason`, `reportingComponent`, `source`, `type`
+- **Events**: `involvedObject.kind`, `involvedObject.namespace`, `involvedObject.name`, `involvedObject.uid`, `involvedObject.apiVersion`, `involvedObject.resourceVersion`, `involvedObject.fieldPath`, `reason`, `reportingComponent`, `source`, `type`
 - **Secrets**: `type`
 - **Namespaces**: `status.phase`
 - **ReplicaSets**: `status.replicas`

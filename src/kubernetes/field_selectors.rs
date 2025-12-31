@@ -27,6 +27,7 @@
 //! 4. Add corresponding test cases
 
 use std::collections::HashMap;
+use std::sync::LazyLock;
 
 /// Represents a field selector operator
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -63,6 +64,13 @@ impl FieldSelector {
         }
     }
 }
+
+/// Global field selector registry instance
+///
+/// This is initialized once on first access using LazyLock to avoid creating
+/// a new HashMap on every filter extraction call (hot path optimization).
+pub static FIELD_SELECTOR_REGISTRY: LazyLock<FieldSelectorRegistry> =
+    LazyLock::new(FieldSelectorRegistry::new);
 
 /// Registry of supported field selectors per Kubernetes resource type
 ///
@@ -112,14 +120,17 @@ impl FieldSelectorRegistry {
         self.get_supported_fields(table_name).contains(&field_path)
     }
 
-    /// Create the default registry with all known field selectors
+    /// Create a new registry with all known field selectors
     ///
     /// This includes:
     /// - Universal fields: `metadata.name` (all resources)
     ///   Note: `metadata.namespace` is intentionally excluded because k8sql uses
     ///   namespaced API endpoints for better performance instead of field selectors
     /// - Resource-specific fields as documented in Kubernetes API reference
-    pub fn default() -> Self {
+    ///
+    /// Note: This is called once by the static FIELD_SELECTOR_REGISTRY.
+    /// Don't call this directly; use the static instance instead.
+    fn new() -> Self {
         let mut registry = HashMap::new();
 
         // Universal field supported by all resources
@@ -237,7 +248,7 @@ mod tests {
 
     #[test]
     fn test_registry_universal_fields() {
-        let registry = FieldSelectorRegistry::default();
+        let registry = &*FIELD_SELECTOR_REGISTRY;
 
         // metadata.name should be supported for all resources
         assert!(registry.is_supported("pods", "metadata.name"));
@@ -248,7 +259,7 @@ mod tests {
 
     #[test]
     fn test_registry_pod_fields() {
-        let registry = FieldSelectorRegistry::default();
+        let registry = &*FIELD_SELECTOR_REGISTRY;
 
         // Pod-specific fields
         assert!(registry.is_supported("pods", "status.phase"));
@@ -262,7 +273,7 @@ mod tests {
 
     #[test]
     fn test_registry_secret_fields() {
-        let registry = FieldSelectorRegistry::default();
+        let registry = &*FIELD_SELECTOR_REGISTRY;
 
         // Secret-specific field
         assert!(registry.is_supported("secrets", "type"));
@@ -273,7 +284,7 @@ mod tests {
 
     #[test]
     fn test_registry_event_fields() {
-        let registry = FieldSelectorRegistry::default();
+        let registry = &*FIELD_SELECTOR_REGISTRY;
 
         // Event-specific fields
         assert!(registry.is_supported("events", "reason"));
@@ -284,7 +295,7 @@ mod tests {
 
     #[test]
     fn test_registry_namespace_not_supported() {
-        let registry = FieldSelectorRegistry::default();
+        let registry = &*FIELD_SELECTOR_REGISTRY;
 
         // metadata.namespace is intentionally not supported (we use namespaced API instead)
         assert!(!registry.is_supported("pods", "metadata.namespace"));
@@ -293,7 +304,7 @@ mod tests {
 
     #[test]
     fn test_registry_unknown_resource() {
-        let registry = FieldSelectorRegistry::default();
+        let registry = &*FIELD_SELECTOR_REGISTRY;
 
         // Unknown resource type should return empty fields
         let fields = registry.get_supported_fields("unknownresource");

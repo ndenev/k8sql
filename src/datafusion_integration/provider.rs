@@ -205,13 +205,12 @@ impl K8sTableProvider {
     /// Looks for patterns like `status->>'phase' = 'Running'` or `name = 'pod-123'`
     /// Returns a K8s field selector string like "status.phase=Running,metadata.name=pod-123"
     fn extract_field_selectors(&self, filters: &[Expr]) -> Option<String> {
-        use crate::kubernetes::FieldSelectorRegistry;
+        use crate::kubernetes::FIELD_SELECTOR_REGISTRY;
 
-        let registry = FieldSelectorRegistry::default();
         let mut selectors = Vec::new();
 
         for filter in filters {
-            self.collect_field_selectors(filter, &registry, &mut selectors);
+            self.collect_field_selectors(filter, &FIELD_SELECTOR_REGISTRY, &mut selectors);
         }
 
         if selectors.is_empty() {
@@ -304,6 +303,9 @@ impl K8sTableProvider {
                 // Build field path: "spec.nodeName", "status.phase", etc.
                 let field_path = format!("{}.{}", col.name, key);
 
+                // Note: Values come from DataFusion's validated SQL literals, not raw user input.
+                // kube-rs handles URL encoding when building API requests.
+
                 // Check if this field selector is supported for this resource type
                 if registry.is_supported(&self.resource_info.table_name, &field_path) {
                     debug!(
@@ -339,6 +341,9 @@ impl K8sTableProvider {
             } else {
                 col.name.clone()
             };
+
+            // Note: Values come from DataFusion's validated SQL literals, not raw user input.
+            // kube-rs handles URL encoding when building API requests.
 
             // Check if this field selector is supported for this resource type
             if registry.is_supported(&self.resource_info.table_name, &field_path) {
@@ -386,7 +391,7 @@ impl TableProvider for K8sTableProvider {
         &self,
         filters: &[&Expr],
     ) -> Result<Vec<TableProviderFilterPushDown>> {
-        use crate::kubernetes::FieldSelectorRegistry;
+        use crate::kubernetes::FIELD_SELECTOR_REGISTRY;
 
         // We can push down these filters to the K8s API:
         // - namespace = 'x' -> Uses namespaced API
@@ -397,8 +402,6 @@ impl TableProvider for K8sTableProvider {
         // - status->>'phase' = 'Running' -> K8s field selector (resource-specific)
         // - name = 'pod-123' -> K8s field selector (metadata.name)
         // Other filters will be handled by DataFusion
-
-        let registry = FieldSelectorRegistry::default();
 
         Ok(filters
             .iter()
@@ -466,7 +469,9 @@ impl TableProvider for K8sTableProvider {
                         {
                             // Build field path and check if supported
                             let field_path = format!("{}.{}", col.name, key);
-                            if registry.is_supported(&self.resource_info.table_name, &field_path) {
+                            if FIELD_SELECTOR_REGISTRY
+                                .is_supported(&self.resource_info.table_name, &field_path)
+                            {
                                 // != needs Inexact for same reasons as labels
                                 if binary.op == Operator::NotEq {
                                     return TableProviderFilterPushDown::Inexact;
@@ -489,7 +494,9 @@ impl TableProvider for K8sTableProvider {
                             &col.name
                         };
 
-                        if registry.is_supported(&self.resource_info.table_name, field_path) {
+                        if FIELD_SELECTOR_REGISTRY
+                            .is_supported(&self.resource_info.table_name, field_path)
+                        {
                             // != needs Inexact for same reasons as labels
                             if binary.op == Operator::NotEq {
                                 return TableProviderFilterPushDown::Inexact;
