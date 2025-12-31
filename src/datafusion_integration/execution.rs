@@ -46,7 +46,7 @@ use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, Pla
 use futures::Stream;
 use tracing::debug;
 
-use crate::kubernetes::discovery::ResourceInfo;
+use crate::kubernetes::discovery::{ColumnDef, ResourceInfo};
 use crate::kubernetes::{ApiFilters, K8sClientPool};
 
 use super::convert::json_to_record_batch;
@@ -96,10 +96,13 @@ pub struct K8sExecutionPlan {
     fetch_limit: Option<usize>,
     /// Execution metrics for EXPLAIN ANALYZE
     metrics: ExecutionPlanMetricsSet,
+    /// Cached column definitions (avoids regenerating for every batch)
+    columns: Arc<Vec<ColumnDef>>,
 }
 
 impl K8sExecutionPlan {
     /// Create a new K8sExecutionPlan
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         table_name: String,
         resource_info: ResourceInfo,
@@ -108,6 +111,7 @@ impl K8sExecutionPlan {
         pool: Arc<K8sClientPool>,
         schema: SchemaRef,
         fetch_limit: Option<usize>,
+        columns: Arc<Vec<ColumnDef>>,
     ) -> Self {
         // Compute plan properties
         let partitioning = Partitioning::UnknownPartitioning(targets.len().max(1));
@@ -129,6 +133,7 @@ impl K8sExecutionPlan {
             plan_properties,
             fetch_limit,
             metrics: ExecutionPlanMetricsSet::new(),
+            columns,
         }
     }
 
@@ -147,6 +152,7 @@ impl K8sExecutionPlan {
             plan_properties: self.plan_properties.clone(),
             fetch_limit: fetch,
             metrics: self.metrics.clone(),
+            columns: self.columns.clone(),
         }
     }
 }
@@ -264,6 +270,7 @@ impl ExecutionPlan for K8sExecutionPlan {
         let pool = self.pool.clone();
         let schema = self.schema.clone();
         let fetch_limit = self.fetch_limit;
+        let columns = self.columns.clone();
 
         // Set up metrics for this partition
         let rows_fetched = MetricBuilder::new(&self.metrics).counter("rows_fetched", partition);
@@ -288,6 +295,7 @@ impl ExecutionPlan for K8sExecutionPlan {
             api_filters,
             schema.clone(),
             fetch_limit,
+            columns,
             rows_fetched,
             pages_fetched,
             fetch_time,
@@ -303,10 +311,11 @@ fn create_streaming_execution(
     pool: Arc<K8sClientPool>,
     table_name: String,
     target: QueryTarget,
-    resource_info: ResourceInfo,
+    _resource_info: ResourceInfo,
     api_filters: ApiFilters,
     schema: SchemaRef,
     fetch_limit: Option<usize>,
+    columns: Arc<Vec<ColumnDef>>,
     rows_fetched: datafusion::physical_plan::metrics::Count,
     pages_fetched: datafusion::physical_plan::metrics::Count,
     fetch_time: datafusion::physical_plan::metrics::Time,
@@ -347,7 +356,7 @@ fn create_streaming_execution(
 
                     // Convert page to RecordBatch and yield
                     if !items.is_empty() {
-                        let batch = json_to_record_batch(&target.cluster, &resource_info, items)?;
+                        let batch = json_to_record_batch(&target.cluster, &columns, items)?;
                         yield batch;
                     }
                 }

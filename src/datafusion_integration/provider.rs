@@ -18,7 +18,7 @@ use tracing::{debug, info};
 
 use crate::kubernetes::ApiFilters;
 use crate::kubernetes::K8sClientPool;
-use crate::kubernetes::discovery::{ResourceInfo, generate_schema};
+use crate::kubernetes::discovery::{ColumnDef, ResourceInfo, generate_schema};
 
 use super::convert::to_arrow_schema;
 use super::execution::{K8sExecutionPlan, QueryTarget};
@@ -98,6 +98,8 @@ pub struct K8sTableProvider {
     pool: Arc<K8sClientPool>,
     /// Arrow schema for this table
     schema: SchemaRef,
+    /// Cached column definitions (avoids regenerating for every batch)
+    columns: Arc<Vec<ColumnDef>>,
 }
 
 impl K8sTableProvider {
@@ -109,6 +111,7 @@ impl K8sTableProvider {
             resource_info,
             pool,
             schema,
+            columns: Arc::new(columns),
         }
     }
 
@@ -666,6 +669,7 @@ impl TableProvider for K8sTableProvider {
             self.pool.clone(),
             self.schema.clone(),
             limit,
+            self.columns.clone(),
         );
 
         // Handle projection if specified
@@ -1384,7 +1388,7 @@ mod tests {
 
         let progress = create_progress_handle();
         let pool = Arc::new(K8sClientPool::new_for_test(progress));
-        let provider = K8sTableProvider::new(resource_info, pool);
+        let _provider = K8sTableProvider::new(resource_info, pool);
 
         // Simulate what would happen with json_get_str(status, 'replicas') = '3'
         // We can't easily construct ScalarFunction expressions, but we can verify
