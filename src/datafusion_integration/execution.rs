@@ -7,26 +7,29 @@
 //! allowing DataFusion to control parallelism and enabling streaming execution.
 //! Results are streamed as pages arrive from the K8s API for optimal memory usage.
 //!
-//! # LIMIT Behavior with Multiple Partitions
+//! # LIMIT Pushdown Behavior
 //!
-//! When querying multiple clusters/namespaces (multiple partitions) with a LIMIT:
+//! LIMIT pushdown to the Kubernetes API is only enabled for single-partition queries
+//! (single cluster/namespace). This ensures correctness when combined with ORDER BY.
 //!
-//! - Each partition independently applies the limit as an optimization hint
-//! - For `SELECT * FROM pods WHERE _cluster = '*' LIMIT 10` across 3 clusters:
-//!   - Partition 0 (cluster1): fetches up to 10 rows
-//!   - Partition 1 (cluster2): fetches up to 10 rows
-//!   - Partition 2 (cluster3): fetches up to 10 rows
-//!   - K8sExec returns up to 30 rows total
-//!   - DataFusion's LimitExec (above K8sExec) then takes the first 10
+//! ## Single Partition (Optimized)
+//! - `SELECT * FROM pods WHERE namespace = 'default' LIMIT 10`
+//! - LIMIT is pushed to K8s API (fetches only 10 items)
+//! - 50x reduction in network transfer for small limits
 //!
-//! This is the expected behavior for partitioned scans with limit pushdown.
-//! We cannot know which partition will provide the "first" N rows until
-//! execution, so each partition optimistically fetches up to N rows.
-//! The final LIMIT is always correctly enforced by DataFusion's LimitExec.
+//! ## Multiple Partitions (Correctness-First)
+//! - `SELECT * FROM pods WHERE _cluster = '*' LIMIT 10` (3 clusters)
+//! - LIMIT is NOT pushed to K8s API
+//! - All rows fetched from all clusters
+//! - DataFusion's LimitExec enforces the final LIMIT correctly
 //!
-//! The benefit: instead of fetching ALL rows from all partitions, we fetch
-//! at most `limit * num_partitions` rows, which is still a significant
-//! reduction for large result sets.
+//! **Why?** Pushing LIMIT to each partition breaks ORDER BY semantics:
+//! - `SELECT * FROM pods ORDER BY created DESC LIMIT 10` across 3 clusters
+//! - If we fetch 10 per cluster, the correct top 10 might all be in one cluster
+//! - We'd miss rows that should be in the result
+//!
+//! Priority #1 is correctness. Single-partition queries get the optimization,
+//! multi-partition queries maintain correct semantics.
 
 use std::any::Any;
 use std::fmt;
@@ -228,7 +231,18 @@ impl ExecutionPlan for K8sExecutionPlan {
     }
 
     fn with_fetch(&self, fetch: Option<usize>) -> Option<Arc<dyn ExecutionPlan>> {
-        Some(Arc::new(self.with_new_fetch(fetch)))
+        // Only push LIMIT to K8s API for single-partition queries.
+        // For multi-partition queries (multiple clusters/namespaces), pushing LIMIT
+        // to each partition breaks ORDER BY semantics - we'd fetch N rows per partition
+        // but the correct top N might all be in one partition.
+        // DataFusion's LimitExec above us will handle the final limit correctly.
+        if self.targets.len() > 1 {
+            // Multi-partition: don't push limit, let DataFusion handle it
+            None
+        } else {
+            // Single partition: safe to push limit to K8s API
+            Some(Arc::new(self.with_new_fetch(fetch)))
+        }
     }
 
     fn fetch(&self) -> Option<usize> {

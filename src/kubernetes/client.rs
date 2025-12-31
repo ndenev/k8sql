@@ -885,6 +885,9 @@ impl K8sClientPool {
                 // If we have a limit, only request what we need (up to PAGE_SIZE)
                 let page_limit = if let Some(max_limit) = limit {
                     let remaining = max_limit.saturating_sub(total_fetched);
+                    if remaining == 0 {
+                        break; // We've fetched enough, stop pagination
+                    }
                     PAGE_SIZE.min(remaining as u32)
                 } else {
                     PAGE_SIZE
