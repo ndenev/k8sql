@@ -1606,28 +1606,4 @@ mod tests {
         let extracted = provider.extract_field_selectors(&[or_filter]);
         assert!(extracted.is_none());
     }
-
-    #[test]
-    fn test_label_selector_in_not_in_documentation() {
-        // Documentation test: Demonstrates supported queries and K8s API format
-        // Reference: https://kubernetes.io/docs/concepts/overview/working-with-objects/labels/#set-based-requirement
-        //
-        // Supported SQL queries:
-        // 1. SELECT * FROM pods WHERE labels->>'env' IN ('prod', 'staging')
-        //    -> K8s API: labelSelector=env in (prod,staging)
-        //
-        // 2. SELECT * FROM pods WHERE labels->>'tier' NOT IN ('debug', 'test')
-        //    -> K8s API: labelSelector=tier notin (debug,test)
-        //
-        // 3. Combined: SELECT * FROM pods WHERE labels->>'app' = 'nginx' AND labels->>'env' IN ('prod', 'staging')
-        //    -> K8s API: labelSelector=app=nginx,env in (prod,staging)
-        //
-        // Edge cases (NOT pushed down):
-        // - Empty list: labels->>'env' IN ()
-        // - Non-literal values: labels->>'env' IN ('prod', some_column)
-        // - Mixed types: labels->>'env' IN (1, 'string')
-
-        // This test primarily serves as documentation
-        // Full integration testing requires a real K8s cluster
-    }
 }

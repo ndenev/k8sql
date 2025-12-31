@@ -76,4 +76,44 @@ assert_success "Namespace IN across all clusters" "k3d-k8sql-test-1" \
 assert_success "Namespace IN with COUNT" "k3d-k8sql-test-1" \
     "SELECT namespace, COUNT(*) as cnt FROM pods WHERE namespace IN ('default', 'kube-system') GROUP BY namespace"
 
+# Label Selector IN/NOT IN Tests
+echo ""
+echo "=== Label Selector IN/NOT IN Tests ==="
+
+# Basic label IN query - pods with app label in ('nginx', 'test-app')
+assert_success "Label IN basic query" "k3d-k8sql-test-1" \
+    "SELECT name, namespace FROM pods WHERE labels->>'app' IN ('nginx', 'test-app')"
+
+# Label IN should return nginx pods
+assert_contains "Label IN returns nginx pods" "k3d-k8sql-test-1" \
+    "SELECT name FROM pods WHERE labels->>'app' IN ('nginx', 'test-app') AND namespace = 'default'" "nginx"
+
+# Label IN combined with namespace filter
+assert_success "Label IN with namespace filter" "k3d-k8sql-test-1" \
+    "SELECT name FROM pods WHERE namespace = 'default' AND labels->>'app' IN ('nginx', 'test-app')"
+
+# Label IN combined with multiple labels
+assert_success "Label IN combined with label equality" "k3d-k8sql-test-1" \
+    "SELECT name FROM deployments WHERE labels->>'app' IN ('nginx', 'test-app') AND labels->>'env' = 'test'"
+
+# Label NOT IN query - pods without specific app labels
+assert_success "Label NOT IN basic query" "k3d-k8sql-test-1" \
+    "SELECT name, namespace FROM pods WHERE labels->>'tier' NOT IN ('frontend', 'backend') LIMIT 10"
+
+# Empty IN list should be handled (no pushdown, client-side filter)
+assert_row_count "Label IN empty list returns nothing" "k3d-k8sql-test-1" \
+    "SELECT name FROM pods WHERE labels->>'app' IN ()" 0
+
+# Label IN across multiple namespaces
+assert_success "Label IN across namespaces" "k3d-k8sql-test-1" \
+    "SELECT name, namespace FROM pods WHERE namespace IN ('default', 'test-ns') AND labels->>'app' IN ('nginx', 'test-app')"
+
+# Label IN with deployments
+assert_min_row_count "Label IN on deployments" "k3d-k8sql-test-1" \
+    "SELECT name FROM deployments WHERE labels->>'app' IN ('nginx', 'test-app')" 1
+
+# Combined: namespace IN, label IN, and equality
+assert_success "Complex filter: namespace IN + label IN + label =" "k3d-k8sql-test-1" \
+    "SELECT name FROM pods WHERE namespace IN ('default', 'test-ns') AND labels->>'app' IN ('nginx', 'test-app') AND labels->>'env' = 'test'"
+
 print_summary
