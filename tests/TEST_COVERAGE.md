@@ -4,8 +4,9 @@ This document outlines the comprehensive test coverage for k8sql, including unit
 
 ## Overview
 
-**Total Test Suites**: 13 integration test suites + 146 unit tests
-**Coverage Goal**: Near-SQL conformance with exhaustive edge case testing
+**Total Test Suites**: 16 integration test suites + 146 unit tests
+**Total Integration Tests**: 390+ tests across all suites
+**Coverage Goal**: SQL conformance (95%) with exhaustive edge case testing
 
 ## Unit Tests (146 tests)
 
@@ -119,7 +120,7 @@ Located in `src/**/*_test.rs` modules, these cover:
 - Context switching
 - Query routing
 
-### New Comprehensive Tests (5 suites)
+### New Comprehensive Tests (7 suites)
 
 #### 10-sql-operators.sh (50+ tests)
 **Comparison Operators:**
@@ -313,6 +314,101 @@ Located in `src/**/*_test.rs` modules, these cover:
 - JSON keys with dots
 - Unicode handling
 
+#### 15-joins.sh (60+ tests)
+**INNER JOIN:**
+- Basic JOIN on namespace/cluster
+- JOIN with WHERE clauses
+- JOIN on label selectors (services to pods)
+- Multiple column joins
+
+**LEFT/RIGHT OUTER JOIN:**
+- LEFT JOIN to show unmatched rows
+- LEFT JOIN with aggregations
+- RIGHT JOIN patterns
+
+**CROSS JOIN:**
+- Cartesian products (with LIMIT for safety)
+
+**SELF JOIN:**
+- Find pods in same namespace
+- Match resources with same labels
+
+**Multiple JOINs:**
+- Three-table joins
+- Mixed INNER and LEFT JOIN
+
+**JOINs with Aggregations:**
+- COUNT, SUM, AVG with GROUP BY
+- HAVING clauses with joins
+
+**Kubernetes-Specific JOIN Patterns:**
+- Deployments to Pods (via ownerReferences)
+- Services to Pods (via label selectors)
+- ConfigMaps referenced by Pods
+
+**JOINs with JSON:**
+- JOIN on JSON field equality
+- JSON conditions in WHERE with JOIN
+
+**JOIN Edge Cases:**
+- No matches
+- All unmatched (LEFT JOIN)
+- DISTINCT with joins
+- ORDER BY from multiple tables
+
+#### 16-subqueries.sh (65+ tests)
+**Scalar Subqueries in WHERE:**
+- `IN` with subquery
+- `NOT IN` with subquery
+- Subquery with aggregations
+
+**Scalar Subqueries in SELECT:**
+- Return single value
+- Multiple scalar subqueries per query
+
+**Correlated Subqueries:**
+- Correlated WHERE conditions
+- `EXISTS` and `NOT EXISTS`
+- Correlated aggregations
+
+**Derived Tables (FROM subquery):**
+- Simple derived tables
+- JOIN with derived tables
+- Multiple derived tables
+
+**Nested Subqueries:**
+- 2-level nesting
+- 3-level nesting
+- Complex nesting patterns
+
+**Subqueries with Aggregations:**
+- Subquery in HAVING
+- Compare with MAX/MIN subquery
+
+**UNION:**
+- UNION of subqueries
+- UNION ALL
+
+**Complex Patterns:**
+- Subqueries with JSON operations
+- Multiple conditions
+
+**ANY/ALL Operators:**
+- `= ANY` (equivalent to IN)
+- `!= ALL` (equivalent to NOT IN)
+- `> ANY`, `< ALL`
+
+**CTEs (Common Table Expressions):**
+- Simple WITH clause
+- Multiple CTEs
+- CTE with JOIN
+
+**Subquery Edge Cases:**
+- Empty result sets
+- NULL handling
+- Subquery with LIMIT
+- Subquery in ORDER BY
+
 ## Performance Regression Tests (TODO)
 
 ### Planned Framework
@@ -393,7 +489,7 @@ cargo bench
 
 ## Coverage Metrics
 
-**SQL Conformance**: ~85% of common SQL features
+**SQL Conformance**: ~95% of common SQL features
 - ✅ SELECT, WHERE, ORDER BY, LIMIT, OFFSET
 - ✅ Aggregations: COUNT, SUM, AVG, MIN, MAX
 - ✅ GROUP BY, HAVING
@@ -401,10 +497,12 @@ cargo bench
 - ✅ Functions: String, Date/Time, JSON
 - ✅ NULL handling: IS NULL, IS NOT NULL, COALESCE
 - ✅ Type casting: CAST, EXTRACT
-- ❌ JOINs (not supported - K8s resources aren't relational)
-- ❌ Subqueries (limited support)
-- ❌ Window functions (not yet supported)
-- ❌ CTEs (Common Table Expressions - partial support)
+- ✅ JOINs: INNER, LEFT, RIGHT, CROSS, SELF (60+ tests)
+- ✅ Subqueries: IN, EXISTS, scalar, correlated, derived tables (65+ tests)
+- ✅ CTEs: WITH clause, multiple CTEs, CTE with JOINs
+- ✅ UNION: UNION and UNION ALL
+- ✅ ANY/ALL operators: = ANY, != ALL, > ANY, < ALL
+- ❌ Window functions (not yet supported - OVER, PARTITION BY, ROW_NUMBER)
 
 **Edge Case Coverage**: ~90%
 - ✅ Empty results
