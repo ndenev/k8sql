@@ -125,6 +125,7 @@ impl<'a> ColumnBuilder<'a> {
         // We sample first few rows to estimate average string length
         let sample_size = num_rows.min(10);
         let mut sample_total_len = 0usize;
+        let mut sample_non_null_count = 0usize;
         for i in 0..sample_size {
             if let Some(value) = extract_field_value(
                 &self.resources[i],
@@ -132,12 +133,14 @@ impl<'a> ColumnBuilder<'a> {
                 self.col.json_path.as_deref(),
             ) {
                 sample_total_len += value.len();
+                sample_non_null_count += 1;
             }
         }
-        let avg_len = if sample_size > 0 {
-            sample_total_len / sample_size
+        // Calculate average based on non-null values to avoid underestimation
+        let avg_len = if sample_non_null_count > 0 {
+            sample_total_len / sample_non_null_count
         } else {
-            32
+            32  // Fallback if all sampled values are null
         };
         let estimated_capacity = avg_len * num_rows;
 

@@ -1360,34 +1360,6 @@ mod tests {
         // Example: status.replicas = "3" (K8s API accepts string representation)
         // This tests that our current implementation (which uses string literals)
         // will work correctly with integer field selectors when we add them
-        use crate::kubernetes::discovery::ResourceInfo;
-        use crate::progress::create_progress_handle;
-
-        let api_resource = ApiResource::from_gvk_with_plural(
-            &kube::api::GroupVersionKind::gvk("apps", "v1", "ReplicaSet"),
-            "replicasets",
-        );
-
-        let capabilities = ApiCapabilities {
-            scope: Scope::Namespaced,
-            subresources: vec![],
-            operations: vec![],
-        };
-
-        let resource_info = ResourceInfo {
-            api_resource,
-            capabilities,
-            table_name: "replicasets".to_string(),
-            aliases: vec!["replicaset".to_string(), "rs".to_string()],
-            is_core: false,
-            group: "apps".to_string(),
-            version: "v1".to_string(),
-            custom_fields: None,
-        };
-
-        let progress = create_progress_handle();
-        let pool = Arc::new(K8sClientPool::new_for_test(progress));
-        let _provider = K8sTableProvider::new(resource_info, pool);
 
         // Simulate what would happen with json_get_str(status, 'replicas') = '3'
         // We can't easily construct ScalarFunction expressions, but we can verify
@@ -1414,34 +1386,6 @@ mod tests {
     fn test_field_selector_boolean_string_value() {
         // Test that field selectors work with boolean values as strings
         // Example: spec.unschedulable = "true" (K8s API accepts string representation)
-        use crate::kubernetes::discovery::ResourceInfo;
-        use crate::progress::create_progress_handle;
-
-        let api_resource = ApiResource::from_gvk_with_plural(
-            &kube::api::GroupVersionKind::gvk("", "v1", "Node"),
-            "nodes",
-        );
-
-        let capabilities = ApiCapabilities {
-            scope: Scope::Cluster,
-            subresources: vec![],
-            operations: vec![],
-        };
-
-        let resource_info = ResourceInfo {
-            api_resource,
-            capabilities,
-            table_name: "nodes".to_string(),
-            aliases: vec!["node".to_string(), "no".to_string()],
-            is_core: true,
-            group: "".to_string(),
-            version: "v1".to_string(),
-            custom_fields: None,
-        };
-
-        let progress = create_progress_handle();
-        let pool = Arc::new(K8sClientPool::new_for_test(progress));
-        let _provider = K8sTableProvider::new(resource_info, pool);
 
         // Verify the registry knows about spec.unschedulable for nodes
         use crate::kubernetes::FIELD_SELECTOR_REGISTRY;
