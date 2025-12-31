@@ -480,7 +480,7 @@ WHERE json_length(secrets) > 0
 ORDER BY secret_count DESC;
 ```
 
-Audit service account token usage.
+Audit service account token usage. Note: `secrets` is a JSON array field; `json_length()` returns the array length directly.
 
 ### 7. ClusterRoleBindings granting cluster-admin
 
@@ -560,6 +560,8 @@ ORDER BY (host_network_pods + privileged_pods) DESC;
 ```
 
 Fleet-wide security metric comparison.
+
+**Note**: The privileged container check uses `containers[0]` (first container only). For pods with multiple containers, use UNNEST to check all containers.
 
 ---
 
@@ -1063,7 +1065,7 @@ These filters require fetching data first, then filtering locally:
 
 Only certain fields support server-side filtering. Here's the complete list:
 
-**Pods** (supports 8 field selectors):
+**Pods** (supports 9 field selectors):
 - `metadata.name` (use `name` column)
 - `status->>'phase'`
 - `spec->>'nodeName'`
