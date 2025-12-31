@@ -413,13 +413,18 @@ Verify DaemonSet deployment status.
 ### 1. Pods without resource limits
 
 ```sql
-SELECT name, namespace,
-       json_get_str(UNNEST(json_get_array(spec, 'containers')), 'name') as container
-FROM pods
-WHERE json_get_json(UNNEST(json_get_array(spec, 'containers')), 'resources', 'limits') IS NULL;
+WITH expanded_containers AS (
+    SELECT name, namespace,
+           json_get_str(UNNEST(json_get_array(spec, 'containers')), 'name') as container,
+           json_get_json(UNNEST(json_get_array(spec, 'containers')), 'resources', 'limits') as limits
+    FROM pods
+)
+SELECT name, namespace, container
+FROM expanded_containers
+WHERE limits IS NULL;
 ```
 
-Find pods that could consume unlimited resources.
+Find pods that could consume unlimited resources. Uses CTE to unnest containers before filtering.
 
 ### 2. Containers running as root (UID 0)
 
@@ -437,14 +442,18 @@ Security risk: processes running with root privileges.
 ### 3. Privileged containers
 
 ```sql
-SELECT name, namespace,
-       json_get_str(UNNEST(json_get_array(spec, 'containers')), 'name') as container,
-       json_get_bool(UNNEST(json_get_array(spec, 'containers')), 'securityContext', 'privileged') as privileged
-FROM pods
-WHERE json_get_bool(UNNEST(json_get_array(spec, 'containers')), 'securityContext', 'privileged') = true;
+WITH expanded_containers AS (
+    SELECT name, namespace,
+           json_get_str(UNNEST(json_get_array(spec, 'containers')), 'name') as container,
+           json_get_bool(UNNEST(json_get_array(spec, 'containers')), 'securityContext', 'privileged') as privileged
+    FROM pods
+)
+SELECT name, namespace, container, privileged
+FROM expanded_containers
+WHERE privileged = true;
 ```
 
-Find containers with elevated privileges.
+Find containers with elevated privileges. Uses CTE to unnest containers before filtering.
 
 ### 4. Pods with host network access
 
@@ -498,14 +507,18 @@ Find subjects with cluster-admin privileges.
 ### 8. Pods with hostPath volumes
 
 ```sql
-SELECT name, namespace,
-       json_get_str(UNNEST(json_get_array(spec, 'volumes')), 'name') as volume_name,
-       json_get_str(UNNEST(json_get_array(spec, 'volumes')), 'hostPath', 'path') as host_path
-FROM pods
-WHERE json_get_str(UNNEST(json_get_array(spec, 'volumes')), 'hostPath', 'path') IS NOT NULL;
+WITH expanded_volumes AS (
+    SELECT name, namespace,
+           json_get_str(UNNEST(json_get_array(spec, 'volumes')), 'name') as volume_name,
+           json_get_str(UNNEST(json_get_array(spec, 'volumes')), 'hostPath', 'path') as host_path
+    FROM pods
+)
+SELECT name, namespace, volume_name, host_path
+FROM expanded_volumes
+WHERE host_path IS NOT NULL;
 ```
 
-Volumes mounting host filesystem (security risk).
+Volumes mounting host filesystem (security risk). Uses CTE to unnest volumes before filtering.
 
 ### 9. Ingresses without TLS
 
@@ -768,13 +781,17 @@ Node-specific troubleshooting.
 ### 5. Pods using a specific container image
 
 ```sql
-SELECT name, namespace,
-       json_get_str(UNNEST(json_get_array(spec, 'containers')), 'image') as image
-FROM pods
-WHERE json_get_str(UNNEST(json_get_array(spec, 'containers')), 'image') LIKE '%nginx:1.19%';
+WITH expanded_containers AS (
+    SELECT name, namespace,
+           json_get_str(UNNEST(json_get_array(spec, 'containers')), 'image') as image
+    FROM pods
+)
+SELECT name, namespace, image
+FROM expanded_containers
+WHERE image LIKE '%nginx:1.19%';
 ```
 
-Find pods affected by a specific image version.
+Find pods affected by a specific image version. Uses CTE to unnest containers before filtering.
 
 ### 6. Failed jobs in the last 7 days
 
@@ -872,6 +889,37 @@ Resource pressure detection.
 ## Advanced Queries & Techniques
 
 **Scenario**: You want to leverage k8sql's advanced SQL capabilities for complex analysis.
+
+### UNNEST Array Expansion - Important Limitations
+
+The `UNNEST()` function expands arrays into rows, but has a critical limitation in k8sql:
+
+**✅ WORKS: UNNEST in SELECT clause**
+```sql
+SELECT json_get_str(UNNEST(json_get_array(spec, 'containers')), 'image') as image
+FROM pods;
+```
+
+**❌ FAILS: UNNEST in WHERE clause**
+```sql
+-- This will error: "Unnest should be rewritten to LogicalPlan::Unnest"
+SELECT name FROM pods
+WHERE json_get_str(UNNEST(...), 'image') LIKE '%nginx%';  -- ERROR!
+```
+
+**✅ WORKAROUND: Use CTE (Common Table Expression)**
+```sql
+-- Unnest first, filter after
+WITH expanded AS (
+    SELECT name, json_get_str(UNNEST(json_get_array(spec, 'containers')), 'image') as image
+    FROM pods
+)
+SELECT name, image FROM expanded WHERE image LIKE '%nginx%';
+```
+
+This limitation is a DataFusion constraint. All examples below follow the CTE pattern when filtering unnested data.
+
+---
 
 ### 1. List all container images using UNNEST
 
