@@ -20,13 +20,13 @@ assert_success "COUNT(*) matches row count" "k3d-k8sql-test-1" \
 assert_min_row_count "COUNT with namespace filter" "k3d-k8sql-test-1" \
     "SELECT COUNT(*) as count FROM pods WHERE namespace = 'kube-system'" 1
 
-# Verify COUNT(DISTINCT) is <= COUNT(*)
+# Verify COUNT(DISTINCT) is <= COUNT(*) - use HAVING instead of WHERE
 assert_success "COUNT(DISTINCT) <= COUNT(*)" "k3d-k8sql-test-1" \
     "SELECT 
         COUNT(*) as total,
         COUNT(DISTINCT namespace) as distinct_ns
      FROM pods
-     WHERE COUNT(DISTINCT namespace) <= COUNT(*)"
+     HAVING COUNT(DISTINCT namespace) <= COUNT(*)"
 
 # Cross-Cluster Aggregation Validation
 echo ""
@@ -73,7 +73,7 @@ assert_min_row_count "LEFT JOIN preserves left rows" "k3d-k8sql-test-1" \
      GROUP BY n.name" 1
 
 # Verify JOIN count makes sense (pods in namespace = join count for that namespace)
-assert_success "JOIN count validation" "k3d-k8sql-test-1" \
+assert_min_row_count "JOIN count validation" "k3d-k8sql-test-1" \
     "WITH pod_counts AS (
          SELECT namespace, COUNT(*) as direct_count
          FROM pods
@@ -90,7 +90,7 @@ assert_success "JOIN count validation" "k3d-k8sql-test-1" \
      SELECT pc.namespace, pc.direct_count, jc.join_count
      FROM pod_counts pc
      JOIN join_counts jc ON pc.namespace = jc.namespace
-     WHERE pc.direct_count = jc.join_count"
+     WHERE pc.direct_count = jc.join_count" 1
 
 # Subquery Filtering Validation
 echo ""
@@ -530,5 +530,209 @@ assert_success "Nested subquery validation" "k3d-k8sql-test-1" \
      ) counts
      WHERE pod_count > 0
      LIMIT 5"
+
+# Actual Value Verification (parse JSON, verify specific values)
+echo ""
+echo "--- Actual Value Verification (JSON Parsing) ---"
+
+# Verify COUNT returns numeric value
+RESULT=$(run_query "k3d-k8sql-test-1" "SELECT COUNT(*) as count FROM namespaces")
+COUNT=$(echo "$RESULT" | jq -r '.[0].count')
+if [[ "$COUNT" =~ ^[0-9]+$ ]] && [ "$COUNT" -gt 0 ]; then
+    echo -e "${GREEN}✓${NC} COUNT returns numeric value > 0 (got $COUNT)"
+    PASS=$((PASS + 1))
+else
+    echo -e "${RED}✗${NC} COUNT should return numeric > 0, got: $COUNT"
+    FAIL=$((FAIL + 1))
+fi
+
+# Verify default namespace exists
+RESULT=$(run_query "k3d-k8sql-test-1" "SELECT name FROM namespaces WHERE name = 'default'")
+NAME=$(echo "$RESULT" | jq -r '.[0].name' 2>/dev/null)
+if [ "$NAME" = "default" ]; then
+    echo -e "${GREEN}✓${NC} Default namespace exists with correct name"
+    PASS=$((PASS + 1))
+else
+    echo -e "${RED}✗${NC} Default namespace should exist, got: $NAME"
+    FAIL=$((FAIL + 1))
+fi
+
+# Verify _cluster column is populated correctly
+RESULT=$(run_query "k3d-k8sql-test-1" "SELECT DISTINCT _cluster FROM pods LIMIT 1")
+CLUSTER=$(echo "$RESULT" | jq -r '.[0]._cluster' 2>/dev/null)
+if [ "$CLUSTER" = "k3d-k8sql-test-1" ]; then
+    echo -e "${GREEN}✓${NC} _cluster column has correct value: $CLUSTER"
+    PASS=$((PASS + 1))
+else
+    echo -e "${RED}✗${NC} _cluster should be 'k3d-k8sql-test-1', got: $CLUSTER"
+    FAIL=$((FAIL + 1))
+fi
+
+# Verify MIN <= MAX invariant with actual values
+RESULT=$(run_query "k3d-k8sql-test-1" "SELECT MIN(generation) as min_gen, MAX(generation) as max_gen FROM pods WHERE generation IS NOT NULL")
+MIN_GEN=$(echo "$RESULT" | jq -r '.[0].min_gen' 2>/dev/null)
+MAX_GEN=$(echo "$RESULT" | jq -r '.[0].max_gen' 2>/dev/null)
+if [ "$MIN_GEN" != "null" ] && [ "$MAX_GEN" != "null" ] && [ "$MIN_GEN" -le "$MAX_GEN" ]; then
+    echo -e "${GREEN}✓${NC} MIN(generation)=$MIN_GEN <= MAX(generation)=$MAX_GEN"
+    PASS=$((PASS + 1))
+else
+    echo -e "${RED}✗${NC} MIN <= MAX violated: min=$MIN_GEN, max=$MAX_GEN"
+    FAIL=$((FAIL + 1))
+fi
+
+# Verify COUNT(DISTINCT) <= COUNT(*) with actual values
+RESULT=$(run_query "k3d-k8sql-test-1" "SELECT COUNT(*) as total, COUNT(DISTINCT namespace) as distinct_ns FROM pods")
+TOTAL=$(echo "$RESULT" | jq -r '.[0].total' 2>/dev/null)
+DISTINCT=$(echo "$RESULT" | jq -r '.[0].distinct_ns' 2>/dev/null)
+if [ "$DISTINCT" -le "$TOTAL" ]; then
+    echo -e "${GREEN}✓${NC} COUNT(DISTINCT)=$DISTINCT <= COUNT(*)=$TOTAL"
+    PASS=$((PASS + 1))
+else
+    echo -e "${RED}✗${NC} COUNT(DISTINCT) > COUNT(*): $DISTINCT > $TOTAL"
+    FAIL=$((FAIL + 1))
+fi
+
+# Verify ORDER BY ASC produces ascending order
+RESULT=$(run_query "k3d-k8sql-test-1" "SELECT name FROM namespaces ORDER BY name ASC LIMIT 3")
+NAMES=($(echo "$RESULT" | jq -r '.[].name'))
+if [ "${#NAMES[@]}" -ge 2 ]; then
+    SORTED=true
+    for ((i=0; i<${#NAMES[@]}-1; i++)); do
+        if [[ "${NAMES[$i]}" > "${NAMES[$((i+1))]}" ]]; then
+            SORTED=false
+            break
+        fi
+    done
+    if [ "$SORTED" = true ]; then
+        echo -e "${GREEN}✓${NC} ORDER BY ASC produces ascending order: ${NAMES[*]}"
+        PASS=$((PASS + 1))
+    else
+        echo -e "${RED}✗${NC} ORDER BY ASC not ascending: ${NAMES[*]}"
+        FAIL=$((FAIL + 1))
+    fi
+else
+    echo -e "${GREEN}✓${NC} ORDER BY ASC (too few rows to verify order)"
+    PASS=$((PASS + 1))
+fi
+
+# Verify LIMIT actually limits
+RESULT=$(run_query "k3d-k8sql-test-1" "SELECT name FROM namespaces LIMIT 2")
+ROW_COUNT=$(echo "$RESULT" | jq 'length')
+if [ "$ROW_COUNT" -eq 2 ]; then
+    echo -e "${GREEN}✓${NC} LIMIT 2 returns exactly 2 rows"
+    PASS=$((PASS + 1))
+else
+    echo -e "${RED}✗${NC} LIMIT 2 should return 2 rows, got: $ROW_COUNT"
+    FAIL=$((FAIL + 1))
+fi
+
+# Verify GROUP BY produces correct groups
+RESULT=$(run_query "k3d-k8sql-test-1" "SELECT namespace, COUNT(*) as count FROM pods WHERE namespace = 'kube-system' GROUP BY namespace")
+ROW_COUNT=$(echo "$RESULT" | jq 'length')
+NAMESPACE=$(echo "$RESULT" | jq -r '.[0].namespace' 2>/dev/null)
+if [ "$ROW_COUNT" -eq 1 ] && [ "$NAMESPACE" = "kube-system" ]; then
+    echo -e "${GREEN}✓${NC} GROUP BY creates correct groups (1 group for kube-system)"
+    PASS=$((PASS + 1))
+else
+    echo -e "${RED}✗${NC} GROUP BY should create 1 group for kube-system, got $ROW_COUNT rows"
+    FAIL=$((FAIL + 1))
+fi
+
+# Verify DISTINCT removes duplicates
+RESULT=$(run_query "k3d-k8sql-test-1" "SELECT DISTINCT namespace FROM pods")
+DISTINCT_COUNT=$(echo "$RESULT" | jq 'length')
+RESULT_ALL=$(run_query "k3d-k8sql-test-1" "SELECT namespace FROM pods")
+TOTAL_COUNT=$(echo "$RESULT_ALL" | jq 'length')
+if [ "$DISTINCT_COUNT" -le "$TOTAL_COUNT" ]; then
+    echo -e "${GREEN}✓${NC} DISTINCT count ($DISTINCT_COUNT) <= total count ($TOTAL_COUNT)"
+    PASS=$((PASS + 1))
+else
+    echo -e "${RED}✗${NC} DISTINCT count should be <= total: $DISTINCT_COUNT > $TOTAL_COUNT"
+    FAIL=$((FAIL + 1))
+fi
+
+# Verify JSON ->> returns correct type (string)
+RESULT=$(run_query "k3d-k8sql-test-1" "SELECT labels->>'app' as app FROM pods WHERE labels->>'app' IS NOT NULL LIMIT 1")
+APP=$(echo "$RESULT" | jq -r '.[0].app' 2>/dev/null)
+if [ -n "$APP" ] && [ "$APP" != "null" ]; then
+    echo -e "${GREEN}✓${NC} JSON ->> returns string value: '$APP'"
+    PASS=$((PASS + 1))
+else
+    echo -e "${RED}✗${NC} JSON ->> should return string, got: $APP"
+    FAIL=$((FAIL + 1))
+fi
+
+# Verify timestamp comparison returns correct results
+RESULT=$(run_query "k3d-k8sql-test-1" "SELECT COUNT(*) as count FROM pods WHERE created > TIMESTAMP '2020-01-01'")
+COUNT=$(echo "$RESULT" | jq -r '.[0].count')
+if [ "$COUNT" -gt 0 ]; then
+    echo -e "${GREEN}✓${NC} Timestamp comparison works (pods created after 2020: $COUNT)"
+    PASS=$((PASS + 1))
+else
+    echo -e "${RED}✗${NC} Should have pods created after 2020-01-01"
+    FAIL=$((FAIL + 1))
+fi
+
+# Verify INNER JOIN produces matching rows only
+RESULT=$(run_query "k3d-k8sql-test-1" "SELECT p.name as pod, p.namespace, n.name as ns_name FROM pods p INNER JOIN namespaces n ON p.namespace = n.name LIMIT 5")
+if [ "$(echo "$RESULT" | jq 'length')" -gt 0 ]; then
+    # Check that namespace column matches ns_name column
+    MATCH=true
+    for row in $(echo "$RESULT" | jq -c '.[]'); do
+        NAMESPACE=$(echo "$row" | jq -r '.namespace')
+        NS_NAME=$(echo "$row" | jq -r '.ns_name')
+        if [ "$NAMESPACE" != "$NS_NAME" ]; then
+            MATCH=false
+            break
+        fi
+    done
+    if [ "$MATCH" = true ]; then
+        echo -e "${GREEN}✓${NC} INNER JOIN matches correctly (namespace = ns_name in all rows)"
+        PASS=$((PASS + 1))
+    else
+        echo -e "${RED}✗${NC} INNER JOIN produced non-matching rows"
+        FAIL=$((FAIL + 1))
+    fi
+else
+    echo -e "${GREEN}✓${NC} INNER JOIN works (no rows to verify)"
+    PASS=$((PASS + 1))
+fi
+
+# Verify window function produces sequential row numbers
+RESULT=$(run_query "k3d-k8sql-test-1" "SELECT name, ROW_NUMBER() OVER (ORDER BY name) as row_num FROM namespaces LIMIT 5")
+if [ "$(echo "$RESULT" | jq 'length')" -gt 0 ]; then
+    SEQUENTIAL=true
+    EXPECTED=1
+    for row_num in $(echo "$RESULT" | jq -r '.[].row_num'); do
+        if [ "$row_num" -ne "$EXPECTED" ]; then
+            SEQUENTIAL=false
+            break
+        fi
+        EXPECTED=$((EXPECTED + 1))
+    done
+    if [ "$SEQUENTIAL" = true ]; then
+        echo -e "${GREEN}✓${NC} ROW_NUMBER() produces sequential values (1, 2, 3, ...)"
+        PASS=$((PASS + 1))
+    else
+        echo -e "${RED}✗${NC} ROW_NUMBER() not sequential"
+        FAIL=$((FAIL + 1))
+    fi
+else
+    echo -e "${GREEN}✓${NC} ROW_NUMBER() works (no rows to verify)"
+    PASS=$((PASS + 1))
+fi
+
+# Verify cross-cluster aggregation correctness
+RESULT_C1=$(run_query "k3d-k8sql-test-1" "SELECT COUNT(*) as count FROM pods WHERE _cluster = 'k3d-k8sql-test-1'")
+COUNT_C1=$(echo "$RESULT_C1" | jq -r '.[0].count')
+RESULT_ALL=$(run_query "k3d-k8sql-test-1" "SELECT COUNT(*) as count FROM pods WHERE _cluster = '*'")
+COUNT_ALL=$(echo "$RESULT_ALL" | jq -r '.[0].count')
+if [ "$COUNT_ALL" -ge "$COUNT_C1" ]; then
+    echo -e "${GREEN}✓${NC} Cross-cluster count ($COUNT_ALL) >= single cluster ($COUNT_C1)"
+    PASS=$((PASS + 1))
+else
+    echo -e "${RED}✗${NC} Cross-cluster count should be >= single cluster: $COUNT_ALL < $COUNT_C1"
+    FAIL=$((FAIL + 1))
+fi
 
 print_summary
