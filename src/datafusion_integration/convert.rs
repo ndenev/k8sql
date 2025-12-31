@@ -140,7 +140,7 @@ impl<'a> ColumnBuilder<'a> {
         let avg_len = if sample_non_null_count > 0 {
             sample_total_len / sample_non_null_count
         } else {
-            32  // Fallback if all sampled values are null
+            32 // Fallback if all sampled values are null
         };
         let estimated_capacity = avg_len * num_rows;
 
