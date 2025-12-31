@@ -200,6 +200,179 @@ impl K8sTableProvider {
         }
         None
     }
+
+    /// Extract field selectors from DataFusion expressions
+    /// Looks for patterns like `status->>'phase' = 'Running'` or `name = 'pod-123'`
+    /// Returns a K8s field selector string like "status.phase=Running,metadata.name=pod-123"
+    fn extract_field_selectors(&self, filters: &[Expr]) -> Option<String> {
+        use crate::kubernetes::FIELD_SELECTOR_REGISTRY;
+
+        let mut selectors = Vec::new();
+
+        for filter in filters {
+            self.collect_field_selectors(filter, &FIELD_SELECTOR_REGISTRY, &mut selectors);
+        }
+
+        if selectors.is_empty() {
+            None
+        } else {
+            // Deduplicate selectors to avoid redundant API parameters
+            // Sort first to group identical selectors together
+            selectors.sort_by(|a, b| {
+                a.path
+                    .cmp(&b.path)
+                    .then(a.operator.cmp(&b.operator))
+                    .then(a.value.cmp(&b.value))
+            });
+            selectors.dedup();
+
+            // Join multiple selectors with commas
+            Some(
+                selectors
+                    .iter()
+                    .map(|s| s.to_k8s_string())
+                    .collect::<Vec<_>>()
+                    .join(","),
+            )
+        }
+    }
+
+    /// Recursively collect field selectors from an expression tree
+    fn collect_field_selectors(
+        &self,
+        expr: &Expr,
+        registry: &crate::kubernetes::FieldSelectorRegistry,
+        selectors: &mut Vec<crate::kubernetes::FieldSelector>,
+    ) {
+        use crate::kubernetes::FieldSelectorOperator;
+
+        match expr {
+            // Handle AND expressions - recurse into both sides
+            Expr::BinaryExpr(binary) if binary.op == Operator::And => {
+                self.collect_field_selectors(&binary.left, registry, selectors);
+                self.collect_field_selectors(&binary.right, registry, selectors);
+            }
+            // Handle equality: json_get_str(spec/status, 'key') = 'value' or name = 'value'
+            Expr::BinaryExpr(binary) if binary.op == Operator::Eq => {
+                if let Some(selector) =
+                    self.extract_field_selector(binary, FieldSelectorOperator::Equals, registry)
+                {
+                    selectors.push(selector);
+                }
+            }
+            // Handle inequality: json_get_str(spec/status, 'key') != 'value'
+            Expr::BinaryExpr(binary) if binary.op == Operator::NotEq => {
+                if let Some(selector) =
+                    self.extract_field_selector(binary, FieldSelectorOperator::NotEquals, registry)
+                {
+                    selectors.push(selector);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Extract a field selector from spec/status/metadata field patterns
+    /// Handles three patterns:
+    /// 1. json_get_str(spec/status, 'key') = 'value' -> spec.key=value
+    /// 2. json_as_text(spec/status, 'key') = 'value' -> spec.key=value (from ->> operator)
+    /// 3. name = 'pod-123' -> metadata.name=pod-123 (top-level column)
+    fn extract_field_selector(
+        &self,
+        binary: &datafusion::logical_expr::BinaryExpr,
+        operator: crate::kubernetes::FieldSelectorOperator,
+        registry: &crate::kubernetes::FieldSelectorRegistry,
+    ) -> Option<crate::kubernetes::FieldSelector> {
+        use crate::kubernetes::FieldSelector;
+        use datafusion::common::ScalarValue;
+
+        debug!(
+            left = ?binary.left,
+            right = ?binary.right,
+            "Analyzing binary expression for field selector"
+        );
+
+        // Pattern 1 & 2: json_get_str(spec/status, 'key') = 'value' or spec->>'key' = 'value'
+        // Note: ->> is internally represented as json_as_text by datafusion-functions-json
+        if let Expr::ScalarFunction(func) = binary.left.as_ref() {
+            let func_name = func.name();
+            debug!(
+                func_name = %func_name,
+                args_len = func.args.len(),
+                "Found ScalarFunction on left side"
+            );
+
+            if (func_name == "json_get_str" || func_name == "json_as_text")
+                && func.args.len() >= 2
+                && let Expr::Column(col) = &func.args[0]
+                && let Expr::Literal(key_lit, _) = &func.args[1]
+                && let ScalarValue::Utf8(Some(key)) = key_lit
+                && let Expr::Literal(val_lit, _) = binary.right.as_ref()
+                && let ScalarValue::Utf8(Some(value)) = val_lit
+            {
+                // Build field path: "spec.nodeName", "status.phase", etc.
+                let field_path = format!("{}.{}", col.name, key);
+
+                // Note: Values come from DataFusion's validated SQL literals, not raw user input.
+                // kube-rs handles URL encoding when building API requests.
+
+                // Check if this field selector is supported for this resource type
+                if registry.is_supported(&self.resource_info.table_name, &field_path) {
+                    debug!(
+                        field_path = %field_path,
+                        value = %value,
+                        "Extracted field selector via json accessor"
+                    );
+                    return Some(FieldSelector {
+                        path: field_path,
+                        operator,
+                        value: value.clone(),
+                    });
+                } else {
+                    debug!(
+                        field_path = %field_path,
+                        table = %self.resource_info.table_name,
+                        "Field selector not supported for this resource type"
+                    );
+                }
+            }
+        }
+
+        // Pattern 3: Top-level column = 'value' (e.g., name = 'pod-123' -> metadata.name=pod-123)
+        // Some resources also have top-level columns that map to field selectors
+        // (e.g., 'type' for secrets, 'reason' for events)
+        if let Expr::Column(col) = binary.left.as_ref()
+            && let Expr::Literal(val_lit, _) = binary.right.as_ref()
+            && let ScalarValue::Utf8(Some(value)) = val_lit
+        {
+            // Special case: 'name' column maps to 'metadata.name'
+            let field_path = if col.name == "name" {
+                "metadata.name".to_string()
+            } else {
+                col.name.clone()
+            };
+
+            // Note: Values come from DataFusion's validated SQL literals, not raw user input.
+            // kube-rs handles URL encoding when building API requests.
+
+            // Check if this field selector is supported for this resource type
+            if registry.is_supported(&self.resource_info.table_name, &field_path) {
+                debug!(
+                    column = %col.name,
+                    field_path = %field_path,
+                    value = %value,
+                    "Extracted field selector from top-level column"
+                );
+                return Some(FieldSelector {
+                    path: field_path,
+                    operator,
+                    value: value.clone(),
+                });
+            }
+        }
+
+        None
+    }
 }
 
 impl std::fmt::Debug for K8sTableProvider {
@@ -228,13 +401,18 @@ impl TableProvider for K8sTableProvider {
         &self,
         filters: &[&Expr],
     ) -> Result<Vec<TableProviderFilterPushDown>> {
+        use crate::kubernetes::FIELD_SELECTOR_REGISTRY;
+
         // We can push down these filters to the K8s API:
         // - namespace = 'x' -> Uses namespaced API
         // - namespace IN (...) -> Parallel queries to each namespace
         // - _cluster = 'x' -> Queries specific cluster
         // - _cluster IN (...) / NOT IN (...) -> Queries specific clusters
         // - labels->>'key' = 'value' -> K8s label selector
+        // - status->>'phase' = 'Running' -> K8s field selector (resource-specific)
+        // - name = 'pod-123' -> K8s field selector (metadata.name)
         // Other filters will be handled by DataFusion
+
         Ok(filters
             .iter()
             .map(|f| {
@@ -288,6 +466,53 @@ impl TableProvider for K8sTableProvider {
                             }
                             return TableProviderFilterPushDown::Exact;
                         }
+
+                        // NEW: Check for field selector patterns
+                        // Pattern 1 & 2: json_get_str(spec/status, 'key') = 'value' or spec->>'key' = 'value'
+                        if (func_name == "json_get_str" || func_name == "json_as_text")
+                            && func.args.len() >= 2
+                            && let Expr::Column(col) = &func.args[0]
+                            && let Expr::Literal(key_lit, _) = &func.args[1]
+                            && let datafusion::common::ScalarValue::Utf8(Some(key)) = key_lit
+                            && (binary.op == Operator::Eq || binary.op == Operator::NotEq)
+                            && matches!(binary.right.as_ref(), Expr::Literal(..))
+                        {
+                            // Build field path and check if supported
+                            let field_path = format!("{}.{}", col.name, key);
+                            if FIELD_SELECTOR_REGISTRY
+                                .is_supported(&self.resource_info.table_name, &field_path)
+                            {
+                                // != needs Inexact for same reasons as labels
+                                if binary.op == Operator::NotEq {
+                                    return TableProviderFilterPushDown::Inexact;
+                                }
+                                return TableProviderFilterPushDown::Exact;
+                            }
+                        }
+                    }
+
+                    // NEW: Check for top-level column field selectors
+                    // Pattern 3: name = 'pod-123' or type = 'Opaque' (for secrets/events)
+                    if let Expr::Column(col) = binary.left.as_ref()
+                        && (binary.op == Operator::Eq || binary.op == Operator::NotEq)
+                        && matches!(binary.right.as_ref(), Expr::Literal(..))
+                    {
+                        // Special case: 'name' column maps to 'metadata.name'
+                        let field_path = if col.name == "name" {
+                            "metadata.name"
+                        } else {
+                            &col.name
+                        };
+
+                        if FIELD_SELECTOR_REGISTRY
+                            .is_supported(&self.resource_info.table_name, field_path)
+                        {
+                            // != needs Inexact for same reasons as labels
+                            if binary.op == Operator::NotEq {
+                                return TableProviderFilterPushDown::Inexact;
+                            }
+                            return TableProviderFilterPushDown::Exact;
+                        }
                     }
                 }
                 // We don't push this filter to K8s API - DataFusion must apply it
@@ -315,6 +540,7 @@ impl TableProvider for K8sTableProvider {
         let namespace_filter = self.extract_namespace_filter(filters);
         let cluster_filter = self.extract_cluster_filter(filters);
         let label_selector = self.extract_label_selectors(filters);
+        let field_selector = self.extract_field_selectors(filters);
 
         // Log cluster and namespace filters for debugging
         debug!(
@@ -322,13 +548,14 @@ impl TableProvider for K8sTableProvider {
             cluster_filter = ?cluster_filter,
             namespace_filter = ?namespace_filter,
             labels = ?label_selector,
+            fields = ?field_selector,
             "Extracted filters for K8s API"
         );
 
-        // Build API filters with label selector
+        // Build API filters with label and field selectors
         let api_filters = ApiFilters {
             label_selector,
-            field_selector: None, // K8s field selectors have limited supported fields per resource
+            field_selector,
         };
 
         // Determine which cluster(s) to query based on filter
@@ -413,6 +640,7 @@ impl TableProvider for K8sTableProvider {
             targets = num_targets,
             namespace_filter = ?namespace_filter,
             labels = ?api_filters.label_selector,
+            fields = ?api_filters.field_selector,
             limit = ?limit,
             "Creating lazy K8s execution plan"
         );
@@ -574,9 +802,9 @@ mod tests {
     }
 
     #[test]
-    fn test_filter_pushdown_unsupported_name_comparison() {
+    fn test_filter_pushdown_name_field_selector() {
         let provider = create_test_provider();
-        // name = 'test' is not pushed to K8s API (not namespace/_cluster/labels)
+        // name = 'test' is now pushed as metadata.name field selector
         let filter = Expr::BinaryExpr(BinaryExpr {
             left: Box::new(Expr::Column(Column::new_unqualified("name"))),
             op: Operator::Eq,
@@ -589,10 +817,7 @@ mod tests {
         let result = provider.supports_filters_pushdown(&[&filter]).unwrap();
 
         assert_eq!(result.len(), 1);
-        assert!(matches!(
-            result[0],
-            TableProviderFilterPushDown::Unsupported
-        ));
+        assert!(matches!(result[0], TableProviderFilterPushDown::Exact));
     }
 
     #[test]
@@ -617,6 +842,482 @@ mod tests {
         ));
     }
 
+    // Note: JSON accessor field selector tests (status->>'phase', spec->>'nodeName')
+    // are tested via integration/manual testing since constructing ScalarFunction
+    // expressions manually is complex. The field selector extraction logic is covered
+    // by the registry tests and top-level column tests below.
+
+    #[test]
+    fn test_field_selector_top_level_secret_type() {
+        use crate::kubernetes::discovery::ResourceInfo;
+        use crate::progress::create_progress_handle;
+
+        // Create test provider for secrets (which support 'type' field selector)
+        let api_resource = ApiResource::from_gvk_with_plural(
+            &kube::api::GroupVersionKind::gvk("", "v1", "Secret"),
+            "secrets",
+        );
+
+        let capabilities = ApiCapabilities {
+            scope: Scope::Namespaced,
+            subresources: vec![],
+            operations: vec![],
+        };
+
+        let resource_info = ResourceInfo {
+            api_resource,
+            capabilities,
+            table_name: "secrets".to_string(),
+            aliases: vec!["secret".to_string()],
+            is_core: true,
+            group: "".to_string(),
+            version: "v1".to_string(),
+            custom_fields: None,
+        };
+
+        let progress = create_progress_handle();
+        let pool = Arc::new(K8sClientPool::new_for_test(progress));
+        let provider = K8sTableProvider::new(resource_info, pool);
+
+        // type = 'Opaque' (top-level column for secrets)
+        let filter = Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(Expr::Column(Column::new_unqualified("type"))),
+            op: Operator::Eq,
+            right: Box::new(Expr::Literal(
+                datafusion::common::ScalarValue::Utf8(Some("Opaque".to_string())),
+                None,
+            )),
+        });
+
+        let result = provider.supports_filters_pushdown(&[&filter]).unwrap();
+
+        assert_eq!(result.len(), 1);
+        assert!(matches!(result[0], TableProviderFilterPushDown::Exact));
+    }
+
+    #[test]
+    fn test_field_selector_static_registry_initialization() {
+        use crate::kubernetes::FIELD_SELECTOR_REGISTRY;
+
+        // Access registry multiple times to ensure it's initialized once
+        let first_access = FIELD_SELECTOR_REGISTRY.is_supported("pods", "status.phase");
+        let second_access = FIELD_SELECTOR_REGISTRY.is_supported("pods", "status.phase");
+
+        assert!(first_access);
+        assert!(second_access);
+
+        // Verify registry contains expected resources
+        assert!(FIELD_SELECTOR_REGISTRY.is_supported("pods", "metadata.name"));
+        assert!(FIELD_SELECTOR_REGISTRY.is_supported("secrets", "type"));
+        assert!(FIELD_SELECTOR_REGISTRY.is_supported("events", "reason"));
+    }
+
+    #[test]
+    fn test_field_selector_multiple_conditions_and() {
+        let provider = create_test_provider();
+
+        // Test AND with two field selectors: name = 'pod-1' AND status = 'Running'
+        // Note: We can't test status->>'phase' easily without ScalarFunction construction,
+        // but we can test top-level columns
+        let name_filter = Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(Expr::Column(Column::new_unqualified("name"))),
+            op: Operator::Eq,
+            right: Box::new(Expr::Literal(
+                datafusion::common::ScalarValue::Utf8(Some("pod-1".to_string())),
+                None,
+            )),
+        });
+
+        // Create a combined AND expression
+        let combined_filter = Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(name_filter.clone()),
+            op: Operator::And,
+            right: Box::new(Expr::Column(Column::new_unqualified("namespace"))),
+        });
+
+        let result = provider
+            .supports_filters_pushdown(&[&combined_filter])
+            .unwrap();
+
+        // The AND expression should be analyzed and both sides should be pushable
+        assert_eq!(result.len(), 1);
+    }
+
+    #[test]
+    fn test_field_selector_name_metadata_mapping() {
+        let provider = create_test_provider();
+
+        // Verify that 'name' column is correctly mapped to 'metadata.name'
+        let name_filter = Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(Expr::Column(Column::new_unqualified("name"))),
+            op: Operator::Eq,
+            right: Box::new(Expr::Literal(
+                datafusion::common::ScalarValue::Utf8(Some("my-pod".to_string())),
+                None,
+            )),
+        });
+
+        let result = provider.supports_filters_pushdown(&[&name_filter]).unwrap();
+
+        assert_eq!(result.len(), 1);
+        assert!(matches!(result[0], TableProviderFilterPushDown::Exact));
+    }
+
+    #[test]
+    fn test_field_selector_name_not_equals_inexact() {
+        let provider = create_test_provider();
+
+        // Test that name != 'x' uses Inexact pushdown for NULL semantics
+        let name_filter = Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(Expr::Column(Column::new_unqualified("name"))),
+            op: Operator::NotEq,
+            right: Box::new(Expr::Literal(
+                datafusion::common::ScalarValue::Utf8(Some("excluded-pod".to_string())),
+                None,
+            )),
+        });
+
+        let result = provider.supports_filters_pushdown(&[&name_filter]).unwrap();
+
+        assert_eq!(result.len(), 1);
+        assert!(matches!(result[0], TableProviderFilterPushDown::Inexact));
+    }
+
+    #[test]
+    fn test_field_selector_unsupported_operator_greater_than() {
+        let provider = create_test_provider();
+
+        // Field selectors don't support > operator
+        let filter = Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(Expr::Column(Column::new_unqualified("name"))),
+            op: Operator::Gt,
+            right: Box::new(Expr::Literal(
+                datafusion::common::ScalarValue::Utf8(Some("pod-a".to_string())),
+                None,
+            )),
+        });
+
+        let result = provider.supports_filters_pushdown(&[&filter]).unwrap();
+
+        assert_eq!(result.len(), 1);
+        assert!(matches!(
+            result[0],
+            TableProviderFilterPushDown::Unsupported
+        ));
+    }
+
+    #[test]
+    fn test_field_selector_unsupported_operator_like() {
+        let provider = create_test_provider();
+
+        // Field selectors don't support LIKE
+        let filter = Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(Expr::Column(Column::new_unqualified("name"))),
+            op: Operator::LikeMatch,
+            right: Box::new(Expr::Literal(
+                datafusion::common::ScalarValue::Utf8(Some("pod-%".to_string())),
+                None,
+            )),
+        });
+
+        let result = provider.supports_filters_pushdown(&[&filter]).unwrap();
+
+        assert_eq!(result.len(), 1);
+        assert!(matches!(
+            result[0],
+            TableProviderFilterPushDown::Unsupported
+        ));
+    }
+
+    #[test]
+    fn test_field_selector_no_state_leakage_across_queries() {
+        use crate::kubernetes::FIELD_SELECTOR_REGISTRY;
+
+        // Simulate multiple queries to ensure no state leakage
+        let provider1 = create_test_provider();
+        let provider2 = create_test_provider();
+
+        // First query
+        let filter1 = Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(Expr::Column(Column::new_unqualified("name"))),
+            op: Operator::Eq,
+            right: Box::new(Expr::Literal(
+                datafusion::common::ScalarValue::Utf8(Some("pod-1".to_string())),
+                None,
+            )),
+        });
+
+        let result1 = provider1.supports_filters_pushdown(&[&filter1]).unwrap();
+        assert!(matches!(result1[0], TableProviderFilterPushDown::Exact));
+
+        // Second query - registry should still work correctly
+        let filter2 = Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(Expr::Column(Column::new_unqualified("name"))),
+            op: Operator::Eq,
+            right: Box::new(Expr::Literal(
+                datafusion::common::ScalarValue::Utf8(Some("pod-2".to_string())),
+                None,
+            )),
+        });
+
+        let result2 = provider2.supports_filters_pushdown(&[&filter2]).unwrap();
+        assert!(matches!(result2[0], TableProviderFilterPushDown::Exact));
+
+        // Verify registry is still intact
+        assert!(FIELD_SELECTOR_REGISTRY.is_supported("pods", "status.phase"));
+        assert!(FIELD_SELECTOR_REGISTRY.is_supported("secrets", "type"));
+    }
+
+    #[test]
+    fn test_field_selector_extraction_format() {
+        let provider = create_test_provider();
+
+        // Create filters that should be extracted
+        let name_filter = Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(Expr::Column(Column::new_unqualified("name"))),
+            op: Operator::Eq,
+            right: Box::new(Expr::Literal(
+                datafusion::common::ScalarValue::Utf8(Some("my-pod".to_string())),
+                None,
+            )),
+        });
+
+        // Extract field selectors
+        let result = provider.extract_field_selectors(&[name_filter]);
+
+        // Should produce "metadata.name=my-pod"
+        assert!(result.is_some());
+        let field_selector_string = result.unwrap();
+        assert_eq!(field_selector_string, "metadata.name=my-pod");
+    }
+
+    #[test]
+    fn test_field_selector_resource_specific_secret_type() {
+        use crate::kubernetes::discovery::ResourceInfo;
+        use crate::progress::create_progress_handle;
+
+        // Create provider for secrets to test resource-specific field
+        let api_resource = ApiResource::from_gvk_with_plural(
+            &kube::api::GroupVersionKind::gvk("", "v1", "Secret"),
+            "secrets",
+        );
+
+        let capabilities = ApiCapabilities {
+            scope: Scope::Namespaced,
+            subresources: vec![],
+            operations: vec![],
+        };
+
+        let resource_info = ResourceInfo {
+            api_resource,
+            capabilities,
+            table_name: "secrets".to_string(),
+            aliases: vec!["secret".to_string()],
+            is_core: true,
+            group: "".to_string(),
+            version: "v1".to_string(),
+            custom_fields: None,
+        };
+
+        let progress = create_progress_handle();
+        let pool = Arc::new(K8sClientPool::new_for_test(progress));
+        let provider = K8sTableProvider::new(resource_info, pool);
+
+        // Test type field for secrets
+        let type_filter = Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(Expr::Column(Column::new_unqualified("type"))),
+            op: Operator::Eq,
+            right: Box::new(Expr::Literal(
+                datafusion::common::ScalarValue::Utf8(Some("Opaque".to_string())),
+                None,
+            )),
+        });
+
+        // Extract field selectors
+        let result = provider.extract_field_selectors(&[type_filter]);
+
+        // Should produce "type=Opaque"
+        assert!(result.is_some());
+        let field_selector_string = result.unwrap();
+        assert_eq!(field_selector_string, "type=Opaque");
+    }
+
+    #[test]
+    fn test_field_selector_scan_integration() {
+        use crate::kubernetes::ApiFilters;
+
+        let provider = create_test_provider();
+
+        // Create a filter that should extract field selector
+        let name_filter = Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(Expr::Column(Column::new_unqualified("name"))),
+            op: Operator::Eq,
+            right: Box::new(Expr::Literal(
+                datafusion::common::ScalarValue::Utf8(Some("test-pod".to_string())),
+                None,
+            )),
+        });
+
+        // Test extraction
+        let field_selector = provider.extract_field_selectors(&[name_filter]);
+
+        assert!(field_selector.is_some());
+        assert_eq!(field_selector.as_ref().unwrap(), "metadata.name=test-pod");
+
+        // Verify it can be used in ApiFilters
+        let api_filters = ApiFilters {
+            label_selector: None,
+            field_selector,
+        };
+
+        assert!(api_filters.field_selector.is_some());
+        assert_eq!(
+            api_filters.field_selector.unwrap(),
+            "metadata.name=test-pod"
+        );
+    }
+
+    #[test]
+    fn test_field_selector_multiple_combined() {
+        // For secrets, create a type filter
+        use crate::kubernetes::discovery::ResourceInfo;
+        use crate::progress::create_progress_handle;
+
+        let api_resource = ApiResource::from_gvk_with_plural(
+            &kube::api::GroupVersionKind::gvk("", "v1", "Secret"),
+            "secrets",
+        );
+
+        let capabilities = ApiCapabilities {
+            scope: Scope::Namespaced,
+            subresources: vec![],
+            operations: vec![],
+        };
+
+        let resource_info = ResourceInfo {
+            api_resource,
+            capabilities,
+            table_name: "secrets".to_string(),
+            aliases: vec!["secret".to_string()],
+            is_core: true,
+            group: "".to_string(),
+            version: "v1".to_string(),
+            custom_fields: None,
+        };
+
+        let progress = create_progress_handle();
+        let pool = Arc::new(K8sClientPool::new_for_test(progress));
+        let secret_provider = K8sTableProvider::new(resource_info, pool);
+
+        let name_filter_secret = Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(Expr::Column(Column::new_unqualified("name"))),
+            op: Operator::Eq,
+            right: Box::new(Expr::Literal(
+                datafusion::common::ScalarValue::Utf8(Some("my-secret".to_string())),
+                None,
+            )),
+        });
+
+        let type_filter = Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(Expr::Column(Column::new_unqualified("type"))),
+            op: Operator::Eq,
+            right: Box::new(Expr::Literal(
+                datafusion::common::ScalarValue::Utf8(Some("Opaque".to_string())),
+                None,
+            )),
+        });
+
+        // Extract both field selectors
+        let combined = secret_provider.extract_field_selectors(&[name_filter_secret, type_filter]);
+
+        assert!(combined.is_some());
+        let combined_str = combined.unwrap();
+
+        // Should contain both selectors, comma-separated
+        // Order may vary, so check both are present
+        assert!(combined_str.contains("metadata.name=my-secret"));
+        assert!(combined_str.contains("type=Opaque"));
+        assert!(combined_str.contains(","));
+    }
+
+    #[test]
+    fn test_field_selector_with_namespace_filter() {
+        let provider = create_test_provider();
+
+        // Combine namespace filter (uses scoped API) with field selector
+        let namespace_filter = Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(Expr::Column(Column::new_unqualified("namespace"))),
+            op: Operator::Eq,
+            right: Box::new(Expr::Literal(
+                datafusion::common::ScalarValue::Utf8(Some("default".to_string())),
+                None,
+            )),
+        });
+
+        let name_filter = Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(Expr::Column(Column::new_unqualified("name"))),
+            op: Operator::Eq,
+            right: Box::new(Expr::Literal(
+                datafusion::common::ScalarValue::Utf8(Some("my-pod".to_string())),
+                None,
+            )),
+        });
+
+        // Test pushdown - both should be Exact
+        let result = provider
+            .supports_filters_pushdown(&[&namespace_filter, &name_filter])
+            .unwrap();
+
+        assert_eq!(result.len(), 2);
+        assert!(matches!(result[0], TableProviderFilterPushDown::Exact));
+        assert!(matches!(result[1], TableProviderFilterPushDown::Exact));
+
+        // Test extraction - namespace handled separately, field selector extracted
+        let namespace_extracted = provider.extract_namespace_filter(&[namespace_filter]);
+        let field_selector = provider.extract_field_selectors(&[name_filter]);
+
+        // Namespace should be Single("default")
+        assert!(matches!(
+            namespace_extracted,
+            crate::datafusion_integration::provider::NamespaceFilter::Single(_)
+        ));
+
+        // Field selector should be metadata.name=my-pod
+        assert!(field_selector.is_some());
+        assert_eq!(field_selector.unwrap(), "metadata.name=my-pod");
+    }
+
+    #[test]
+    fn test_field_selector_deduplication() {
+        let provider = create_test_provider();
+
+        // Create duplicate filters: name = 'pod-1' AND name = 'pod-1'
+        let name_filter1 = Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(Expr::Column(Column::new_unqualified("name"))),
+            op: Operator::Eq,
+            right: Box::new(Expr::Literal(
+                datafusion::common::ScalarValue::Utf8(Some("pod-1".to_string())),
+                None,
+            )),
+        });
+
+        let name_filter2 = Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(Expr::Column(Column::new_unqualified("name"))),
+            op: Operator::Eq,
+            right: Box::new(Expr::Literal(
+                datafusion::common::ScalarValue::Utf8(Some("pod-1".to_string())),
+                None,
+            )),
+        });
+
+        // Extract should deduplicate
+        let field_selector = provider.extract_field_selectors(&[name_filter1, name_filter2]);
+
+        assert!(field_selector.is_some());
+        // Should only contain one instance, not "metadata.name=pod-1,metadata.name=pod-1"
+        assert_eq!(field_selector.unwrap(), "metadata.name=pod-1");
+    }
+
     #[test]
     fn test_filter_pushdown_mixed_filters() {
         let provider = create_test_provider();
@@ -631,7 +1332,7 @@ mod tests {
             )),
         });
 
-        // name = 'test' (not pushable)
+        // name = 'test' (now pushable as metadata.name field selector)
         let name_filter = Expr::BinaryExpr(BinaryExpr {
             left: Box::new(Expr::Column(Column::new_unqualified("name"))),
             op: Operator::Eq,
@@ -647,9 +1348,166 @@ mod tests {
 
         assert_eq!(result.len(), 2);
         assert!(matches!(result[0], TableProviderFilterPushDown::Exact));
+        assert!(matches!(result[1], TableProviderFilterPushDown::Exact));
+    }
+
+    #[test]
+    fn test_field_selector_integer_string_value() {
+        // Test that field selectors work with integer values as strings
+        // Example: status.replicas = "3" (K8s API accepts string representation)
+        // This tests that our current implementation (which uses string literals)
+        // will work correctly with integer field selectors when we add them
+        use crate::kubernetes::discovery::ResourceInfo;
+        use crate::progress::create_progress_handle;
+
+        let api_resource = ApiResource::from_gvk_with_plural(
+            &kube::api::GroupVersionKind::gvk("apps", "v1", "ReplicaSet"),
+            "replicasets",
+        );
+
+        let capabilities = ApiCapabilities {
+            scope: Scope::Namespaced,
+            subresources: vec![],
+            operations: vec![],
+        };
+
+        let resource_info = ResourceInfo {
+            api_resource,
+            capabilities,
+            table_name: "replicasets".to_string(),
+            aliases: vec!["replicaset".to_string(), "rs".to_string()],
+            is_core: false,
+            group: "apps".to_string(),
+            version: "v1".to_string(),
+            custom_fields: None,
+        };
+
+        let progress = create_progress_handle();
+        let pool = Arc::new(K8sClientPool::new_for_test(progress));
+        let provider = K8sTableProvider::new(resource_info, pool);
+
+        // Simulate what would happen with json_get_str(status, 'replicas') = '3'
+        // We can't easily construct ScalarFunction expressions, but we can verify
+        // the registry knows about status.replicas for replicasets
+        use crate::kubernetes::FIELD_SELECTOR_REGISTRY;
+
+        assert!(FIELD_SELECTOR_REGISTRY.is_supported("replicasets", "status.replicas"));
+
+        // Verify the field selector format would be correct with string value
+        use crate::kubernetes::{FieldSelector, FieldSelectorOperator};
+        let selector = FieldSelector {
+            path: "status.replicas".to_string(),
+            operator: FieldSelectorOperator::Equals,
+            value: "3".to_string(), // Integer as string
+        };
+
+        assert_eq!(selector.to_k8s_string(), "status.replicas=3");
+
+        // This confirms that when we extract status->>'replicas' = '3' in the future,
+        // it will work correctly with K8s API (which accepts "3" as a string)
+    }
+
+    #[test]
+    fn test_field_selector_boolean_string_value() {
+        // Test that field selectors work with boolean values as strings
+        // Example: spec.unschedulable = "true" (K8s API accepts string representation)
+        use crate::kubernetes::discovery::ResourceInfo;
+        use crate::progress::create_progress_handle;
+
+        let api_resource = ApiResource::from_gvk_with_plural(
+            &kube::api::GroupVersionKind::gvk("", "v1", "Node"),
+            "nodes",
+        );
+
+        let capabilities = ApiCapabilities {
+            scope: Scope::Cluster,
+            subresources: vec![],
+            operations: vec![],
+        };
+
+        let resource_info = ResourceInfo {
+            api_resource,
+            capabilities,
+            table_name: "nodes".to_string(),
+            aliases: vec!["node".to_string(), "no".to_string()],
+            is_core: true,
+            group: "".to_string(),
+            version: "v1".to_string(),
+            custom_fields: None,
+        };
+
+        let progress = create_progress_handle();
+        let pool = Arc::new(K8sClientPool::new_for_test(progress));
+        let _provider = K8sTableProvider::new(resource_info, pool);
+
+        // Verify the registry knows about spec.unschedulable for nodes
+        use crate::kubernetes::FIELD_SELECTOR_REGISTRY;
+
+        assert!(FIELD_SELECTOR_REGISTRY.is_supported("nodes", "spec.unschedulable"));
+
+        // Verify the field selector format works with boolean string values
+        use crate::kubernetes::{FieldSelector, FieldSelectorOperator};
+        let selector_true = FieldSelector {
+            path: "spec.unschedulable".to_string(),
+            operator: FieldSelectorOperator::Equals,
+            value: "true".to_string(), // Boolean as string
+        };
+
+        let selector_false = FieldSelector {
+            path: "spec.unschedulable".to_string(),
+            operator: FieldSelectorOperator::Equals,
+            value: "false".to_string(), // Boolean as string
+        };
+
+        assert_eq!(selector_true.to_k8s_string(), "spec.unschedulable=true");
+        assert_eq!(selector_false.to_k8s_string(), "spec.unschedulable=false");
+
+        // This confirms that when we extract spec->>'unschedulable' = 'true' in the future,
+        // it will work correctly with K8s API (which accepts "true"/"false" as strings)
+    }
+
+    #[test]
+    fn test_field_selector_or_expression_unsupported() {
+        // Test that OR expressions are unsupported for field selectors
+        // K8s field selectors only support AND (comma-separated), not OR
+        let provider = create_test_provider();
+
+        let name_filter1 = Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(Expr::Column(Column::new_unqualified("name"))),
+            op: Operator::Eq,
+            right: Box::new(Expr::Literal(
+                datafusion::common::ScalarValue::Utf8(Some("pod-1".to_string())),
+                None,
+            )),
+        });
+
+        let name_filter2 = Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(Expr::Column(Column::new_unqualified("name"))),
+            op: Operator::Eq,
+            right: Box::new(Expr::Literal(
+                datafusion::common::ScalarValue::Utf8(Some("pod-2".to_string())),
+                None,
+            )),
+        });
+
+        // Create OR expression: name = 'pod-1' OR name = 'pod-2'
+        let or_filter = Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(name_filter1),
+            op: Operator::Or,
+            right: Box::new(name_filter2),
+        });
+
+        // OR should be Unsupported (K8s doesn't support OR in field selectors)
+        let result = provider.supports_filters_pushdown(&[&or_filter]).unwrap();
+
+        assert_eq!(result.len(), 1);
         assert!(matches!(
-            result[1],
+            result[0],
             TableProviderFilterPushDown::Unsupported
         ));
+
+        // Verify extraction doesn't produce anything for OR
+        let extracted = provider.extract_field_selectors(&[or_filter]);
+        assert!(extracted.is_none());
     }
 }
