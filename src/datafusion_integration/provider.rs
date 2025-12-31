@@ -747,11 +747,18 @@ impl TableProvider for K8sTableProvider {
             .progress()
             .start_query(&self.resource_info.table_name, num_targets);
 
-        // Filter columns based on projection to avoid converting unrequested fields.
-        // This is a critical optimization: for queries like "SELECT name FROM pods",
-        // we skip parsing and converting the large spec/status JSON fields entirely.
-        let (projected_schema, projected_columns) = if let Some(proj) = projection {
-            // Build schema and columns for only the requested fields
+        // Projection pushdown optimization: filter columns before conversion.
+        // For queries like "SELECT name FROM pods", we skip parsing large JSON fields.
+        //
+        // Exception: COUNT(*) queries pass empty projection. We can't push those down
+        // because Arrow requires ≥1 column. Use ProjectionExec wrapper for those.
+        let should_pushdown_projection = projection
+            .as_ref()
+            .map(|proj| !proj.is_empty())
+            .unwrap_or(false);
+
+        let (exec_schema, exec_columns) = if should_pushdown_projection {
+            let proj = projection.unwrap(); // Safe: checked above
             let fields: Vec<_> = proj.iter().map(|&i| self.schema.field(i).clone()).collect();
             let columns: Vec<_> = proj.iter().map(|&i| self.columns[i].clone()).collect();
 
@@ -759,12 +766,12 @@ impl TableProvider for K8sTableProvider {
                 table = %self.resource_info.table_name,
                 total_columns = self.columns.len(),
                 projected_columns = columns.len(),
-                "Applying projection pushdown - converting only requested columns"
+                "Projection pushdown - converting only requested columns"
             );
 
             (Arc::new(Schema::new(fields)), Arc::new(columns))
         } else {
-            // No projection - use full schema and all columns
+            // No projection or empty projection - use full schema
             (self.schema.clone(), self.columns.clone())
         };
 
@@ -780,10 +787,30 @@ impl TableProvider for K8sTableProvider {
             query_targets,
             api_filters,
             self.pool.clone(),
-            projected_schema,
+            exec_schema,
             limit,
-            projected_columns,
+            exec_columns,
         );
+
+        // Handle empty projection (COUNT(*)) with ProjectionExec wrapper.
+        // We return all columns from K8sExec, and ProjectionExec handles the empty output.
+        if let Some(proj) = projection
+            && proj.is_empty()
+        {
+            use datafusion::physical_plan::projection::ProjectionExec;
+
+            debug!(
+                table = %self.resource_info.table_name,
+                "Empty projection (COUNT(*)) - using ProjectionExec wrapper"
+            );
+
+            let input_plan: Arc<dyn ExecutionPlan> = Arc::new(plan);
+            // Empty projection - no expressions needed
+            let empty_exprs: Vec<(Arc<dyn datafusion::physical_expr::PhysicalExpr>, String)> =
+                vec![];
+            let projection_plan = ProjectionExec::try_new(empty_exprs, input_plan)?;
+            return Ok(Arc::new(projection_plan));
+        }
 
         Ok(Arc::new(plan))
     }
