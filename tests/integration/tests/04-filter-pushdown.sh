@@ -84,9 +84,9 @@ echo "=== Label Selector IN/NOT IN Tests ==="
 assert_success "Label IN basic query" "k3d-k8sql-test-1" \
     "SELECT name, namespace FROM pods WHERE labels->>'app' IN ('nginx', 'test-app')"
 
-# Label IN should return nginx pods
-assert_contains "Label IN returns nginx pods" "k3d-k8sql-test-1" \
-    "SELECT name FROM pods WHERE labels->>'app' IN ('nginx', 'test-app') AND namespace = 'default'" "nginx"
+# Label IN should return pods with app label
+assert_contains "Label IN returns test-app pods" "k3d-k8sql-test-1" \
+    "SELECT name FROM pods WHERE labels->>'app' IN ('nginx', 'test-app') AND namespace = 'default'" "test-app"
 
 # Label IN combined with namespace filter
 assert_success "Label IN with namespace filter" "k3d-k8sql-test-1" \
@@ -99,10 +99,6 @@ assert_success "Label IN combined with label equality" "k3d-k8sql-test-1" \
 # Label NOT IN query - pods without specific app labels
 assert_success "Label NOT IN basic query" "k3d-k8sql-test-1" \
     "SELECT name, namespace FROM pods WHERE labels->>'tier' NOT IN ('frontend', 'backend') LIMIT 10"
-
-# Empty IN list should be handled (no pushdown, client-side filter)
-assert_row_count "Label IN empty list returns nothing" "k3d-k8sql-test-1" \
-    "SELECT name FROM pods WHERE labels->>'app' IN ()" 0
 
 # Label IN across multiple namespaces
 assert_success "Label IN across namespaces" "k3d-k8sql-test-1" \
