@@ -158,11 +158,16 @@ assert_success() {
     local context="$2"
     local query="$3"
 
-    if $K8SQL -c "$context" -q "$query" >/dev/null 2>&1; then
+    local error_output
+    error_output=$($K8SQL -c "$context" -q "$query" 2>&1 >/dev/null)
+    local exit_code=$?
+
+    if [[ $exit_code -eq 0 ]]; then
         echo -e "${GREEN}✓${NC} $desc"
         PASS=$((PASS + 1))
     else
         echo -e "${RED}✗${NC} $desc (query failed)"
+        echo "    Error: $error_output"
         FAIL=$((FAIL + 1))
     fi
 }
