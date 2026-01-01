@@ -27,6 +27,23 @@ use datafusion::sql::sqlparser::ast::Statement;
 use datafusion::sql::sqlparser::dialect::GenericDialect;
 use datafusion::sql::sqlparser::parser::Parser;
 use regex::Regex;
+use std::sync::LazyLock;
+
+/// Regex to match arrows followed by comparison operators (left side)
+static LEFT_ARROW_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r#"(?i)((?:\w+\.)?[\w\->']+)\s*(->>?)\s*'([^']+)'\s*(=|!=|<>|<=|>=|<|>|NOT\s+ILIKE|NOT\s+LIKE|ILIKE|LIKE|IS\s+NOT\s+NULL|IS\s+NULL|NOT\s+IN|IN)"#,
+    )
+    .unwrap()
+});
+
+/// Regex to match arrows preceded by comparison operators (right side)
+static RIGHT_ARROW_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r#"(?i)(=|!=|<>|<=|>=|<|>|NOT\s+ILIKE|NOT\s+LIKE|ILIKE|LIKE|IN)\s+((?:\w+\.)?[\w\->']+)\s*(->>?)\s*'([^']+)'"#,
+    )
+    .unwrap()
+});
 
 /// Fix JSON arrow operator precedence
 ///
@@ -43,16 +60,8 @@ fn fix_arrow_precedence(sql: &str) -> String {
     // Should become:
     //   (p1.labels->>'app') = (p2.labels->>'app')
 
-    // Match arrows followed by comparison/boolean operators (left side)
-    // This pattern matches both simple and chained arrows:
-    //   labels->>'app' = ...
-    //   spec->'selector'->>'app' = ...
-    let left_side_pattern = Regex::new(
-        r#"(?i)((?:\w+\.)?[\w\->']+)\s*(->>?)\s*'([^']+)'\s*(=|!=|<>|<=|>=|<|>|NOT\s+ILIKE|NOT\s+LIKE|ILIKE|LIKE|IS\s+NOT\s+NULL|IS\s+NULL|NOT\s+IN|IN)"#,
-    )
-    .unwrap();
-
-    let sql = left_side_pattern
+    // First pass: wrap arrows on left side of comparisons
+    let sql = LEFT_ARROW_PATTERN
         .replace_all(sql, |caps: &regex::Captures| {
             let column = &caps[1];
             let arrow = &caps[2];
@@ -62,16 +71,8 @@ fn fix_arrow_precedence(sql: &str) -> String {
         })
         .into_owned();
 
-    // Match arrows preceded by comparison/boolean operators (right side)
-    // This handles cases like:
-    //   = p2.labels->>'app'
-    //   = spec->'selector'->>'app'
-    let right_side_pattern = Regex::new(
-        r#"(?i)(=|!=|<>|<=|>=|<|>|NOT\s+ILIKE|NOT\s+LIKE|ILIKE|LIKE|IN)\s+((?:\w+\.)?[\w\->']+)\s*(->>?)\s*'([^']+)'"#,
-    )
-    .unwrap();
-
-    right_side_pattern
+    // Second pass: wrap arrows on right side of comparisons
+    RIGHT_ARROW_PATTERN
         .replace_all(&sql, |caps: &regex::Captures| {
             let operator = &caps[1];
             let column = &caps[2];
