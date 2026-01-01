@@ -27,6 +27,13 @@ use datafusion::sql::sqlparser::parser::Parser;
 use regex::Regex;
 use std::sync::LazyLock;
 
+/// Regex to match potential chained JSON arrow operators
+/// Matches patterns like: column->'key1' followed by more arrows
+/// We'll filter to only 2+ arrows in the conversion function
+static CHAINED_JSON_ARROW_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)((?:\w+\.)?\w+)(?:\s*->>?\s*'[^']+')+").unwrap()
+});
+
 /// Regex to fix -> and ->> operator precedence when followed by comparison operators.
 ///
 /// Workaround for upstream bug: https://github.com/apache/datafusion-sqlparser-rs/issues/814
@@ -47,6 +54,51 @@ static JSON_ARROW_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"(?i)((?:\w+\.)?\w+)\s*->>?\s*'([^']+)'\s*(=|!=|<>|<=|>=|<|>|NOT\s+ILIKE|NOT\s+LIKE|ILIKE|LIKE|IS\s+NOT\s+NULL|IS\s+NULL|NOT\s+IN|IN)"#).unwrap()
 });
 
+/// Convert chained JSON arrow operators to nested json_get/json_get_str calls
+/// Examples:
+///   spec->'selector'->>'app' -> json_get_str(json_get(spec, 'selector'), 'app')
+///   labels->'app'->>'version' -> json_get_str(json_get(labels, 'app'), 'version')
+/// Only converts if there are 2+ arrow operations (chains)
+fn convert_chained_json_arrows(sql: &str) -> String {
+    CHAINED_JSON_ARROW_PATTERN
+        .replace_all(sql, |caps: &regex::Captures| {
+            let full_match = caps.get(0).unwrap().as_str();
+            let base_column = &caps[1];
+
+            // Extract all arrow operations from the full match
+            let arrow_regex = Regex::new(r"->>?\s*'([^']+)'").unwrap();
+            let arrows: Vec<_> = arrow_regex
+                .captures_iter(full_match)
+                .map(|c| {
+                    let key = c.get(1).unwrap().as_str();
+                    let is_text = full_match[c.get(0).unwrap().start()..].starts_with("->>");
+                    (key, is_text)
+                })
+                .collect();
+
+            // Only convert if we have 2 or more arrows (a chain)
+            if arrows.len() < 2 {
+                // Return original match unchanged for single arrows
+                return full_match.to_string();
+            }
+
+            // Build nested json_get calls for chained operations
+            let mut result = base_column.to_string();
+            for (i, (key, is_text)) in arrows.iter().enumerate() {
+                let is_last = i == arrows.len() - 1;
+                if is_last && *is_text {
+                    // Last operation with ->> uses json_get_str
+                    result = format!("json_get_str({}, '{}')", result, key);
+                } else {
+                    // Intermediate operations use json_get
+                    result = format!("json_get({}, '{}')", result, key);
+                }
+            }
+            result
+        })
+        .into_owned()
+}
+
 /// Pre-parse fix for ->> operator precedence
 fn fix_json_arrow_precedence(sql: &str) -> String {
     JSON_ARROW_PATTERN
@@ -61,10 +113,16 @@ fn fix_json_arrow_precedence(sql: &str) -> String {
 
 /// Preprocess SQL to fix parser quirks
 ///
-/// Currently only fixes ->> operator precedence:
-/// - `col->>'key' = 'value'` -> `(col->>'key') = 'value'`
+/// Applies the following transformations:
+/// 1. Converts chained JSON arrows to json_get functions:
+///    - `spec->'selector'->>'app'` -> `json_get_str(json_get(spec, 'selector'), 'app')`
+/// 2. Fixes ->> operator precedence:
+///    - `col->>'key' = 'value'` -> `(col->>'key') = 'value'`
 pub fn preprocess_sql(sql: &str) -> String {
-    fix_json_arrow_precedence(sql)
+    // First convert chained arrows to functions (must come before precedence fix)
+    let sql = convert_chained_json_arrows(sql);
+    // Then fix precedence for remaining single arrow operators
+    fix_json_arrow_precedence(&sql)
 }
 
 /// Validate that the SQL statement is read-only
@@ -257,6 +315,43 @@ mod tests {
         assert_eq!(
             result,
             "SELECT name FROM pods WHERE (labels->>'app') IS NOT NULL"
+        );
+    }
+
+    #[test]
+    fn test_chained_json_arrows_two_levels() {
+        let sql = "SELECT spec->'selector'->>'app' FROM services";
+        let result = preprocess_sql(sql);
+        assert_eq!(
+            result,
+            "SELECT json_get_str(json_get(spec, 'selector'), 'app') FROM services"
+        );
+    }
+
+    #[test]
+    fn test_chained_json_arrows_three_levels() {
+        let sql = "SELECT metadata->'labels'->'app'->>'version' FROM pods";
+        let result = preprocess_sql(sql);
+        assert_eq!(
+            result,
+            "SELECT json_get_str(json_get(json_get(metadata, 'labels'), 'app'), 'version') FROM pods"
+        );
+    }
+
+    #[test]
+    fn test_chained_json_arrows_in_where() {
+        let sql = "SELECT * FROM pods WHERE spec->'selector'->>'app' = 'nginx'";
+        let result = preprocess_sql(sql);
+        assert!(result.contains("json_get_str(json_get(spec, 'selector'), 'app')"));
+    }
+
+    #[test]
+    fn test_chained_json_arrows_with_table_prefix() {
+        let sql = "SELECT p.spec->'containers'->>'name' FROM pods p";
+        let result = preprocess_sql(sql);
+        assert_eq!(
+            result,
+            "SELECT json_get_str(json_get(p.spec, 'containers'), 'name') FROM pods p"
         );
     }
 

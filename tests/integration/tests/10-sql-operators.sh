@@ -14,16 +14,18 @@ assert_min_row_count "Greater than (created > old timestamp)" "k3d-k8sql-test-1"
     "SELECT name FROM pods WHERE created > TIMESTAMP '2020-01-01'" 1
 
 # Less than
+# Use deployments for generation tests since pods have immutable specs (generation = 0)
 assert_success "Less than (generation < 1000)" "k3d-k8sql-test-1" \
-    "SELECT name FROM pods WHERE generation < 1000 LIMIT 5"
+    "SELECT name FROM deployments WHERE generation < 1000 LIMIT 5"
 
 # Greater than or equal
+# Test with deployments which have been patched to bump generation in setup
 assert_min_row_count "Greater than or equal (generation >= 0)" "k3d-k8sql-test-1" \
-    "SELECT name FROM pods WHERE generation >= 0" 1
+    "SELECT name FROM deployments WHERE generation >= 0" 1
 
 # Less than or equal
 assert_success "Less than or equal (generation <= 10)" "k3d-k8sql-test-1" \
-    "SELECT name FROM pods WHERE generation <= 10 LIMIT 5"
+    "SELECT name FROM deployments WHERE generation <= 10 LIMIT 5"
 
 # Not equal
 assert_success "Not equal (namespace != 'kube-system')" "k3d-k8sql-test-1" \
@@ -33,8 +35,9 @@ assert_success "Not equal (namespace != 'kube-system')" "k3d-k8sql-test-1" \
 echo ""
 echo "--- BETWEEN Operator ---"
 
+# Use deployments for generation tests
 assert_success "BETWEEN with integers" "k3d-k8sql-test-1" \
-    "SELECT name FROM pods WHERE generation BETWEEN 0 AND 10 LIMIT 5"
+    "SELECT name FROM deployments WHERE generation BETWEEN 0 AND 10 LIMIT 5"
 
 # Logical Operators
 echo ""
