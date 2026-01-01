@@ -28,7 +28,7 @@
 use std::any::Any;
 use std::fmt;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use async_stream::try_stream;
@@ -93,6 +93,9 @@ pub struct K8sExecutionPlan {
     metrics: ExecutionPlanMetricsSet,
     /// Cached column definitions (passed to conversion, avoids regenerating)
     columns: Arc<Vec<ColumnDef>>,
+    /// Wall-clock timer for tracking actual query duration across all partitions
+    /// Starts when first partition executes, tracks overall time
+    wall_clock_start: Arc<Mutex<Option<Instant>>>,
 }
 
 impl K8sExecutionPlan {
@@ -127,6 +130,7 @@ impl K8sExecutionPlan {
             fetch_limit,
             metrics: ExecutionPlanMetricsSet::new(),
             columns,
+            wall_clock_start: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -144,9 +148,8 @@ impl fmt::Debug for K8sExecutionPlan {
 impl DisplayAs for K8sExecutionPlan {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match t {
-            DisplayFormatType::Default
-            | DisplayFormatType::Verbose
-            | DisplayFormatType::TreeRender => {
+            DisplayFormatType::Default => {
+                // Concise: just table name and partition count
                 write!(
                     f,
                     "K8sExec: table={}, partitions={}",
@@ -156,6 +159,29 @@ impl DisplayAs for K8sExecutionPlan {
                 if let Some(limit) = self.fetch_limit {
                     write!(f, ", fetch={}", limit)?;
                 }
+                Ok(())
+            }
+            DisplayFormatType::Verbose | DisplayFormatType::TreeRender => {
+                // Verbose: show per-partition cluster mapping
+                writeln!(
+                    f,
+                    "K8sExec: table={}, partitions={}",
+                    self.table_name,
+                    self.targets.len()
+                )?;
+                if let Some(limit) = self.fetch_limit {
+                    writeln!(f, "  fetch={}", limit)?;
+                }
+
+                // Show which cluster each partition targets
+                for (i, target) in self.targets.iter().enumerate() {
+                    write!(f, "  partition[{}]: cluster={}", i, target.cluster)?;
+                    if let Some(ref ns) = target.namespace {
+                        write!(f, ", namespace={}", ns)?;
+                    }
+                    writeln!(f)?;
+                }
+
                 Ok(())
             }
         }
@@ -199,6 +225,13 @@ impl ExecutionPlan for K8sExecutionPlan {
     }
 
     fn metrics(&self) -> Option<MetricsSet> {
+        // Add wall-clock time if query has started
+        if let Some(start) = *self.wall_clock_start.lock().unwrap() {
+            let elapsed_ms = start.elapsed().as_millis() as usize;
+            let wall_clock = MetricBuilder::new(&self.metrics).gauge("wall_clock_time", 0);
+            wall_clock.set(elapsed_ms);
+        }
+
         Some(self.metrics.clone_inner())
     }
 
@@ -239,6 +272,14 @@ impl ExecutionPlan for K8sExecutionPlan {
             )));
         }
 
+        // Start wall-clock timer on first partition execution
+        {
+            let mut timer = self.wall_clock_start.lock().unwrap();
+            if timer.is_none() {
+                *timer = Some(Instant::now());
+            }
+        }
+
         // Get the target for this partition
         let target = self.targets[partition].clone();
         let table_name = self.table_name.clone();
@@ -251,7 +292,14 @@ impl ExecutionPlan for K8sExecutionPlan {
         // Set up metrics for this partition
         let rows_fetched = MetricBuilder::new(&self.metrics).counter("rows_fetched", partition);
         let pages_fetched = MetricBuilder::new(&self.metrics).counter("pages_fetched", partition);
-        let fetch_time = MetricBuilder::new(&self.metrics).subset_time("fetch_time", partition);
+        let fetch_time =
+            MetricBuilder::new(&self.metrics).subset_time("total_fetch_time", partition);
+        let bytes_received = MetricBuilder::new(&self.metrics).counter("bytes_received", partition);
+        let output_bytes = MetricBuilder::new(&self.metrics).counter("output_bytes", partition);
+        let conversion_time =
+            MetricBuilder::new(&self.metrics).subset_time("conversion_time", partition);
+        let first_page_time =
+            MetricBuilder::new(&self.metrics).subset_time("first_page_time", partition);
 
         debug!(
             table = %table_name,
@@ -274,6 +322,10 @@ impl ExecutionPlan for K8sExecutionPlan {
             rows_fetched,
             pages_fetched,
             fetch_time,
+            bytes_received,
+            output_bytes,
+            conversion_time,
+            first_page_time,
         );
 
         Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
@@ -293,6 +345,10 @@ fn create_streaming_execution(
     rows_fetched: datafusion::physical_plan::metrics::Count,
     pages_fetched: datafusion::physical_plan::metrics::Count,
     fetch_time: datafusion::physical_plan::metrics::Time,
+    bytes_received: datafusion::physical_plan::metrics::Count,
+    output_bytes: datafusion::physical_plan::metrics::Count,
+    conversion_time: datafusion::physical_plan::metrics::Time,
+    first_page_time: datafusion::physical_plan::metrics::Time,
 ) -> Pin<Box<dyn Stream<Item = Result<RecordBatch>> + Send>> {
     let stream = try_stream! {
         let start = Instant::now();
@@ -308,12 +364,26 @@ fn create_streaming_execution(
 
         use futures::StreamExt;
         let mut total_rows = 0usize;
+        let mut first_page_received = false;
+        let first_page_timer = Instant::now();
 
         while let Some(page_result) = page_stream.next().await {
             match page_result {
                 Ok(items) => {
+                    // Track time to first page
+                    if !first_page_received {
+                        first_page_time.add_duration(first_page_timer.elapsed());
+                        first_page_received = true;
+                    }
+
                     let page_row_count = items.len();
                     total_rows += page_row_count;
+
+                    // Track bytes received (JSON size)
+                    let json_bytes = serde_json::to_vec(&items)
+                        .map(|v| v.len())
+                        .unwrap_or(0);
+                    bytes_received.add(json_bytes);
 
                     // Update metrics
                     pages_fetched.add(1);
@@ -330,7 +400,14 @@ fn create_streaming_execution(
 
                     // Convert page to RecordBatch and yield
                     if !items.is_empty() {
+                        let convert_start = Instant::now();
                         let batch = json_to_record_batch(&target.cluster, &columns, items)?;
+
+                        // Track conversion time and output bytes
+                        conversion_time.add_duration(convert_start.elapsed());
+                        let batch_bytes = batch.get_array_memory_size();
+                        output_bytes.add(batch_bytes);
+
                         yield batch;
                     }
                 }
