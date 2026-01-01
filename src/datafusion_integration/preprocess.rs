@@ -9,6 +9,8 @@
 //!
 //! - **JSON arrow precedence fix**: `col->>'key' = 'val'` becomes
 //!   `(col->>'key') = 'val'` to work around DataFusion parser precedence
+//! - **Chained JSON arrows**: `spec->'selector'->>'app'` becomes
+//!   `json_get_str(json_get(spec, 'selector'), 'app')` for PostgreSQL compatibility
 //!
 //! ## JSON Field Access
 //!
@@ -17,8 +19,8 @@
 //! -- Access label value
 //! SELECT * FROM pods WHERE labels->>'app' = 'nginx'
 //!
-//! -- Access nested status field
-//! SELECT status->>'phase' FROM pods
+//! -- Access nested field (chained)
+//! SELECT spec->'selector'->>'app' FROM services
 //! ```
 
 use datafusion::sql::sqlparser::ast::Statement;
@@ -27,82 +29,75 @@ use datafusion::sql::sqlparser::parser::Parser;
 use regex::Regex;
 use std::sync::LazyLock;
 
-/// Regex to match potential chained JSON arrow operators
-/// Matches patterns like: column->'key1' followed by more arrows
-/// We'll filter to only 2+ arrows in the conversion function
-static CHAINED_JSON_ARROW_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)((?:\w+\.)?\w+)(?:\s*->>?\s*'[^']+')+").unwrap()
-});
+/// Regex to match JSON arrow operator sequences
+/// Matches patterns like: column->'key' or column->'k1'->'k2'->>'k3'
+static JSON_ARROW_PATTERN: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)((?:\w+\.)?\w+)(?:\s*->>?\s*'[^']+')+").unwrap());
 
-/// Regex to fix -> and ->> operator precedence when followed by comparison operators.
-///
-/// Workaround for upstream bug: https://github.com/apache/datafusion-sqlparser-rs/issues/814
-/// The parser uses outdated PostgreSQL 7.0 precedence rules where comparison operators
-/// (=, IN, IS NULL, etc.) incorrectly bind more tightly than JSON arrow operators.
-///
-/// Examples of incorrect parsing without this fix:
-///   `col->>'key' = 'val'` parsed as `col->>('key' = 'val')`  ← WRONG
-///   `col->'field' IN (...)` parsed as `col->('field' IN (...))` ← WRONG
-///
-/// We wrap the arrow expression in parentheses before parsing:
-///   `col->>'key' = 'val'` becomes `(col->>'key') = 'val'` ← CORRECT
-///   `col->'field' IN (...)` becomes `(col->'field') IN (...)` ← CORRECT
-///
-/// Note: This must be done at string level before parsing because the parser
-/// gets the precedence wrong during tokenization.
-static JSON_ARROW_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"(?i)((?:\w+\.)?\w+)\s*->>?\s*'([^']+)'\s*(=|!=|<>|<=|>=|<|>|NOT\s+ILIKE|NOT\s+LIKE|ILIKE|LIKE|IS\s+NOT\s+NULL|IS\s+NULL|NOT\s+IN|IN)"#).unwrap()
-});
+/// Extract arrow operations from a matched string
+/// Returns Vec<(key, is_text)> where is_text indicates ->> vs ->
+fn extract_arrow_operations(s: &str) -> Vec<(&str, bool)> {
+    let arrow_regex = Regex::new(r"->>?\s*'([^']+)'").unwrap();
+    arrow_regex
+        .captures_iter(s)
+        .map(|c| {
+            let key = c.get(1).unwrap().as_str();
+            let is_text = s[c.get(0).unwrap().start()..].starts_with("->>");
+            (key, is_text)
+        })
+        .collect()
+}
 
-/// Convert chained JSON arrow operators to nested json_get/json_get_str calls
-/// Examples:
-///   spec->'selector'->>'app' -> json_get_str(json_get(spec, 'selector'), 'app')
-///   labels->'app'->>'version' -> json_get_str(json_get(labels, 'app'), 'version')
-/// Only converts if there are 2+ arrow operations (chains)
-fn convert_chained_json_arrows(sql: &str) -> String {
-    CHAINED_JSON_ARROW_PATTERN
+/// Convert arrow operations to nested json_get function calls
+fn convert_to_json_get_chain(base_column: &str, arrows: &[(&str, bool)]) -> String {
+    let mut result = base_column.to_string();
+    for (i, (key, is_text)) in arrows.iter().enumerate() {
+        let is_last = i == arrows.len() - 1;
+        if is_last && *is_text {
+            // Last operation with ->> uses json_get_str
+            result = format!("json_get_str({}, '{}')", result, key);
+        } else {
+            // Intermediate operations use json_get
+            result = format!("json_get({}, '{}')", result, key);
+        }
+    }
+    result
+}
+
+/// Process JSON arrow operators - convert chains to json_get, wrap singles with parens
+///
+/// This function handles both:
+/// 1. Chained arrows (2+): spec->'selector'->>'app' → json_get_str(json_get(spec, 'selector'), 'app')
+/// 2. Single arrows with comparison: labels->>'app' = 'x' → (labels->>'app') = 'x'
+///
+/// The precedence fix is needed due to DataFusion parser bug:
+/// https://github.com/apache/datafusion-sqlparser-rs/issues/814
+fn process_json_arrows(sql: &str) -> String {
+    // First pass: convert chained arrows to json_get functions
+    let sql = JSON_ARROW_PATTERN
         .replace_all(sql, |caps: &regex::Captures| {
             let full_match = caps.get(0).unwrap().as_str();
             let base_column = &caps[1];
+            let arrows = extract_arrow_operations(full_match);
 
-            // Extract all arrow operations from the full match
-            let arrow_regex = Regex::new(r"->>?\s*'([^']+)'").unwrap();
-            let arrows: Vec<_> = arrow_regex
-                .captures_iter(full_match)
-                .map(|c| {
-                    let key = c.get(1).unwrap().as_str();
-                    let is_text = full_match[c.get(0).unwrap().start()..].starts_with("->>");
-                    (key, is_text)
-                })
-                .collect();
-
-            // Only convert if we have 2 or more arrows (a chain)
-            if arrows.len() < 2 {
-                // Return original match unchanged for single arrows
-                return full_match.to_string();
+            if arrows.len() >= 2 {
+                // Chain: convert to nested json_get calls
+                convert_to_json_get_chain(base_column, &arrows)
+            } else {
+                // Single arrow: keep as-is for now (will be handled in second pass)
+                full_match.to_string()
             }
-
-            // Build nested json_get calls for chained operations
-            let mut result = base_column.to_string();
-            for (i, (key, is_text)) in arrows.iter().enumerate() {
-                let is_last = i == arrows.len() - 1;
-                if is_last && *is_text {
-                    // Last operation with ->> uses json_get_str
-                    result = format!("json_get_str({}, '{}')", result, key);
-                } else {
-                    // Intermediate operations use json_get
-                    result = format!("json_get({}, '{}')", result, key);
-                }
-            }
-            result
         })
-        .into_owned()
-}
+        .into_owned();
 
-/// Pre-parse fix for ->> operator precedence
-fn fix_json_arrow_precedence(sql: &str) -> String {
-    JSON_ARROW_PATTERN
-        .replace_all(sql, |caps: &regex::Captures| {
+    // Second pass: wrap remaining single arrows before comparison operators
+    let comparison_pattern = Regex::new(
+        r#"(?i)((?:\w+\.)?\w+)\s*->>?\s*'([^']+)'\s*(=|!=|<>|<=|>=|<|>|NOT\s+ILIKE|NOT\s+LIKE|ILIKE|LIKE|IS\s+NOT\s+NULL|IS\s+NULL|NOT\s+IN|IN)"#,
+    )
+    .unwrap();
+
+    comparison_pattern
+        .replace_all(&sql, |caps: &regex::Captures| {
             let column = &caps[1];
             let key = &caps[2];
             let operator = &caps[3];
@@ -119,10 +114,7 @@ fn fix_json_arrow_precedence(sql: &str) -> String {
 /// 2. Fixes ->> operator precedence:
 ///    - `col->>'key' = 'value'` -> `(col->>'key') = 'value'`
 pub fn preprocess_sql(sql: &str) -> String {
-    // First convert chained arrows to functions (must come before precedence fix)
-    let sql = convert_chained_json_arrows(sql);
-    // Then fix precedence for remaining single arrow operators
-    fix_json_arrow_precedence(&sql)
+    process_json_arrows(sql)
 }
 
 /// Validate that the SQL statement is read-only
