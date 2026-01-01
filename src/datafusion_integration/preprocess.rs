@@ -30,17 +30,21 @@ use regex::Regex;
 use std::sync::LazyLock;
 
 /// Regex to match arrows followed by comparison operators (left side)
+/// Note: Uses explicit structure matching to prevent ReDoS vulnerability.
+/// Matches: column_name[->>'key' or ->'key' chains]->>'final_key'
 static LEFT_ARROW_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r#"(?i)((?:\w+\.)?[\w\->']+)\s*(->>?)\s*'([^']+)'\s*(=|!=|<>|<=|>=|<|>|NOT\s+ILIKE|NOT\s+LIKE|ILIKE|LIKE|IS\s+NOT\s+NULL|IS\s+NULL|NOT\s+IN|IN)"#,
+        r#"(?i)((?:\w+\.)?[\w\-]+(?:->>?'[^']+')*)\s*(->>?)\s*'([^']+)'\s*(=|!=|<>|<=|>=|<|>|NOT\s+ILIKE|NOT\s+LIKE|ILIKE|LIKE|IS\s+NOT\s+NULL|IS\s+NULL|NOT\s+IN|IN)"#,
     )
     .unwrap()
 });
 
 /// Regex to match arrows preceded by comparison operators (right side)
+/// Note: Uses explicit structure matching to prevent ReDoS vulnerability.
+/// Matches: column_name[->>'key' or ->'key' chains]->>'final_key'
 static RIGHT_ARROW_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r#"(?i)(=|!=|<>|<=|>=|<|>|NOT\s+ILIKE|NOT\s+LIKE|ILIKE|LIKE|IN)\s+((?:\w+\.)?[\w\->']+)\s*(->>?)\s*'([^']+)'"#,
+        r#"(?i)(=|!=|<>|<=|>=|<|>|NOT\s+ILIKE|NOT\s+LIKE|ILIKE|LIKE|IN)\s+((?:\w+\.)?[\w\-]+(?:->>?'[^']+')*)\s*(->>?)\s*'([^']+)'"#,
     )
     .unwrap()
 });
