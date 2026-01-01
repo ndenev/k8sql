@@ -297,7 +297,6 @@ impl ExecutionPlan for K8sExecutionPlan {
         // Counters (aggregate via sum):
         let rows_fetched = MetricBuilder::new(&self.metrics).counter("rows_fetched", partition); // count: K8s resources returned
         let pages_fetched = MetricBuilder::new(&self.metrics).counter("pages_fetched", partition); // count: K8s API calls (LIST operations)
-        let bytes_received = MetricBuilder::new(&self.metrics).counter("bytes_received", partition); // bytes: JSON payload size from K8s API
         let output_bytes = MetricBuilder::new(&self.metrics).counter("output_bytes", partition); // bytes: Arrow RecordBatch memory size
 
         // Time metrics in milliseconds (aggregate via sum):
@@ -329,7 +328,6 @@ impl ExecutionPlan for K8sExecutionPlan {
             rows_fetched,
             pages_fetched,
             fetch_time,
-            bytes_received,
             output_bytes,
             conversion_time,
             first_page_time,
@@ -352,7 +350,6 @@ fn create_streaming_execution(
     rows_fetched: datafusion::physical_plan::metrics::Count,
     pages_fetched: datafusion::physical_plan::metrics::Count,
     fetch_time: datafusion::physical_plan::metrics::Time,
-    bytes_received: datafusion::physical_plan::metrics::Count,
     output_bytes: datafusion::physical_plan::metrics::Count,
     conversion_time: datafusion::physical_plan::metrics::Time,
     first_page_time: datafusion::physical_plan::metrics::Time,
@@ -385,23 +382,6 @@ fn create_streaming_execution(
 
                     let page_row_count = items.len();
                     total_rows += page_row_count;
-
-                    // Track bytes received (JSON size)
-                    // NOTE: This re-serializes already-deserialized K8s JSON to measure logical data size.
-                    // Trade-offs:
-                    //   - Adds CPU overhead (serialization) and temporary memory allocation per page
-                    //   - Provides accurate measure of logical JSON payload size
-                    //   - May differ from actual network bytes (HTTP compression, whitespace)
-                    // Alternatives considered:
-                    //   - Track at HTTP layer: requires kube-rs client changes (not exposed)
-                    //   - Estimate from row count: less accurate, harder to debug size anomalies
-                    //   - Skip metric: loses visibility into data transfer costs
-                    // Decision: Accept overhead for observability - helps identify large resources
-                    // and understand network vs conversion bottlenecks in query performance.
-                    let json_bytes = serde_json::to_vec(&items)
-                        .map(|v| v.len())
-                        .unwrap_or(0);
-                    bytes_received.add(json_bytes);
 
                     // Update metrics
                     pages_fetched.add(1);
