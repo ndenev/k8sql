@@ -60,7 +60,30 @@ impl QueryResult {
                     .columns
                     .iter()
                     .zip(row.iter())
-                    .map(|(col, val)| (col.clone(), serde_json::Value::String(val.clone())))
+                    .map(|(col, val)| {
+                        // Convert empty strings (representing NULL values) to JSON null
+                        // For proper JSON semantics where NULL values should be null, not ""
+                        let json_val = if val.is_empty() {
+                            serde_json::Value::Null
+                        } else {
+                            // Try to parse as number first, fall back to string
+                            if let Ok(num) = val.parse::<i64>() {
+                                serde_json::Value::Number(num.into())
+                            } else if let Ok(num) = val.parse::<f64>() {
+                                serde_json::Value::Number(
+                                    serde_json::Number::from_f64(num)
+                                        .unwrap_or_else(|| serde_json::Number::from(0)),
+                                )
+                            } else if val == "true" {
+                                serde_json::Value::Bool(true)
+                            } else if val == "false" {
+                                serde_json::Value::Bool(false)
+                            } else {
+                                serde_json::Value::String(val.clone())
+                            }
+                        };
+                        (col.clone(), json_val)
+                    })
                     .collect();
                 serde_json::Value::Object(obj)
             })
