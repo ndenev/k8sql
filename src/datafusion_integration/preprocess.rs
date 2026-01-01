@@ -90,18 +90,42 @@ fn process_json_arrows(sql: &str) -> String {
         })
         .into_owned();
 
-    // Second pass: wrap remaining single arrows before comparison operators
-    let comparison_pattern = Regex::new(
-        r#"(?i)((?:\w+\.)?\w+)\s*->>?\s*'([^']+)'\s*(=|!=|<>|<=|>=|<|>|NOT\s+ILIKE|NOT\s+LIKE|ILIKE|LIKE|IS\s+NOT\s+NULL|IS\s+NULL|NOT\s+IN|IN)"#,
+    // Second pass: wrap single arrows that appear in comparison/boolean contexts
+    // We need to handle arrows on BOTH sides of comparisons:
+    //   p1.labels->>'app' = p2.labels->>'app'
+    // Should become:
+    //   (p1.labels->>'app') = (p2.labels->>'app')
+
+    // Match arrows followed by comparison/boolean operators (left side)
+    let left_side_pattern = Regex::new(
+        r#"(?i)((?:\w+\.)?\w+)\s*(->>?)\s*'([^']+)'\s*(=|!=|<>|<=|>=|<|>|NOT\s+ILIKE|NOT\s+LIKE|ILIKE|LIKE|IS\s+NOT\s+NULL|IS\s+NULL|NOT\s+IN|IN)"#,
     )
     .unwrap();
 
-    comparison_pattern
+    let sql = left_side_pattern
         .replace_all(&sql, |caps: &regex::Captures| {
             let column = &caps[1];
-            let key = &caps[2];
-            let operator = &caps[3];
-            format!("({}->>'{}') {}", column, key, operator)
+            let arrow = &caps[2];
+            let key = &caps[3];
+            let operator = &caps[4];
+            format!("({}{}'{}') {}", column, arrow, key, operator)
+        })
+        .into_owned();
+
+    // Match arrows preceded by comparison/boolean operators (right side)
+    // This handles cases like: = p2.labels->>'app'
+    let right_side_pattern = Regex::new(
+        r#"(?i)(=|!=|<>|<=|>=|<|>|NOT\s+ILIKE|NOT\s+LIKE|ILIKE|LIKE|IN)\s+((?:\w+\.)?\w+)\s*(->>?)\s*'([^']+)'"#,
+    )
+    .unwrap();
+
+    right_side_pattern
+        .replace_all(&sql, |caps: &regex::Captures| {
+            let operator = &caps[1];
+            let column = &caps[2];
+            let arrow = &caps[3];
+            let key = &caps[4];
+            format!("{} ({}{}'{}')", operator, column, arrow, key)
         })
         .into_owned()
 }
@@ -425,5 +449,27 @@ mod tests {
         let result = validate_read_only("TRUNCATE TABLE test");
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("TRUNCATE"));
+    }
+
+    #[test]
+    fn test_json_arrow_both_sides_of_comparison() {
+        // Test that arrows on BOTH sides of comparison get wrapped
+        let sql = "SELECT * FROM pods p1 JOIN pods p2 ON p1.labels->>'app' = p2.labels->>'app'";
+        let result = preprocess_sql(sql);
+        assert_eq!(
+            result,
+            "SELECT * FROM pods p1 JOIN pods p2 ON (p1.labels->>'app') = (p2.labels->>'app')"
+        );
+    }
+
+    #[test]
+    fn test_json_arrow_in_clause_right_side() {
+        // Test arrow on right side of IN clause
+        let sql = "SELECT * FROM pods WHERE 'nginx' = labels->>'app'";
+        let result = preprocess_sql(sql);
+        assert_eq!(
+            result,
+            "SELECT * FROM pods WHERE 'nginx' = (labels->>'app')"
+        );
     }
 }
