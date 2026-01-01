@@ -8,16 +8,10 @@ K8SQL="${K8SQL:-../../bin/k8sql}"
 PASS=0
 FAIL=0
 
-# Colors for output (if terminal supports it)
-if [[ -t 1 ]]; then
-    GREEN='\033[0;32m'
-    RED='\033[0;31m'
-    NC='\033[0m' # No Color
-else
-    GREEN=''
-    RED=''
-    NC=''
-fi
+# Colors for output (GitHub Actions supports ANSI colors)
+GREEN='\033[0;32m'
+RED='\033[0;31m'
+NC='\033[0m' # No Color
 
 # Run a k8sql query and capture output
 run_query() {
