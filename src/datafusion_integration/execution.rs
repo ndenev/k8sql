@@ -180,7 +180,10 @@ impl DisplayAs for K8sExecutionPlan {
                     if let Some(ref ns) = target.namespace {
                         write!(f, ", namespace={}", ns)?;
                     }
-                    writeln!(f)?;
+                    // Don't add newline after last partition - DataFusion appends metrics on same line
+                    if i < self.targets.len() - 1 {
+                        writeln!(f)?;
+                    }
                 }
 
                 Ok(())
