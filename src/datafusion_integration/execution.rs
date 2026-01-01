@@ -10,10 +10,18 @@
 //! # LIMIT Pushdown
 //!
 //! LIMIT pushdown to the Kubernetes API is **disabled** due to a DataFusion API limitation.
-//! DataFusion's `with_fetch()` method receives a combined `skip + fetch` value when there's
-//! an OFFSET clause, making it impossible to distinguish between:
-//! - `LIMIT 10` (should fetch 10 rows)
-//! - `LIMIT 10 OFFSET 10` (DataFusion passes fetch=20, breaking OFFSET semantics)
+//! When a query has an OFFSET clause, DataFusion passes a combined `skip + fetch` value to
+//! `TableProvider::scan()`, making it impossible to distinguish between:
+//! - `LIMIT 10` (scan receives limit=10, should fetch 10 rows)
+//! - `LIMIT 10 OFFSET 5` (scan receives limit=15, breaking OFFSET semantics)
+//!
+//! Example bug scenario:
+//! ```sql
+//! SELECT * FROM pods ORDER BY name LIMIT 10 OFFSET 5
+//! ```
+//! With pushdown enabled, we fetch 15 rows from K8s API, then DataFusion applies OFFSET.
+//! But if the ORDER BY requires sorting across all data, we've already limited the K8s
+//! fetch and might skip rows that should appear in the final result.
 //!
 //! All LIMIT/OFFSET handling is performed by DataFusion's LimitExec to ensure correctness.
 
@@ -121,21 +129,6 @@ impl K8sExecutionPlan {
             columns,
         }
     }
-
-    /// Create a clone with a new fetch limit for LIMIT pushdown
-    fn with_new_fetch(&self, fetch: Option<usize>) -> Self {
-        Self {
-            table_name: self.table_name.clone(),
-            targets: self.targets.clone(),
-            api_filters: self.api_filters.clone(),
-            pool: self.pool.clone(),
-            schema: self.schema.clone(),
-            plan_properties: self.plan_properties.clone(),
-            fetch_limit: fetch,
-            metrics: self.metrics.clone(),
-            columns: self.columns.clone(),
-        }
-    }
 }
 
 impl fmt::Debug for K8sExecutionPlan {
@@ -210,29 +203,14 @@ impl ExecutionPlan for K8sExecutionPlan {
     }
 
     fn supports_limit_pushdown(&self) -> bool {
-        // Enable LIMIT pushdown for single-partition queries only
-        // Multi-partition queries skip pushdown to maintain ORDER BY correctness
-        true
+        // LIMIT pushdown is disabled due to DataFusion passing skip+fetch combined
+        // to TableProvider::scan() when OFFSET is present (see module docs)
+        false
     }
 
-    fn with_fetch(&self, fetch: Option<usize>) -> Option<Arc<dyn ExecutionPlan>> {
-        // DEBUG: Log when with_fetch is called to understand DataFusion's behavior
-        eprintln!(
-            "DEBUG with_fetch: called with fetch={:?}, partitions={}",
-            fetch,
-            self.targets.len()
-        );
-
-        // Only push LIMIT to K8s API for single-partition queries
-        // Multi-partition queries (multiple clusters/namespaces) can't safely
-        // push LIMIT because ORDER BY needs to see all data across partitions
-        if self.targets.len() > 1 {
-            eprintln!("DEBUG with_fetch: skipping (multi-partition)");
-            None
-        } else {
-            eprintln!("DEBUG with_fetch: pushing limit to K8s API");
-            Some(Arc::new(self.with_new_fetch(fetch)))
-        }
+    fn with_fetch(&self, _fetch: Option<usize>) -> Option<Arc<dyn ExecutionPlan>> {
+        // LIMIT pushdown disabled - see module-level documentation
+        None
     }
 
     fn fetch(&self) -> Option<usize> {
