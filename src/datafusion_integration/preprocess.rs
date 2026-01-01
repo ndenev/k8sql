@@ -8,19 +8,20 @@
 //! ## Transformations
 //!
 //! - **JSON arrow precedence fix**: `col->>'key' = 'val'` becomes
-//!   `(col->>'key') = 'val'` to work around DataFusion parser precedence
-//! - **Chained JSON arrows**: `spec->'selector'->>'app'` becomes
-//!   `json_get_str(json_get(spec, 'selector'), 'app')` for PostgreSQL compatibility
+//!   `(col->>'key') = 'val'` to work around DataFusion parser precedence bug
 //!
-//! ## JSON Field Access
+//! ## PostgreSQL-Compatible JSON Operators
 //!
-//! Use PostgreSQL-style JSON operators for accessing nested fields:
+//! DataFusion with datafusion-functions-json supports PostgreSQL JSON operators natively,
+//! including chained arrows:
+//!
 //! ```sql
-//! -- Access label value
+//! -- Single arrow access
 //! SELECT * FROM pods WHERE labels->>'app' = 'nginx'
 //!
-//! -- Access nested field (chained)
+//! -- Chained arrows work natively (no conversion needed!)
 //! SELECT spec->'selector'->>'app' FROM services
+//! SELECT metadata->'labels'->'env'->>'name' FROM pods
 //! ```
 
 use datafusion::sql::sqlparser::ast::Statement;
