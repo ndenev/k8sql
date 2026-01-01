@@ -247,7 +247,6 @@ SELECT json_get_str(UNNEST(json_get_array(spec, 'containers')), 'image') FROM po
 4. **Use field selectors**: `WHERE status->>'phase' = 'Running'` for pods pushes to K8s API
 5. **Cluster filters**: `WHERE _cluster = 'prod'` avoids querying unnecessary clusters
 6. **Combine filters**: Multiple AND conditions on labels/fields push to K8s as combined selectors
-7. **Use LIMIT**: `LIMIT 10` with single cluster queries pushes to K8s API (50x data reduction)
 
 **What to Avoid**:
 - `SELECT * FROM pods` when you only need a few columns (wastes CPU converting large JSON fields)

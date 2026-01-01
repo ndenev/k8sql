@@ -8,16 +8,10 @@ K8SQL="${K8SQL:-../../bin/k8sql}"
 PASS=0
 FAIL=0
 
-# Colors for output (if terminal supports it)
-if [[ -t 1 ]]; then
-    GREEN='\033[0;32m'
-    RED='\033[0;31m'
-    NC='\033[0m' # No Color
-else
-    GREEN=''
-    RED=''
-    NC=''
-fi
+# Colors for output (GitHub Actions supports ANSI colors)
+GREEN='\033[0;32m'
+RED='\033[0;31m'
+NC='\033[0m' # No Color
 
 # Run a k8sql query and capture output
 run_query() {
@@ -158,11 +152,16 @@ assert_success() {
     local context="$2"
     local query="$3"
 
-    if $K8SQL -c "$context" -q "$query" >/dev/null 2>&1; then
+    local error_output
+    error_output=$($K8SQL -c "$context" -q "$query" 2>&1 >/dev/null)
+    local exit_code=$?
+
+    if [[ $exit_code -eq 0 ]]; then
         echo -e "${GREEN}✓${NC} $desc"
         PASS=$((PASS + 1))
     else
         echo -e "${RED}✗${NC} $desc (query failed)"
+        echo "    Error: $error_output"
         FAIL=$((FAIL + 1))
     fi
 }

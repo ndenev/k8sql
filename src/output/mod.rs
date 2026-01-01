@@ -52,6 +52,10 @@ impl QueryResult {
     }
 
     /// Convert rows to JSON Value objects (used by JSON and YAML formatters)
+    ///
+    /// Note: All values are kept as strings to preserve Kubernetes semantics
+    /// (labels/annotations are string maps) and maintain backward compatibility.
+    /// Only empty strings (representing NULL from Arrow arrays) are converted to JSON null.
     pub(crate) fn to_json_rows(&self) -> Vec<serde_json::Value> {
         self.rows
             .iter()
@@ -60,7 +64,16 @@ impl QueryResult {
                     .columns
                     .iter()
                     .zip(row.iter())
-                    .map(|(col, val)| (col.clone(), serde_json::Value::String(val.clone())))
+                    .map(|(col, val)| {
+                        // Convert empty strings (representing NULL values) to JSON null
+                        // All other values kept as strings to preserve K8s semantics
+                        let json_val = if val.is_empty() {
+                            serde_json::Value::Null
+                        } else {
+                            serde_json::Value::String(val.clone())
+                        };
+                        (col.clone(), json_val)
+                    })
                     .collect();
                 serde_json::Value::Object(obj)
             })

@@ -25,22 +25,23 @@ test-unit:
 
 # Run integration tests (requires Docker and k3d)
 # This will create k3d clusters, run tests, and clean up
+# Uses separate KUBECONFIG to avoid touching ~/.kube/config
 test-integration: build-release
 	@echo "=== Running integration tests ==="
 	@echo "Prerequisites: Docker and k3d must be installed"
 	@command -v docker >/dev/null 2>&1 || { echo "Error: docker is not installed"; exit 1; }
 	@command -v k3d >/dev/null 2>&1 || { echo "Error: k3d is not installed"; exit 1; }
-	./tests/integration/setup-clusters.sh
-	K8SQL=./bin/k8sql ./tests/integration/run-tests.sh || (./tests/integration/cleanup.sh && exit 1)
+	KUBECONFIG=/tmp/k8sql-test-kubeconfig ./tests/integration/setup-clusters.sh
+	KUBECONFIG=/tmp/k8sql-test-kubeconfig K8SQL=./bin/k8sql ./tests/integration/run-tests.sh || (./tests/integration/cleanup.sh && exit 1)
 	./tests/integration/cleanup.sh
 
 # Run integration tests without setup/cleanup (for debugging)
 test-integration-run:
-	K8SQL=./bin/k8sql ./tests/integration/run-tests.sh
+	KUBECONFIG=/tmp/k8sql-test-kubeconfig K8SQL=./bin/k8sql ./tests/integration/run-tests.sh
 
 # Setup integration test clusters only
 test-integration-setup:
-	./tests/integration/setup-clusters.sh
+	KUBECONFIG=/tmp/k8sql-test-kubeconfig ./tests/integration/setup-clusters.sh
 
 # Cleanup integration test clusters
 test-integration-cleanup:

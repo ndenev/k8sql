@@ -39,9 +39,13 @@ k3d cluster create "$CLUSTER2" \
     --timeout 120s \
     --agents 0
 
-# Merge kubeconfigs
+# Set up kubeconfig for tests (defaults to /tmp/k8sql-test-kubeconfig to avoid touching ~/.kube/config)
+export KUBECONFIG="${KUBECONFIG:-/tmp/k8sql-test-kubeconfig}"
+echo "Using KUBECONFIG: $KUBECONFIG"
+
+# Merge kubeconfigs to test-specific location
 echo "Merging kubeconfigs..."
-k3d kubeconfig merge "$CLUSTER1" "$CLUSTER2" --kubeconfig-merge-default
+k3d kubeconfig merge "$CLUSTER1" "$CLUSTER2" --kubeconfig-switch-context=false --output "$KUBECONFIG"
 
 # Wait for clusters to be ready
 echo "Waiting for cluster 1 to be ready..."
@@ -88,6 +92,18 @@ kubectl --context "k3d-$CLUSTER2" wait --for=condition=available deployment/test
     kubectl --context "k3d-$CLUSTER2" describe pods -n default -l app=nginx
     exit 1
 }
+
+# Bump deployment generation to test generation >= 0 queries
+# Kubernetes increments generation when spec changes
+echo "Bumping deployment generation for testing..."
+kubectl --context "k3d-$CLUSTER1" patch deployment test-app -n default \
+  --type='json' -p='[{"op": "replace", "path": "/spec/replicas", "value": 3}]'
+kubectl --context "k3d-$CLUSTER2" patch deployment test-app -n default \
+  --type='json' -p='[{"op": "replace", "path": "/spec/replicas", "value": 3}]'
+
+# Wait for the new replica to be ready
+kubectl --context "k3d-$CLUSTER1" wait --for=condition=available deployment/test-app -n default --timeout=60s
+kubectl --context "k3d-$CLUSTER2" wait --for=condition=available deployment/test-app -n default --timeout=60s
 
 echo ""
 echo "=== Test clusters ready ==="

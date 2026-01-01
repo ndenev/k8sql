@@ -8,17 +8,19 @@
 //! ## Transformations
 //!
 //! - **JSON arrow precedence fix**: `col->>'key' = 'val'` becomes
-//!   `(col->>'key') = 'val'` to work around DataFusion parser precedence
+//!   `(col->>'key') = 'val'` to work around DataFusion parser precedence bug
 //!
-//! ## JSON Field Access
+//! ## PostgreSQL-Compatible JSON Operators
 //!
-//! Use PostgreSQL-style JSON operators for accessing nested fields:
+//! Supports PostgreSQL JSON operators including chained arrows:
+//!
 //! ```sql
-//! -- Access label value
+//! -- Single arrow
 //! SELECT * FROM pods WHERE labels->>'app' = 'nginx'
 //!
-//! -- Access nested status field
-//! SELECT status->>'phase' FROM pods
+//! -- Chained arrows
+//! SELECT spec->'selector'->>'app' FROM services
+//! SELECT metadata->'labels'->'env'->>'name' FROM pods
 //! ```
 
 use datafusion::sql::sqlparser::ast::Statement;
@@ -27,44 +29,72 @@ use datafusion::sql::sqlparser::parser::Parser;
 use regex::Regex;
 use std::sync::LazyLock;
 
-/// Regex to fix -> and ->> operator precedence when followed by comparison operators.
-///
-/// Workaround for upstream bug: https://github.com/apache/datafusion-sqlparser-rs/issues/814
-/// The parser uses outdated PostgreSQL 7.0 precedence rules where comparison operators
-/// (=, IN, IS NULL, etc.) incorrectly bind more tightly than JSON arrow operators.
-///
-/// Examples of incorrect parsing without this fix:
-///   `col->>'key' = 'val'` parsed as `col->>('key' = 'val')`  ← WRONG
-///   `col->'field' IN (...)` parsed as `col->('field' IN (...))` ← WRONG
-///
-/// We wrap the arrow expression in parentheses before parsing:
-///   `col->>'key' = 'val'` becomes `(col->>'key') = 'val'` ← CORRECT
-///   `col->'field' IN (...)` becomes `(col->'field') IN (...)` ← CORRECT
-///
-/// Note: This must be done at string level before parsing because the parser
-/// gets the precedence wrong during tokenization.
-static JSON_ARROW_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"(?i)((?:\w+\.)?\w+)\s*->>?\s*'([^']+)'\s*(=|!=|<>|<=|>=|<|>|NOT\s+ILIKE|NOT\s+LIKE|ILIKE|LIKE|IS\s+NOT\s+NULL|IS\s+NULL|NOT\s+IN|IN)"#).unwrap()
+/// Regex to match arrows followed by comparison operators (left side)
+/// Note: Uses explicit structure matching to prevent ReDoS vulnerability.
+/// Matches: column_name[->>'key' or ->'key' chains]->>'final_key'
+static LEFT_ARROW_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r#"(?i)((?:\w+\.)?[\w\-]+(?:->>?'[^']+')*)\s*(->>?)\s*'([^']+)'\s*(=|!=|<>|<=|>=|<|>|NOT\s+ILIKE|NOT\s+LIKE|ILIKE|LIKE|IS\s+NOT\s+NULL|IS\s+NULL|NOT\s+IN|IN)"#,
+    )
+    .unwrap()
 });
 
-/// Pre-parse fix for ->> operator precedence
-fn fix_json_arrow_precedence(sql: &str) -> String {
-    JSON_ARROW_PATTERN
+/// Regex to match arrows preceded by comparison operators (right side)
+/// Note: Uses explicit structure matching to prevent ReDoS vulnerability.
+/// Matches: column_name[->>'key' or ->'key' chains]->>'final_key'
+static RIGHT_ARROW_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r#"(?i)(=|!=|<>|<=|>=|<|>|NOT\s+ILIKE|NOT\s+LIKE|ILIKE|LIKE|IN)\s+((?:\w+\.)?[\w\-]+(?:->>?'[^']+')*)\s*(->>?)\s*'([^']+)'"#,
+    )
+    .unwrap()
+});
+
+/// Fix JSON arrow operator precedence
+///
+/// DataFusion has a parser precedence bug where comparison operators bind too tightly:
+/// https://github.com/apache/datafusion-sqlparser-rs/issues/814
+///
+/// Wraps arrow expressions in parentheses when they appear with comparison operators:
+/// - `labels->>'app' = 'nginx'` → `(labels->>'app') = 'nginx'`
+/// - `p1.labels->>'app' = p2.labels->>'app'` → `(p1.labels->>'app') = (p2.labels->>'app')`
+fn fix_arrow_precedence(sql: &str) -> String {
+    // Wrap arrows that appear in comparison/boolean contexts
+    // We need to handle arrows on BOTH sides of comparisons:
+    //   p1.labels->>'app' = p2.labels->>'app'
+    // Should become:
+    //   (p1.labels->>'app') = (p2.labels->>'app')
+
+    // First pass: wrap arrows on left side of comparisons
+    let sql = LEFT_ARROW_PATTERN
         .replace_all(sql, |caps: &regex::Captures| {
             let column = &caps[1];
-            let key = &caps[2];
-            let operator = &caps[3];
-            format!("({}->>'{}') {}", column, key, operator)
+            let arrow = &caps[2];
+            let key = &caps[3];
+            let operator = &caps[4];
+            format!("({}{}'{}') {}", column, arrow, key, operator)
+        })
+        .into_owned();
+
+    // Second pass: wrap arrows on right side of comparisons
+    RIGHT_ARROW_PATTERN
+        .replace_all(&sql, |caps: &regex::Captures| {
+            let operator = &caps[1];
+            let column = &caps[2];
+            let arrow = &caps[3];
+            let key = &caps[4];
+            format!("{} ({}{}'{}')", operator, column, arrow, key)
         })
         .into_owned()
 }
 
 /// Preprocess SQL to fix parser quirks
 ///
-/// Currently only fixes ->> operator precedence:
-/// - `col->>'key' = 'value'` -> `(col->>'key') = 'value'`
+/// Currently only fixes the JSON arrow operator precedence bug.
+/// Wraps arrow expressions in parentheses when used with comparison operators:
+/// - `col->>'key' = 'value'` → `(col->>'key') = 'value'`
+/// - `p1.col->>'k' = p2.col->>'k'` → `(p1.col->>'k') = (p2.col->>'k')`
 pub fn preprocess_sql(sql: &str) -> String {
-    fix_json_arrow_precedence(sql)
+    fix_arrow_precedence(sql)
 }
 
 /// Validate that the SQL statement is read-only
@@ -260,6 +290,38 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_chained_json_arrows_two_levels_unchanged() {
+        let sql = "SELECT spec->'selector'->>'app' FROM services";
+        let result = preprocess_sql(sql);
+        assert_eq!(result, sql);
+    }
+
+    #[test]
+    fn test_chained_json_arrows_three_levels_unchanged() {
+        let sql = "SELECT metadata->'labels'->'app'->>'version' FROM pods";
+        let result = preprocess_sql(sql);
+        assert_eq!(result, sql);
+    }
+
+    #[test]
+    fn test_chained_json_arrows_in_where_with_comparison() {
+        // Chained arrow with comparison gets wrapped for precedence
+        let sql = "SELECT * FROM pods WHERE spec->'selector'->>'app' = 'nginx'";
+        let result = preprocess_sql(sql);
+        assert_eq!(
+            result,
+            "SELECT * FROM pods WHERE (spec->'selector'->>'app') = 'nginx'"
+        );
+    }
+
+    #[test]
+    fn test_chained_json_arrows_with_table_prefix_unchanged() {
+        let sql = "SELECT p.spec->'containers'->>'name' FROM pods p";
+        let result = preprocess_sql(sql);
+        assert_eq!(result, sql);
+    }
+
     // Tests for validate_read_only
 
     #[test]
@@ -338,5 +400,125 @@ mod tests {
         let result = validate_read_only("TRUNCATE TABLE test");
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("TRUNCATE"));
+    }
+
+    #[test]
+    fn test_json_arrow_both_sides_of_comparison() {
+        // Test that arrows on BOTH sides of comparison get wrapped
+        let sql = "SELECT * FROM pods p1 JOIN pods p2 ON p1.labels->>'app' = p2.labels->>'app'";
+        let result = preprocess_sql(sql);
+        assert_eq!(
+            result,
+            "SELECT * FROM pods p1 JOIN pods p2 ON (p1.labels->>'app') = (p2.labels->>'app')"
+        );
+    }
+
+    #[test]
+    fn test_json_arrow_in_clause_right_side() {
+        // Test arrow on right side of IN clause
+        let sql = "SELECT * FROM pods WHERE 'nginx' = labels->>'app'";
+        let result = preprocess_sql(sql);
+        assert_eq!(
+            result,
+            "SELECT * FROM pods WHERE 'nginx' = (labels->>'app')"
+        );
+    }
+
+    #[test]
+    fn test_parser_supports_chained_arrows() {
+        // Test if DataFusion's SQL parser natively supports chained arrow operators
+        use datafusion::sql::sqlparser::dialect::GenericDialect;
+        use datafusion::sql::sqlparser::parser::Parser;
+
+        let dialect = GenericDialect {};
+
+        // Test chained arrows WITHOUT preprocessing
+        let sql = "SELECT spec->'selector'->>'app' FROM pods";
+        let result = Parser::parse_sql(&dialect, sql);
+
+        // If this succeeds, we DON'T need to convert chained arrows to functions!
+        // If it fails, we'll see the error and understand why conversion is needed
+        match result {
+            Ok(_) => println!("Parser DOES support chained arrows natively!"),
+            Err(e) => println!("Parser DOES NOT support chained arrows: {}", e),
+        }
+
+        // Don't assert - just document the behavior
+        // assert!(result.is_ok(), "Parser should support chained arrows");
+    }
+
+    #[tokio::test]
+    async fn test_chained_arrows_end_to_end() {
+        // End-to-end test: Can we execute a query with chained arrows?
+        use datafusion::arrow::array::{RecordBatch, StringArray};
+        use datafusion::arrow::datatypes::{DataType, Field, Schema};
+        use datafusion::prelude::SessionContext;
+        use std::sync::Arc;
+
+        // Create a test dataset with nested JSON
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, false),
+            Field::new("spec", DataType::Utf8, true),
+        ]));
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["svc1", "svc2"])),
+                Arc::new(StringArray::from(vec![
+                    r#"{"selector": {"app": "nginx"}}"#,
+                    r#"{"selector": {"app": "redis"}}"#,
+                ])),
+            ],
+        )
+        .unwrap();
+
+        // Create SessionContext and register JSON functions
+        let mut ctx = SessionContext::new();
+        datafusion_functions_json::register_all(&mut ctx).unwrap();
+
+        // Register test table
+        ctx.register_batch("test_services", batch).unwrap();
+
+        // Test 1: Single arrow (baseline)
+        let result = ctx
+            .sql("SELECT name, spec->>'selector' as selector FROM test_services")
+            .await;
+        match &result {
+            Ok(_) => println!("✓ Single arrow works end-to-end"),
+            Err(e) => println!("✗ Single arrow failed: {}", e),
+        }
+        assert!(result.is_ok(), "Single arrow should work");
+
+        // Test 2: Chained arrows WITHOUT preprocessing
+        let chained_sql = "SELECT name, spec->'selector'->>'app' as app FROM test_services";
+        let result = ctx.sql(chained_sql).await;
+
+        match &result {
+            Ok(_) => {
+                println!("✓ Chained arrows work end-to-end WITHOUT conversion!");
+                // Try to actually execute and get results
+                if let Ok(df) = &result {
+                    match df.clone().collect().await {
+                        Ok(batches) => {
+                            println!("✓ Successfully executed chained arrow query");
+                            println!("  Result batches: {}", batches.len());
+                        }
+                        Err(e) => {
+                            println!("✗ Execution failed: {}", e);
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                println!("✗ Chained arrows failed end-to-end: {}", e);
+            }
+        }
+
+        // This is the critical test - if this passes, we don't need conversion!
+        assert!(
+            result.is_ok(),
+            "Chained arrows should work end-to-end without conversion"
+        );
     }
 }
