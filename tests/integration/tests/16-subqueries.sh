@@ -243,32 +243,34 @@ assert_success "Subquery with multiple WHERE" "k3d-k8sql-test-1" \
      AND labels->>'app' IS NOT NULL
      LIMIT 10"
 
-# ANY/ALL operators (if supported)
+# ANY/ALL operators - DataFusion doesn't support ANY/ALL, using IN/NOT IN equivalents
+# See: https://github.com/apache/arrow-datafusion/issues/2547
+# See: https://github.com/apache/arrow-datafusion/issues/2548
 echo ""
-echo "--- ANY and ALL Operators ---"
+echo "--- ANY and ALL Operators (as IN/NOT IN) ---"
 
 # = ANY (equivalent to IN)
-assert_success "= ANY operator" "k3d-k8sql-test-1" \
+assert_success "= ANY operator (as IN)" "k3d-k8sql-test-1" \
     "SELECT name FROM pods
-     WHERE namespace = ANY(SELECT name FROM namespaces WHERE name LIKE 'kube%')
+     WHERE namespace IN (SELECT name FROM namespaces WHERE name LIKE 'kube%')
      LIMIT 10"
 
 # != ALL (equivalent to NOT IN)
-assert_success "!= ALL operator" "k3d-k8sql-test-1" \
+assert_success "!= ALL operator (as NOT IN)" "k3d-k8sql-test-1" \
     "SELECT name FROM namespaces
-     WHERE name != ALL(SELECT DISTINCT namespace FROM pods WHERE namespace LIKE 'kube%')
+     WHERE name NOT IN (SELECT DISTINCT namespace FROM pods WHERE namespace LIKE 'kube%')
      LIMIT 5"
 
-# > ANY
-assert_success "> ANY operator" "k3d-k8sql-test-1" \
+# > ANY - x > ANY(subquery) means x > MIN(subquery)
+assert_success "> ANY operator (as > MIN)" "k3d-k8sql-test-1" \
     "SELECT name, generation FROM pods
-     WHERE generation > ANY(SELECT generation FROM pods WHERE namespace = 'default')
+     WHERE generation > (SELECT MIN(generation) FROM pods WHERE namespace = 'default' AND generation IS NOT NULL)
      LIMIT 5"
 
-# < ALL
-assert_success "< ALL operator" "k3d-k8sql-test-1" \
+# < ALL - x < ALL(subquery) means x < MIN(subquery)  
+assert_success "< ALL operator (as < MIN)" "k3d-k8sql-test-1" \
     "SELECT name, generation FROM pods
-     WHERE generation < ALL(SELECT MAX(generation) FROM pods GROUP BY namespace)
+     WHERE generation < (SELECT MIN(max_gen) FROM (SELECT MAX(generation) as max_gen FROM pods WHERE generation IS NOT NULL GROUP BY namespace))
      LIMIT 5"
 
 # Common Table Expressions (CTEs)

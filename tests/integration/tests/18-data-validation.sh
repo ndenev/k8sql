@@ -139,13 +139,13 @@ assert_success "SUM validation" "k3d-k8sql-test-1" \
 
 # Verify AVG is between MIN and MAX
 assert_success "AVG between MIN and MAX" "k3d-k8sql-test-1" \
-    "SELECT 
+    "SELECT
         MIN(generation) as min_gen,
         AVG(generation) as avg_gen,
         MAX(generation) as max_gen
      FROM pods
      WHERE generation IS NOT NULL
-       AND AVG(generation) >= MIN(generation)
+     HAVING AVG(generation) >= MIN(generation)
        AND AVG(generation) <= MAX(generation)"
 
 # Verify MIN <= MAX
@@ -244,9 +244,9 @@ echo "--- DISTINCT Validation ---"
 # Verify DISTINCT removes duplicates
 assert_success "DISTINCT removes duplicates" "k3d-k8sql-test-1" \
     "SELECT COUNT(*) as with_dupes,
-            (SELECT COUNT(DISTINCT namespace) FROM pods) as without_dupes
+            COUNT(DISTINCT namespace) as without_dupes
      FROM pods
-     WHERE (SELECT COUNT(DISTINCT namespace) FROM pods) <= COUNT(*)"
+     HAVING COUNT(DISTINCT namespace) <= COUNT(*)"
 
 # Verify DISTINCT with multiple columns
 assert_success "DISTINCT multiple columns" "k3d-k8sql-test-1" \
@@ -373,9 +373,12 @@ assert_success "RANK tie handling" "k3d-k8sql-test-1" \
 
 # Verify PARTITION BY creates separate windows
 assert_success "PARTITION BY creates separate windows" "k3d-k8sql-test-1" \
-    "SELECT namespace,
-            ROW_NUMBER() OVER (PARTITION BY namespace ORDER BY created) as rn
-     FROM pods
+    "SELECT namespace, rn
+     FROM (
+       SELECT namespace,
+              ROW_NUMBER() OVER (PARTITION BY namespace ORDER BY created) as rn
+       FROM pods
+     ) subq
      WHERE rn >= 1
      LIMIT 10"
 
@@ -572,7 +575,8 @@ fi
 RESULT=$(run_query "k3d-k8sql-test-1" "SELECT MIN(generation) as min_gen, MAX(generation) as max_gen FROM pods WHERE generation IS NOT NULL")
 MIN_GEN=$(echo "$RESULT" | jq -r '.[0].min_gen' 2>/dev/null)
 MAX_GEN=$(echo "$RESULT" | jq -r '.[0].max_gen' 2>/dev/null)
-if [ "$MIN_GEN" != "null" ] && [ "$MAX_GEN" != "null" ] && [ "$MIN_GEN" -le "$MAX_GEN" ]; then
+# Check for valid numeric values before comparison
+if [ -n "$MIN_GEN" ] && [ "$MIN_GEN" != "null" ] && [ -n "$MAX_GEN" ] && [ "$MAX_GEN" != "null" ] && [ "$MIN_GEN" -le "$MAX_GEN" ]; then
     echo -e "${GREEN}✓${NC} MIN(generation)=$MIN_GEN <= MAX(generation)=$MAX_GEN"
     PASS=$((PASS + 1))
 else

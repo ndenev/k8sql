@@ -93,6 +93,18 @@ kubectl --context "k3d-$CLUSTER2" wait --for=condition=available deployment/test
     exit 1
 }
 
+# Bump deployment generation to test generation >= 0 queries
+# Kubernetes increments generation when spec changes
+echo "Bumping deployment generation for testing..."
+kubectl --context "k3d-$CLUSTER1" patch deployment test-app -n default \
+  --type='json' -p='[{"op": "replace", "path": "/spec/replicas", "value": 3}]'
+kubectl --context "k3d-$CLUSTER2" patch deployment test-app -n default \
+  --type='json' -p='[{"op": "replace", "path": "/spec/replicas", "value": 3}]'
+
+# Wait for the new replica to be ready
+kubectl --context "k3d-$CLUSTER1" wait --for=condition=available deployment/test-app -n default --timeout=60s
+kubectl --context "k3d-$CLUSTER2" wait --for=condition=available deployment/test-app -n default --timeout=60s
+
 echo ""
 echo "=== Test clusters ready ==="
 echo "Cluster 1: k3d-$CLUSTER1"

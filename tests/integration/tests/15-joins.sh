@@ -25,12 +25,14 @@ assert_success "INNER JOIN with WHERE" "k3d-k8sql-test-1" \
      LIMIT 5"
 
 # Join on label match (pods to services via selector)
+# Note: service selector is a JSON object, need to extract the 'app' field
 assert_success "JOIN on label selector" "k3d-k8sql-test-1" \
     "SELECT p.name as pod, s.name as service
      FROM pods p
      INNER JOIN services s ON p.namespace = s.namespace
-       AND p.labels->>'app' = s.spec->>'selector'
+       AND p.labels->>'app' = s.spec->'selector'->>'app'
      WHERE p.namespace = 'default'
+       AND p.labels->>'app' IS NOT NULL
      LIMIT 5"
 
 # Multiple column join
@@ -40,6 +42,8 @@ assert_success "JOIN on multiple columns" "k3d-k8sql-test-1" \
      INNER JOIN pods p2 ON p1.namespace = p2.namespace
        AND p1.labels->>'app' = p2.labels->>'app'
      WHERE p1.name != p2.name
+       AND p1.labels->>'app' IS NOT NULL
+       AND p2.labels->>'app' IS NOT NULL
      LIMIT 5"
 
 # LEFT JOIN
