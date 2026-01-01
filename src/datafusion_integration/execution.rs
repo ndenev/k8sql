@@ -28,7 +28,7 @@
 use std::any::Any;
 use std::fmt;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
 use async_stream::try_stream;
@@ -93,6 +93,10 @@ pub struct K8sExecutionPlan {
     metrics: ExecutionPlanMetricsSet,
     /// Cached column definitions (passed to conversion, avoids regenerating)
     columns: Arc<Vec<ColumnDef>>,
+    /// Wall-clock timer for tracking actual query duration across all partitions
+    /// Starts when first partition executes, tracks overall time
+    /// Uses OnceLock for zero-overhead reads after initialization (no locking)
+    wall_clock_start: Arc<OnceLock<Instant>>,
 }
 
 impl K8sExecutionPlan {
@@ -127,6 +131,7 @@ impl K8sExecutionPlan {
             fetch_limit,
             metrics: ExecutionPlanMetricsSet::new(),
             columns,
+            wall_clock_start: Arc::new(OnceLock::new()),
         }
     }
 }
@@ -144,9 +149,8 @@ impl fmt::Debug for K8sExecutionPlan {
 impl DisplayAs for K8sExecutionPlan {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match t {
-            DisplayFormatType::Default
-            | DisplayFormatType::Verbose
-            | DisplayFormatType::TreeRender => {
+            DisplayFormatType::Default => {
+                // Concise: just table name and partition count
                 write!(
                     f,
                     "K8sExec: table={}, partitions={}",
@@ -156,6 +160,32 @@ impl DisplayAs for K8sExecutionPlan {
                 if let Some(limit) = self.fetch_limit {
                     write!(f, ", fetch={}", limit)?;
                 }
+                Ok(())
+            }
+            DisplayFormatType::Verbose | DisplayFormatType::TreeRender => {
+                // Verbose: show per-partition cluster mapping
+                writeln!(
+                    f,
+                    "K8sExec: table={}, partitions={}",
+                    self.table_name,
+                    self.targets.len()
+                )?;
+                if let Some(limit) = self.fetch_limit {
+                    writeln!(f, "  fetch={}", limit)?;
+                }
+
+                // Show which cluster each partition targets
+                for (i, target) in self.targets.iter().enumerate() {
+                    write!(f, "  partition[{}]: cluster={}", i, target.cluster)?;
+                    if let Some(ref ns) = target.namespace {
+                        write!(f, ", namespace={}", ns)?;
+                    }
+                    // Don't add newline after last partition - DataFusion appends metrics on same line
+                    if i < self.targets.len() - 1 {
+                        writeln!(f)?;
+                    }
+                }
+
                 Ok(())
             }
         }
@@ -199,6 +229,17 @@ impl ExecutionPlan for K8sExecutionPlan {
     }
 
     fn metrics(&self) -> Option<MetricsSet> {
+        // Add wall-clock time if query has started
+        // OnceLock provides zero-overhead reads (no locking after initialization)
+        if let Some(start) = self.wall_clock_start.get() {
+            let elapsed_ms = start.elapsed().as_millis() as usize;
+            // wall_clock_time (gauge, ms): Actual query duration from first partition start
+            // This differs from total_fetch_time (which sums parallel work) and represents
+            // the user-visible query execution time for parallel multi-cluster queries.
+            let wall_clock = MetricBuilder::new(&self.metrics).gauge("wall_clock_time", 0);
+            wall_clock.set(elapsed_ms);
+        }
+
         Some(self.metrics.clone_inner())
     }
 
@@ -239,6 +280,10 @@ impl ExecutionPlan for K8sExecutionPlan {
             )));
         }
 
+        // Start wall-clock timer on first partition execution
+        // OnceLock::get_or_init ensures only the first partition sets the timer
+        self.wall_clock_start.get_or_init(Instant::now);
+
         // Get the target for this partition
         let target = self.targets[partition].clone();
         let table_name = self.table_name.clone();
@@ -249,9 +294,18 @@ impl ExecutionPlan for K8sExecutionPlan {
         let columns = self.columns.clone();
 
         // Set up metrics for this partition
-        let rows_fetched = MetricBuilder::new(&self.metrics).counter("rows_fetched", partition);
-        let pages_fetched = MetricBuilder::new(&self.metrics).counter("pages_fetched", partition);
-        let fetch_time = MetricBuilder::new(&self.metrics).subset_time("fetch_time", partition);
+        // Counters (aggregate via sum):
+        let rows_fetched = MetricBuilder::new(&self.metrics).counter("rows_fetched", partition); // count: K8s resources returned
+        let pages_fetched = MetricBuilder::new(&self.metrics).counter("pages_fetched", partition); // count: K8s API calls (LIST operations)
+        let output_bytes = MetricBuilder::new(&self.metrics).counter("output_bytes", partition); // bytes: Arrow RecordBatch memory size
+
+        // Time metrics in milliseconds (aggregate via sum):
+        let fetch_time =
+            MetricBuilder::new(&self.metrics).subset_time("total_fetch_time", partition); // ms: total K8s API fetch time (summed across partitions)
+        let conversion_time =
+            MetricBuilder::new(&self.metrics).subset_time("conversion_time", partition); // ms: JSON to Arrow conversion time
+        let first_page_time =
+            MetricBuilder::new(&self.metrics).subset_time("first_page_time", partition); // ms: time to first page (TTFB)
 
         debug!(
             table = %table_name,
@@ -274,6 +328,9 @@ impl ExecutionPlan for K8sExecutionPlan {
             rows_fetched,
             pages_fetched,
             fetch_time,
+            output_bytes,
+            conversion_time,
+            first_page_time,
         );
 
         Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
@@ -293,6 +350,9 @@ fn create_streaming_execution(
     rows_fetched: datafusion::physical_plan::metrics::Count,
     pages_fetched: datafusion::physical_plan::metrics::Count,
     fetch_time: datafusion::physical_plan::metrics::Time,
+    output_bytes: datafusion::physical_plan::metrics::Count,
+    conversion_time: datafusion::physical_plan::metrics::Time,
+    first_page_time: datafusion::physical_plan::metrics::Time,
 ) -> Pin<Box<dyn Stream<Item = Result<RecordBatch>> + Send>> {
     let stream = try_stream! {
         let start = Instant::now();
@@ -308,10 +368,18 @@ fn create_streaming_execution(
 
         use futures::StreamExt;
         let mut total_rows = 0usize;
+        let mut first_page_received = false;
+        let first_page_timer = Instant::now();
 
         while let Some(page_result) = page_stream.next().await {
             match page_result {
                 Ok(items) => {
+                    // Track time to first page
+                    if !first_page_received {
+                        first_page_time.add_duration(first_page_timer.elapsed());
+                        first_page_received = true;
+                    }
+
                     let page_row_count = items.len();
                     total_rows += page_row_count;
 
@@ -330,7 +398,14 @@ fn create_streaming_execution(
 
                     // Convert page to RecordBatch and yield
                     if !items.is_empty() {
+                        let convert_start = Instant::now();
                         let batch = json_to_record_batch(&target.cluster, &columns, items)?;
+
+                        // Track conversion time and output bytes
+                        conversion_time.add_duration(convert_start.elapsed());
+                        let batch_bytes = batch.get_array_memory_size();
+                        output_bytes.add(batch_bytes);
+
                         yield batch;
                     }
                 }
@@ -386,4 +461,64 @@ fn create_streaming_execution(
     };
 
     Box::pin(stream)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_query_target_creation() {
+        let target = QueryTarget {
+            cluster: "test-cluster".to_string(),
+            namespace: Some("default".to_string()),
+        };
+
+        assert_eq!(target.cluster, "test-cluster");
+        assert_eq!(target.namespace, Some("default".to_string()));
+    }
+
+    #[test]
+    fn test_query_target_cluster_wide() {
+        let target = QueryTarget {
+            cluster: "test-cluster".to_string(),
+            namespace: None,
+        };
+
+        assert_eq!(target.cluster, "test-cluster");
+        assert!(target.namespace.is_none());
+    }
+
+    #[test]
+    fn test_is_not_found_error_with_404() {
+        let api_err = kube::Error::Api(kube::error::ErrorResponse {
+            status: "Failure".to_string(),
+            message: "namespaces \"missing\" not found".to_string(),
+            reason: "NotFound".to_string(),
+            code: 404,
+        });
+        let err = anyhow::Error::new(api_err);
+
+        assert!(is_not_found_error(&err));
+    }
+
+    #[test]
+    fn test_is_not_found_error_with_other_code() {
+        let api_err = kube::Error::Api(kube::error::ErrorResponse {
+            status: "Failure".to_string(),
+            message: "Forbidden".to_string(),
+            reason: "Forbidden".to_string(),
+            code: 403,
+        });
+        let err = anyhow::Error::new(api_err);
+
+        assert!(!is_not_found_error(&err));
+    }
+
+    #[test]
+    fn test_is_not_found_error_with_non_api_error() {
+        let err = anyhow::anyhow!("Some other error");
+
+        assert!(!is_not_found_error(&err));
+    }
 }
