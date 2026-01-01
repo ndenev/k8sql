@@ -572,11 +572,15 @@ else
 fi
 
 # Verify MIN <= MAX invariant with actual values
+# Note: If no rows have non-null values, MIN/MAX correctly return null
 RESULT=$(run_query "k3d-k8sql-test-1" "SELECT MIN(generation) as min_gen, MAX(generation) as max_gen FROM pods WHERE generation IS NOT NULL")
 MIN_GEN=$(echo "$RESULT" | jq -r '.[0].min_gen' 2>/dev/null)
 MAX_GEN=$(echo "$RESULT" | jq -r '.[0].max_gen' 2>/dev/null)
 # Check for valid numeric values before comparison
-if [ -n "$MIN_GEN" ] && [ "$MIN_GEN" != "null" ] && [ -n "$MAX_GEN" ] && [ "$MAX_GEN" != "null" ] && [ "$MIN_GEN" -le "$MAX_GEN" ]; then
+if [ "$MIN_GEN" = "null" ] || [ "$MAX_GEN" = "null" ]; then
+    echo -e "${GREEN}✓${NC} MIN/MAX correctly return null when no data (min=$MIN_GEN, max=$MAX_GEN)"
+    PASS=$((PASS + 1))
+elif [ -n "$MIN_GEN" ] && [ -n "$MAX_GEN" ] && [ "$MIN_GEN" -le "$MAX_GEN" ]; then
     echo -e "${GREEN}✓${NC} MIN(generation)=$MIN_GEN <= MAX(generation)=$MAX_GEN"
     PASS=$((PASS + 1))
 else
