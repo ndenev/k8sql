@@ -121,6 +121,21 @@ impl K8sExecutionPlan {
             columns,
         }
     }
+
+    /// Create a clone with a new fetch limit for LIMIT pushdown
+    fn with_new_fetch(&self, fetch: Option<usize>) -> Self {
+        Self {
+            table_name: self.table_name.clone(),
+            targets: self.targets.clone(),
+            api_filters: self.api_filters.clone(),
+            pool: self.pool.clone(),
+            schema: self.schema.clone(),
+            plan_properties: self.plan_properties.clone(),
+            fetch_limit: fetch,
+            metrics: self.metrics.clone(),
+            columns: self.columns.clone(),
+        }
+    }
 }
 
 impl fmt::Debug for K8sExecutionPlan {
@@ -195,19 +210,29 @@ impl ExecutionPlan for K8sExecutionPlan {
     }
 
     fn supports_limit_pushdown(&self) -> bool {
-        // DISABLED: LIMIT pushdown breaks OFFSET queries
-        // DataFusion's with_fetch() doesn't distinguish between:
-        //   - LIMIT N (fetch=N)
-        //   - LIMIT N OFFSET M (fetch=N+M)
-        // When there's an OFFSET, DataFusion passes skip+fetch to with_fetch(),
-        // which causes us to fetch too many rows and breaks OFFSET semantics.
-        false
+        // Enable LIMIT pushdown for single-partition queries only
+        // Multi-partition queries skip pushdown to maintain ORDER BY correctness
+        true
     }
 
-    fn with_fetch(&self, _fetch: Option<usize>) -> Option<Arc<dyn ExecutionPlan>> {
-        // LIMIT pushdown is disabled (see supports_limit_pushdown above)
-        // Let DataFusion's LimitExec handle LIMIT/OFFSET correctly
-        None
+    fn with_fetch(&self, fetch: Option<usize>) -> Option<Arc<dyn ExecutionPlan>> {
+        // DEBUG: Log when with_fetch is called to understand DataFusion's behavior
+        eprintln!(
+            "DEBUG with_fetch: called with fetch={:?}, partitions={}",
+            fetch,
+            self.targets.len()
+        );
+
+        // Only push LIMIT to K8s API for single-partition queries
+        // Multi-partition queries (multiple clusters/namespaces) can't safely
+        // push LIMIT because ORDER BY needs to see all data across partitions
+        if self.targets.len() > 1 {
+            eprintln!("DEBUG with_fetch: skipping (multi-partition)");
+            None
+        } else {
+            eprintln!("DEBUG with_fetch: pushing limit to K8s API");
+            Some(Arc::new(self.with_new_fetch(fetch)))
+        }
     }
 
     fn fetch(&self) -> Option<usize> {
