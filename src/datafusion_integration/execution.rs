@@ -7,29 +7,15 @@
 //! allowing DataFusion to control parallelism and enabling streaming execution.
 //! Results are streamed as pages arrive from the K8s API for optimal memory usage.
 //!
-//! # LIMIT Pushdown Behavior
+//! # LIMIT Pushdown
 //!
-//! LIMIT pushdown to the Kubernetes API is only enabled for single-partition queries
-//! (single cluster/namespace). This ensures correctness when combined with ORDER BY.
+//! LIMIT pushdown to the Kubernetes API is **disabled** due to a DataFusion API limitation.
+//! DataFusion's `with_fetch()` method receives a combined `skip + fetch` value when there's
+//! an OFFSET clause, making it impossible to distinguish between:
+//! - `LIMIT 10` (should fetch 10 rows)
+//! - `LIMIT 10 OFFSET 10` (DataFusion passes fetch=20, breaking OFFSET semantics)
 //!
-//! ## Single Partition (Optimized)
-//! - `SELECT * FROM pods WHERE namespace = 'default' LIMIT 10`
-//! - LIMIT is pushed to K8s API (fetches only 10 items)
-//! - 50x reduction in network transfer for small limits
-//!
-//! ## Multiple Partitions (Correctness-First)
-//! - `SELECT * FROM pods WHERE _cluster = '*' LIMIT 10` (3 clusters)
-//! - LIMIT is NOT pushed to K8s API
-//! - All rows fetched from all clusters
-//! - DataFusion's LimitExec enforces the final LIMIT correctly
-//!
-//! **Why?** Pushing LIMIT to each partition breaks ORDER BY semantics:
-//! - `SELECT * FROM pods ORDER BY created DESC LIMIT 10` across 3 clusters
-//! - If we fetch 10 per cluster, the correct top 10 might all be in one cluster
-//! - We'd miss rows that should be in the result
-//!
-//! Priority #1 is correctness. Single-partition queries get the optimization,
-//! multi-partition queries maintain correct semantics.
+//! All LIMIT/OFFSET handling is performed by DataFusion's LimitExec to ensure correctness.
 
 use std::any::Any;
 use std::fmt;
@@ -135,24 +121,6 @@ impl K8sExecutionPlan {
             columns,
         }
     }
-
-    /// Create a clone with a new fetch limit
-    ///
-    /// Note: Metrics are cloned (shared via internal Arc) so EXPLAIN ANALYZE
-    /// captures execution stats from any plan variant the optimizer chooses.
-    fn with_new_fetch(&self, fetch: Option<usize>) -> Self {
-        Self {
-            table_name: self.table_name.clone(),
-            targets: self.targets.clone(),
-            api_filters: self.api_filters.clone(),
-            pool: self.pool.clone(),
-            schema: self.schema.clone(),
-            plan_properties: self.plan_properties.clone(),
-            fetch_limit: fetch,
-            metrics: self.metrics.clone(),
-            columns: self.columns.clone(),
-        }
-    }
 }
 
 impl fmt::Debug for K8sExecutionPlan {
@@ -227,22 +195,19 @@ impl ExecutionPlan for K8sExecutionPlan {
     }
 
     fn supports_limit_pushdown(&self) -> bool {
-        true
+        // DISABLED: LIMIT pushdown breaks OFFSET queries
+        // DataFusion's with_fetch() doesn't distinguish between:
+        //   - LIMIT N (fetch=N)
+        //   - LIMIT N OFFSET M (fetch=N+M)
+        // When there's an OFFSET, DataFusion passes skip+fetch to with_fetch(),
+        // which causes us to fetch too many rows and breaks OFFSET semantics.
+        false
     }
 
-    fn with_fetch(&self, fetch: Option<usize>) -> Option<Arc<dyn ExecutionPlan>> {
-        // Only push LIMIT to K8s API for single-partition queries.
-        // For multi-partition queries (multiple clusters/namespaces), pushing LIMIT
-        // to each partition breaks ORDER BY semantics - we'd fetch N rows per partition
-        // but the correct top N might all be in one partition.
-        // DataFusion's LimitExec above us will handle the final limit correctly.
-        if self.targets.len() > 1 {
-            // Multi-partition: don't push limit, let DataFusion handle it
-            None
-        } else {
-            // Single partition: safe to push limit to K8s API
-            Some(Arc::new(self.with_new_fetch(fetch)))
-        }
+    fn with_fetch(&self, _fetch: Option<usize>) -> Option<Arc<dyn ExecutionPlan>> {
+        // LIMIT pushdown is disabled (see supports_limit_pushdown above)
+        // Let DataFusion's LimitExec handle LIMIT/OFFSET correctly
+        None
     }
 
     fn fetch(&self) -> Option<usize> {
