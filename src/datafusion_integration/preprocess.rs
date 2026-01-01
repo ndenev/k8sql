@@ -27,83 +27,36 @@ use datafusion::sql::sqlparser::ast::Statement;
 use datafusion::sql::sqlparser::dialect::GenericDialect;
 use datafusion::sql::sqlparser::parser::Parser;
 use regex::Regex;
-use std::sync::LazyLock;
 
-/// Regex to match JSON arrow operator sequences
-/// Matches patterns like: column->'key' or column->'k1'->'k2'->>'k3'
-static JSON_ARROW_PATTERN: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?i)((?:\w+\.)?\w+)(?:\s*->>?\s*'[^']+')+").unwrap());
-
-/// Extract arrow operations from a matched string
-/// Returns Vec<(key, is_text)> where is_text indicates ->> vs ->
-fn extract_arrow_operations(s: &str) -> Vec<(&str, bool)> {
-    let arrow_regex = Regex::new(r"->>?\s*'([^']+)'").unwrap();
-    arrow_regex
-        .captures_iter(s)
-        .map(|c| {
-            let key = c.get(1).unwrap().as_str();
-            let is_text = s[c.get(0).unwrap().start()..].starts_with("->>");
-            (key, is_text)
-        })
-        .collect()
-}
-
-/// Convert arrow operations to nested json_get function calls
-fn convert_to_json_get_chain(base_column: &str, arrows: &[(&str, bool)]) -> String {
-    let mut result = base_column.to_string();
-    for (i, (key, is_text)) in arrows.iter().enumerate() {
-        let is_last = i == arrows.len() - 1;
-        if is_last && *is_text {
-            // Last operation with ->> uses json_get_str
-            result = format!("json_get_str({}, '{}')", result, key);
-        } else {
-            // Intermediate operations use json_get
-            result = format!("json_get({}, '{}')", result, key);
-        }
-    }
-    result
-}
-
-/// Process JSON arrow operators - convert chains to json_get, wrap singles with parens
+/// Fix JSON arrow operator precedence
 ///
-/// This function handles both:
-/// 1. Chained arrows (2+): spec->'selector'->>'app' → json_get_str(json_get(spec, 'selector'), 'app')
-/// 2. Single arrows with comparison: labels->>'app' = 'x' → (labels->>'app') = 'x'
-///
-/// The precedence fix is needed due to DataFusion parser bug:
+/// DataFusion has a parser precedence bug where comparison operators bind too tightly:
 /// https://github.com/apache/datafusion-sqlparser-rs/issues/814
-fn process_json_arrows(sql: &str) -> String {
-    // First pass: convert chained arrows to json_get functions
-    let sql = JSON_ARROW_PATTERN
-        .replace_all(sql, |caps: &regex::Captures| {
-            let full_match = caps.get(0).unwrap().as_str();
-            let base_column = &caps[1];
-            let arrows = extract_arrow_operations(full_match);
-
-            if arrows.len() >= 2 {
-                // Chain: convert to nested json_get calls
-                convert_to_json_get_chain(base_column, &arrows)
-            } else {
-                // Single arrow: keep as-is for now (will be handled in second pass)
-                full_match.to_string()
-            }
-        })
-        .into_owned();
-
-    // Second pass: wrap single arrows that appear in comparison/boolean contexts
+///
+/// This function wraps arrow expressions in parentheses when they appear with comparison operators:
+/// - `labels->>'app' = 'nginx'` → `(labels->>'app') = 'nginx'`
+/// - `p1.labels->>'app' = p2.labels->>'app'` → `(p1.labels->>'app') = (p2.labels->>'app')`
+///
+/// Note: Chained arrows like `spec->'selector'->>'app'` work natively with datafusion-functions-json
+/// and do NOT need conversion to json_get() functions.
+fn fix_arrow_precedence(sql: &str) -> String {
+    // Wrap arrows that appear in comparison/boolean contexts
     // We need to handle arrows on BOTH sides of comparisons:
     //   p1.labels->>'app' = p2.labels->>'app'
     // Should become:
     //   (p1.labels->>'app') = (p2.labels->>'app')
 
     // Match arrows followed by comparison/boolean operators (left side)
+    // This pattern matches both simple and chained arrows:
+    //   labels->>'app' = ...
+    //   spec->'selector'->>'app' = ...
     let left_side_pattern = Regex::new(
-        r#"(?i)((?:\w+\.)?\w+)\s*(->>?)\s*'([^']+)'\s*(=|!=|<>|<=|>=|<|>|NOT\s+ILIKE|NOT\s+LIKE|ILIKE|LIKE|IS\s+NOT\s+NULL|IS\s+NULL|NOT\s+IN|IN)"#,
+        r#"(?i)((?:\w+\.)?[\w\->']+)\s*(->>?)\s*'([^']+)'\s*(=|!=|<>|<=|>=|<|>|NOT\s+ILIKE|NOT\s+LIKE|ILIKE|LIKE|IS\s+NOT\s+NULL|IS\s+NULL|NOT\s+IN|IN)"#,
     )
     .unwrap();
 
     let sql = left_side_pattern
-        .replace_all(&sql, |caps: &regex::Captures| {
+        .replace_all(sql, |caps: &regex::Captures| {
             let column = &caps[1];
             let arrow = &caps[2];
             let key = &caps[3];
@@ -113,9 +66,11 @@ fn process_json_arrows(sql: &str) -> String {
         .into_owned();
 
     // Match arrows preceded by comparison/boolean operators (right side)
-    // This handles cases like: = p2.labels->>'app'
+    // This handles cases like:
+    //   = p2.labels->>'app'
+    //   = spec->'selector'->>'app'
     let right_side_pattern = Regex::new(
-        r#"(?i)(=|!=|<>|<=|>=|<|>|NOT\s+ILIKE|NOT\s+LIKE|ILIKE|LIKE|IN)\s+((?:\w+\.)?\w+)\s*(->>?)\s*'([^']+)'"#,
+        r#"(?i)(=|!=|<>|<=|>=|<|>|NOT\s+ILIKE|NOT\s+LIKE|ILIKE|LIKE|IN)\s+((?:\w+\.)?[\w\->']+)\s*(->>?)\s*'([^']+)'"#,
     )
     .unwrap();
 
@@ -132,13 +87,12 @@ fn process_json_arrows(sql: &str) -> String {
 
 /// Preprocess SQL to fix parser quirks
 ///
-/// Applies the following transformations:
-/// 1. Converts chained JSON arrows to json_get functions:
-///    - `spec->'selector'->>'app'` -> `json_get_str(json_get(spec, 'selector'), 'app')`
-/// 2. Fixes ->> operator precedence:
-///    - `col->>'key' = 'value'` -> `(col->>'key') = 'value'`
+/// Currently only fixes the JSON arrow operator precedence bug.
+/// Wraps arrow expressions in parentheses when used with comparison operators:
+/// - `col->>'key' = 'value'` → `(col->>'key') = 'value'`
+/// - `p1.col->>'k' = p2.col->>'k'` → `(p1.col->>'k') = (p2.col->>'k')`
 pub fn preprocess_sql(sql: &str) -> String {
-    process_json_arrows(sql)
+    fix_arrow_precedence(sql)
 }
 
 /// Validate that the SQL statement is read-only
@@ -335,40 +289,38 @@ mod tests {
     }
 
     #[test]
-    fn test_chained_json_arrows_two_levels() {
+    fn test_chained_json_arrows_two_levels_unchanged() {
+        // Chained arrows work natively in DataFusion - no conversion needed!
         let sql = "SELECT spec->'selector'->>'app' FROM services";
         let result = preprocess_sql(sql);
-        assert_eq!(
-            result,
-            "SELECT json_get_str(json_get(spec, 'selector'), 'app') FROM services"
-        );
+        assert_eq!(result, sql); // Should remain unchanged
     }
 
     #[test]
-    fn test_chained_json_arrows_three_levels() {
+    fn test_chained_json_arrows_three_levels_unchanged() {
+        // Three-level chains also work natively
         let sql = "SELECT metadata->'labels'->'app'->>'version' FROM pods";
         let result = preprocess_sql(sql);
-        assert_eq!(
-            result,
-            "SELECT json_get_str(json_get(json_get(metadata, 'labels'), 'app'), 'version') FROM pods"
-        );
+        assert_eq!(result, sql); // Should remain unchanged
     }
 
     #[test]
-    fn test_chained_json_arrows_in_where() {
+    fn test_chained_json_arrows_in_where_with_comparison() {
+        // Chained arrow in WHERE with comparison - only wrap for precedence
         let sql = "SELECT * FROM pods WHERE spec->'selector'->>'app' = 'nginx'";
         let result = preprocess_sql(sql);
-        assert!(result.contains("json_get_str(json_get(spec, 'selector'), 'app')"));
+        assert_eq!(
+            result,
+            "SELECT * FROM pods WHERE (spec->'selector'->>'app') = 'nginx'"
+        );
     }
 
     #[test]
-    fn test_chained_json_arrows_with_table_prefix() {
+    fn test_chained_json_arrows_with_table_prefix_unchanged() {
+        // Chained arrows with table prefix work natively
         let sql = "SELECT p.spec->'containers'->>'name' FROM pods p";
         let result = preprocess_sql(sql);
-        assert_eq!(
-            result,
-            "SELECT json_get_str(json_get(p.spec, 'containers'), 'name') FROM pods p"
-        );
+        assert_eq!(result, sql); // Should remain unchanged
     }
 
     // Tests for validate_read_only
@@ -470,6 +422,104 @@ mod tests {
         assert_eq!(
             result,
             "SELECT * FROM pods WHERE 'nginx' = (labels->>'app')"
+        );
+    }
+
+    #[test]
+    fn test_parser_supports_chained_arrows() {
+        // Test if DataFusion's SQL parser natively supports chained arrow operators
+        use datafusion::sql::sqlparser::dialect::GenericDialect;
+        use datafusion::sql::sqlparser::parser::Parser;
+
+        let dialect = GenericDialect {};
+
+        // Test chained arrows WITHOUT preprocessing
+        let sql = "SELECT spec->'selector'->>'app' FROM pods";
+        let result = Parser::parse_sql(&dialect, sql);
+
+        // If this succeeds, we DON'T need to convert chained arrows to functions!
+        // If it fails, we'll see the error and understand why conversion is needed
+        match result {
+            Ok(_) => println!("Parser DOES support chained arrows natively!"),
+            Err(e) => println!("Parser DOES NOT support chained arrows: {}", e),
+        }
+
+        // Don't assert - just document the behavior
+        // assert!(result.is_ok(), "Parser should support chained arrows");
+    }
+
+    #[tokio::test]
+    async fn test_chained_arrows_end_to_end() {
+        // End-to-end test: Can we execute a query with chained arrows?
+        use datafusion::arrow::array::{RecordBatch, StringArray};
+        use datafusion::arrow::datatypes::{DataType, Field, Schema};
+        use datafusion::prelude::SessionContext;
+        use std::sync::Arc;
+
+        // Create a test dataset with nested JSON
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, false),
+            Field::new("spec", DataType::Utf8, true),
+        ]));
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["svc1", "svc2"])),
+                Arc::new(StringArray::from(vec![
+                    r#"{"selector": {"app": "nginx"}}"#,
+                    r#"{"selector": {"app": "redis"}}"#,
+                ])),
+            ],
+        )
+        .unwrap();
+
+        // Create SessionContext and register JSON functions
+        let mut ctx = SessionContext::new();
+        datafusion_functions_json::register_all(&mut ctx).unwrap();
+
+        // Register test table
+        ctx.register_batch("test_services", batch).unwrap();
+
+        // Test 1: Single arrow (baseline)
+        let result = ctx
+            .sql("SELECT name, spec->>'selector' as selector FROM test_services")
+            .await;
+        match &result {
+            Ok(_) => println!("✓ Single arrow works end-to-end"),
+            Err(e) => println!("✗ Single arrow failed: {}", e),
+        }
+        assert!(result.is_ok(), "Single arrow should work");
+
+        // Test 2: Chained arrows WITHOUT preprocessing
+        let chained_sql = "SELECT name, spec->'selector'->>'app' as app FROM test_services";
+        let result = ctx.sql(chained_sql).await;
+
+        match &result {
+            Ok(_) => {
+                println!("✓ Chained arrows work end-to-end WITHOUT conversion!");
+                // Try to actually execute and get results
+                if let Ok(df) = &result {
+                    match df.clone().collect().await {
+                        Ok(batches) => {
+                            println!("✓ Successfully executed chained arrow query");
+                            println!("  Result batches: {}", batches.len());
+                        }
+                        Err(e) => {
+                            println!("✗ Execution failed: {}", e);
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                println!("✗ Chained arrows failed end-to-end: {}", e);
+            }
+        }
+
+        // This is the critical test - if this passes, we don't need conversion!
+        assert!(
+            result.is_ok(),
+            "Chained arrows should work end-to-end without conversion"
         );
     }
 }

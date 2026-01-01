@@ -221,7 +221,6 @@ impl K8sTableProvider {
 
     /// Extract label selectors from DataFusion expressions
     /// Looks for patterns like `json_get_str(labels, 'key') = 'value'`
-    /// (after SQL preprocessing converts `labels.key` to this form)
     /// Returns a K8s label selector string like "app=nginx,env=prod"
     fn extract_label_selectors(&self, filters: &[Expr]) -> Option<String> {
         let mut visitor = LabelSelectorVisitor::new(self);
