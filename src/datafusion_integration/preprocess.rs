@@ -12,14 +12,13 @@
 //!
 //! ## PostgreSQL-Compatible JSON Operators
 //!
-//! DataFusion with datafusion-functions-json supports PostgreSQL JSON operators natively,
-//! including chained arrows:
+//! Supports PostgreSQL JSON operators including chained arrows:
 //!
 //! ```sql
-//! -- Single arrow access
+//! -- Single arrow
 //! SELECT * FROM pods WHERE labels->>'app' = 'nginx'
 //!
-//! -- Chained arrows work natively (no conversion needed!)
+//! -- Chained arrows
 //! SELECT spec->'selector'->>'app' FROM services
 //! SELECT metadata->'labels'->'env'->>'name' FROM pods
 //! ```
@@ -34,12 +33,9 @@ use regex::Regex;
 /// DataFusion has a parser precedence bug where comparison operators bind too tightly:
 /// https://github.com/apache/datafusion-sqlparser-rs/issues/814
 ///
-/// This function wraps arrow expressions in parentheses when they appear with comparison operators:
+/// Wraps arrow expressions in parentheses when they appear with comparison operators:
 /// - `labels->>'app' = 'nginx'` → `(labels->>'app') = 'nginx'`
 /// - `p1.labels->>'app' = p2.labels->>'app'` → `(p1.labels->>'app') = (p2.labels->>'app')`
-///
-/// Note: Chained arrows like `spec->'selector'->>'app'` work natively with datafusion-functions-json
-/// and do NOT need conversion to json_get() functions.
 fn fix_arrow_precedence(sql: &str) -> String {
     // Wrap arrows that appear in comparison/boolean contexts
     // We need to handle arrows on BOTH sides of comparisons:
@@ -291,23 +287,21 @@ mod tests {
 
     #[test]
     fn test_chained_json_arrows_two_levels_unchanged() {
-        // Chained arrows work natively in DataFusion - no conversion needed!
         let sql = "SELECT spec->'selector'->>'app' FROM services";
         let result = preprocess_sql(sql);
-        assert_eq!(result, sql); // Should remain unchanged
+        assert_eq!(result, sql);
     }
 
     #[test]
     fn test_chained_json_arrows_three_levels_unchanged() {
-        // Three-level chains also work natively
         let sql = "SELECT metadata->'labels'->'app'->>'version' FROM pods";
         let result = preprocess_sql(sql);
-        assert_eq!(result, sql); // Should remain unchanged
+        assert_eq!(result, sql);
     }
 
     #[test]
     fn test_chained_json_arrows_in_where_with_comparison() {
-        // Chained arrow in WHERE with comparison - only wrap for precedence
+        // Chained arrow with comparison gets wrapped for precedence
         let sql = "SELECT * FROM pods WHERE spec->'selector'->>'app' = 'nginx'";
         let result = preprocess_sql(sql);
         assert_eq!(
@@ -318,10 +312,9 @@ mod tests {
 
     #[test]
     fn test_chained_json_arrows_with_table_prefix_unchanged() {
-        // Chained arrows with table prefix work natively
         let sql = "SELECT p.spec->'containers'->>'name' FROM pods p";
         let result = preprocess_sql(sql);
-        assert_eq!(result, sql); // Should remain unchanged
+        assert_eq!(result, sql);
     }
 
     // Tests for validate_read_only
