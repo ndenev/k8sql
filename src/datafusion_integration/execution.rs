@@ -28,7 +28,7 @@
 use std::any::Any;
 use std::fmt;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
 use async_stream::try_stream;
@@ -95,7 +95,8 @@ pub struct K8sExecutionPlan {
     columns: Arc<Vec<ColumnDef>>,
     /// Wall-clock timer for tracking actual query duration across all partitions
     /// Starts when first partition executes, tracks overall time
-    wall_clock_start: Arc<Mutex<Option<Instant>>>,
+    /// Uses OnceLock for zero-overhead reads after initialization (no locking)
+    wall_clock_start: Arc<OnceLock<Instant>>,
 }
 
 impl K8sExecutionPlan {
@@ -130,7 +131,7 @@ impl K8sExecutionPlan {
             fetch_limit,
             metrics: ExecutionPlanMetricsSet::new(),
             columns,
-            wall_clock_start: Arc::new(Mutex::new(None)),
+            wall_clock_start: Arc::new(OnceLock::new()),
         }
     }
 }
@@ -226,8 +227,12 @@ impl ExecutionPlan for K8sExecutionPlan {
 
     fn metrics(&self) -> Option<MetricsSet> {
         // Add wall-clock time if query has started
-        if let Some(start) = *self.wall_clock_start.lock().unwrap() {
+        // OnceLock provides zero-overhead reads (no locking after initialization)
+        if let Some(start) = self.wall_clock_start.get() {
             let elapsed_ms = start.elapsed().as_millis() as usize;
+            // wall_clock_time (gauge, ms): Actual query duration from first partition start
+            // This differs from total_fetch_time (which sums parallel work) and represents
+            // the user-visible query execution time for parallel multi-cluster queries.
             let wall_clock = MetricBuilder::new(&self.metrics).gauge("wall_clock_time", 0);
             wall_clock.set(elapsed_ms);
         }
@@ -273,12 +278,8 @@ impl ExecutionPlan for K8sExecutionPlan {
         }
 
         // Start wall-clock timer on first partition execution
-        {
-            let mut timer = self.wall_clock_start.lock().unwrap();
-            if timer.is_none() {
-                *timer = Some(Instant::now());
-            }
-        }
+        // OnceLock::get_or_init ensures only the first partition sets the timer
+        self.wall_clock_start.get_or_init(Instant::now);
 
         // Get the target for this partition
         let target = self.targets[partition].clone();
@@ -290,16 +291,19 @@ impl ExecutionPlan for K8sExecutionPlan {
         let columns = self.columns.clone();
 
         // Set up metrics for this partition
-        let rows_fetched = MetricBuilder::new(&self.metrics).counter("rows_fetched", partition);
-        let pages_fetched = MetricBuilder::new(&self.metrics).counter("pages_fetched", partition);
+        // Counters (aggregate via sum):
+        let rows_fetched = MetricBuilder::new(&self.metrics).counter("rows_fetched", partition); // count: K8s resources returned
+        let pages_fetched = MetricBuilder::new(&self.metrics).counter("pages_fetched", partition); // count: K8s API calls (LIST operations)
+        let bytes_received = MetricBuilder::new(&self.metrics).counter("bytes_received", partition); // bytes: JSON payload size from K8s API
+        let output_bytes = MetricBuilder::new(&self.metrics).counter("output_bytes", partition); // bytes: Arrow RecordBatch memory size
+
+        // Time metrics in milliseconds (aggregate via sum):
         let fetch_time =
-            MetricBuilder::new(&self.metrics).subset_time("total_fetch_time", partition);
-        let bytes_received = MetricBuilder::new(&self.metrics).counter("bytes_received", partition);
-        let output_bytes = MetricBuilder::new(&self.metrics).counter("output_bytes", partition);
+            MetricBuilder::new(&self.metrics).subset_time("total_fetch_time", partition); // ms: total K8s API fetch time (summed across partitions)
         let conversion_time =
-            MetricBuilder::new(&self.metrics).subset_time("conversion_time", partition);
+            MetricBuilder::new(&self.metrics).subset_time("conversion_time", partition); // ms: JSON to Arrow conversion time
         let first_page_time =
-            MetricBuilder::new(&self.metrics).subset_time("first_page_time", partition);
+            MetricBuilder::new(&self.metrics).subset_time("first_page_time", partition); // ms: time to first page (TTFB)
 
         debug!(
             table = %table_name,
@@ -380,6 +384,17 @@ fn create_streaming_execution(
                     total_rows += page_row_count;
 
                     // Track bytes received (JSON size)
+                    // NOTE: This re-serializes already-deserialized K8s JSON to measure logical data size.
+                    // Trade-offs:
+                    //   - Adds CPU overhead (serialization) and temporary memory allocation per page
+                    //   - Provides accurate measure of logical JSON payload size
+                    //   - May differ from actual network bytes (HTTP compression, whitespace)
+                    // Alternatives considered:
+                    //   - Track at HTTP layer: requires kube-rs client changes (not exposed)
+                    //   - Estimate from row count: less accurate, harder to debug size anomalies
+                    //   - Skip metric: loses visibility into data transfer costs
+                    // Decision: Accept overhead for observability - helps identify large resources
+                    // and understand network vs conversion bottlenecks in query performance.
                     let json_bytes = serde_json::to_vec(&items)
                         .map(|v| v.len())
                         .unwrap_or(0);
@@ -463,4 +478,64 @@ fn create_streaming_execution(
     };
 
     Box::pin(stream)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_query_target_creation() {
+        let target = QueryTarget {
+            cluster: "test-cluster".to_string(),
+            namespace: Some("default".to_string()),
+        };
+
+        assert_eq!(target.cluster, "test-cluster");
+        assert_eq!(target.namespace, Some("default".to_string()));
+    }
+
+    #[test]
+    fn test_query_target_cluster_wide() {
+        let target = QueryTarget {
+            cluster: "test-cluster".to_string(),
+            namespace: None,
+        };
+
+        assert_eq!(target.cluster, "test-cluster");
+        assert!(target.namespace.is_none());
+    }
+
+    #[test]
+    fn test_is_not_found_error_with_404() {
+        let api_err = kube::Error::Api(kube::error::ErrorResponse {
+            status: "Failure".to_string(),
+            message: "namespaces \"missing\" not found".to_string(),
+            reason: "NotFound".to_string(),
+            code: 404,
+        });
+        let err = anyhow::Error::new(api_err);
+
+        assert!(is_not_found_error(&err));
+    }
+
+    #[test]
+    fn test_is_not_found_error_with_other_code() {
+        let api_err = kube::Error::Api(kube::error::ErrorResponse {
+            status: "Failure".to_string(),
+            message: "Forbidden".to_string(),
+            reason: "Forbidden".to_string(),
+            code: 403,
+        });
+        let err = anyhow::Error::new(api_err);
+
+        assert!(!is_not_found_error(&err));
+    }
+
+    #[test]
+    fn test_is_not_found_error_with_non_api_error() {
+        let err = anyhow::anyhow!("Some other error");
+
+        assert!(!is_not_found_error(&err));
+    }
 }
