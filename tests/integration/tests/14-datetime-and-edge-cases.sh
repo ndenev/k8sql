@@ -128,12 +128,13 @@ assert_row_count "OFFSET larger than results" "k3d-k8sql-test-1" \
     "SELECT name FROM pods LIMIT 5 OFFSET 1000000" 0
 
 # LIMIT with OFFSET correctness (regression test for OFFSET bug)
-# This validates that LIMIT 10 OFFSET 10 returns exactly 10 rows, not 20.
-# Bug: DataFusion's with_fetch() receives skip+fetch combined (20), which
-# would cause LIMIT pushdown to fetch 20 rows instead of 10.
-# Fix: Disabled LIMIT pushdown to ensure correct OFFSET semantics.
-assert_row_count "LIMIT 10 OFFSET 10 returns 10 rows" "k3d-k8sql-test-1" \
-    "SELECT name FROM pods LIMIT 10 OFFSET 10" 10
+# This validates that LIMIT N OFFSET M returns exactly N rows (not N+M).
+# Bug: DataFusion's with_fetch() receives skip+fetch combined, which
+# would cause LIMIT pushdown to fetch too many rows and break OFFSET semantics.
+# Fix: Disabled LIMIT pushdown to ensure correct OFFSET behavior.
+# Use smaller numbers to avoid depending on cluster size
+assert_row_count "LIMIT 3 OFFSET 2 returns 3 rows" "k3d-k8sql-test-1" \
+    "SELECT name FROM pods LIMIT 3 OFFSET 2" 3
 
 # Type Coercion
 echo ""
