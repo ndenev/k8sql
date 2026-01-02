@@ -1,6 +1,6 @@
 ---
 # Config instance in default namespace
-apiVersion: k8sql.io/v1
+apiVersion: config.k8sql.io/v1
 kind: Config
 metadata:
   name: test-config
@@ -14,7 +14,7 @@ spec:
   enabled: true
 ---
 # Config instance in test-ns namespace
-apiVersion: k8sql.io/v1
+apiVersion: config.k8sql.io/v1
 kind: Config
 metadata:
   name: test-config-2

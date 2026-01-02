@@ -66,7 +66,7 @@ kubectl --context "k3d-$CLUSTER2" apply -f "$SCRIPT_DIR/fixtures/test-crd-2.yaml
 echo "Waiting for CRDs to be established..."
 kubectl --context "k3d-$CLUSTER1" wait --for=condition=Established crd/testresources.k8sql.io --timeout=30s
 kubectl --context "k3d-$CLUSTER2" wait --for=condition=Established crd/testresources.k8sql.io --timeout=30s
-kubectl --context "k3d-$CLUSTER2" wait --for=condition=Established crd/configs.k8sql.io --timeout=30s
+kubectl --context "k3d-$CLUSTER2" wait --for=condition=Established crd/configs.config.k8sql.io --timeout=30s
 
 # Deploy test resources to cluster 1
 echo "Deploying test resources to cluster 1..."
