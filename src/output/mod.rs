@@ -94,7 +94,7 @@ pub fn show_tables_result(
             "version".to_string(),
             "kind".to_string(),
             "scope".to_string(),
-            "type".to_string(),
+            "resource_type".to_string(),
         ],
         rows: metadata
             .into_iter()

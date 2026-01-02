@@ -183,6 +183,7 @@ Special cases:
 - **ConfigMaps/Secrets**: `data` column instead of spec/status
 - **Events**: `type`, `reason`, `message`, `count`, etc.
 - **PodMetrics/NodeMetrics**: `timestamp`, `window`, `containers`/`usage`
+- **CustomResourceDefinitions**: `group`, `scope`, `resource_kind`, `plural`, `singular`, `short_names`, `categories` (queryable as `crds` or `customresourcedefinitions`)
 
 ## Query Optimization
 
@@ -258,7 +259,7 @@ SELECT json_get_str(UNNEST(json_get_array(spec, 'containers')), 'image') FROM po
 - **Tab**: Auto-complete keywords/tables/columns
 - **↑/↓**: Navigate history
 - **Ctrl+D**: Quit
-- **\dt**: SHOW TABLES
+- **\dt**: SHOW TABLES (displays: table_name, aliases, group, version, kind, scope, resource_type)
 - **\l**: SHOW DATABASES
 - **\d table**: DESCRIBE table
 - **\x**: Toggle expanded display
