@@ -228,7 +228,7 @@ pub fn crd_cache_key(group: &str, version: &str, kind: &str) -> (String, String)
 ///       Certificate.json
 ///       Issuer.json
 ///   clusters/
-///     prod-cluster.json        # [(\"apps\", \"v1\", \"Deployment\"), ...]
+///     prod-cluster.json        # [("apps", "v1", "Deployment"), ...]
 /// ```
 ///
 /// This enables correct multi-cluster caching:
@@ -239,15 +239,24 @@ pub fn crd_cache_key(group: &str, version: &str, kind: &str) -> (String, String)
 /// Caching strategy:
 /// - Cluster CRD list: 1 hour TTL (detect new/removed CRDs)
 /// - CRD schemas: Indefinite (schemas rarely change, refresh via --refresh-crds)
+///
+/// Thread safety:
+/// - write_lock protects concurrent writes from multiple threads
+/// - Atomic file writes (tempfile + rename) protect against crashes and multiple processes
 pub struct ResourceCache {
     base_dir: PathBuf,
+    /// Protects cache writes from concurrent threads
+    write_lock: std::sync::Mutex<()>,
 }
 
 impl ResourceCache {
     /// Create a new cache manager
     pub fn new() -> Result<Self> {
         let base_dir = Self::default_cache_dir()?;
-        let cache = Self { base_dir };
+        let cache = Self {
+            base_dir,
+            write_lock: std::sync::Mutex::new(()),
+        };
 
         // Warn about old cache directory from previous versions
         cache.warn_old_cache_dir();
@@ -378,7 +387,7 @@ impl ResourceCache {
         (cached, missing)
     }
 
-    /// Save the list of CRDs for a cluster
+    /// Save the list of CRDs for a cluster with thread-safe atomic writes
     pub fn save_cluster_groups(
         &self,
         cluster: &str,
@@ -386,18 +395,42 @@ impl ResourceCache {
     ) -> Result<()> {
         self.ensure_dirs()?;
 
+        // Serialize first (outside the lock)
         let cluster_crds = ClusterCRDs::new(crds.to_vec());
         let content = serde_json::to_string_pretty(&cluster_crds)
             .context("Failed to serialize cluster CRDs")?;
 
+        // Acquire write lock for thread safety
+        let _lock = self.write_lock.lock().unwrap();
+
         let path = self.cluster_path(cluster);
-        std::fs::write(&path, content)
-            .with_context(|| format!("Failed to write cluster CRDs to {:?}", path))?;
+
+        // Atomic write: create temp file in same directory, write, then rename
+        let temp_file = tempfile::NamedTempFile::new_in(
+            path.parent().unwrap_or_else(|| std::path::Path::new(".")),
+        )
+        .context("Failed to create temp file for cluster CRDs")?;
+
+        std::fs::write(temp_file.path(), &content).with_context(|| {
+            format!(
+                "Failed to write temp cluster CRDs to {:?}",
+                temp_file.path()
+            )
+        })?;
+
+        // Atomically rename to final path
+        temp_file
+            .persist(&path)
+            .with_context(|| format!("Failed to persist cluster CRDs to {:?}", path))?;
 
         Ok(())
     }
 
-    /// Save a single CRD's resource
+    /// Save a single CRD's resource with thread-safe atomic writes
+    ///
+    /// Uses both:
+    /// - Mutex for thread safety (parallel cluster discovery)
+    /// - Atomic writes (tempfile + rename) for crash safety and multi-process safety
     pub fn save_crd(
         &self,
         group: &str,
@@ -405,21 +438,35 @@ impl ResourceCache {
         kind: &str,
         resource: &CachedResourceInfo,
     ) -> Result<()> {
+        // Serialize first (outside the lock)
+        let content =
+            serde_json::to_string_pretty(resource).context("Failed to serialize CRD cache")?;
+
+        // Acquire write lock for thread safety
+        let _lock = self.write_lock.lock().unwrap();
+
         let path = self.crd_path(group, version, kind);
 
-        // Ensure parent directory exists (group_version directory)
-        // Note: create_dir_all is idempotent and safe for concurrent access
+        // Ensure parent directory exists
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("Failed to create CRD cache directory {:?}", parent))?;
         }
 
-        // Resource already has created_at set via From<&ResourceInfo> impl
-        let content =
-            serde_json::to_string_pretty(resource).context("Failed to serialize CRD cache")?;
+        // Atomic write: create temp file in same directory, write, then rename
+        // This protects against crashes and multiple k8sql instances
+        let temp_file = tempfile::NamedTempFile::new_in(
+            path.parent().unwrap_or_else(|| std::path::Path::new(".")),
+        )
+        .context("Failed to create temp file for CRD cache")?;
 
-        std::fs::write(&path, content)
-            .with_context(|| format!("Failed to write CRD cache to {:?}", path))?;
+        std::fs::write(temp_file.path(), &content)
+            .with_context(|| format!("Failed to write temp CRD cache to {:?}", temp_file.path()))?;
+
+        // Atomically rename to final path (atomic on Unix-like systems)
+        temp_file
+            .persist(&path)
+            .with_context(|| format!("Failed to persist CRD cache to {:?}", path))?;
 
         Ok(())
     }
@@ -470,6 +517,7 @@ mod tests {
         let temp_dir = TempDir::new().expect("Failed to create temp dir");
         let cache = ResourceCache {
             base_dir: temp_dir.path().to_path_buf(),
+            write_lock: std::sync::Mutex::new(()),
         };
         (cache, temp_dir)
     }

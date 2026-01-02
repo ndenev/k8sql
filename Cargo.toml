@@ -76,8 +76,10 @@ serde_yaml = "0.9"
 # Regex for LIKE pattern matching
 regex = "1"
 
-[dev-dependencies]
+# Atomic file operations
 tempfile = "3"
+
+[dev-dependencies]
 
 [profile.release]
 strip = true
