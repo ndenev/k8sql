@@ -60,21 +60,6 @@ fn is_not_found_error(err: &anyhow::Error) -> bool {
     false
 }
 
-/// Check if an error is an "unknown table" error
-///
-/// Returns true for errors indicating the table/resource doesn't exist in
-/// a cluster's registry. This is expected in wildcard queries where different
-/// clusters may have different CRDs.
-///
-/// Note: This uses string matching as a pragmatic approach since the error
-/// originates from anyhow!() in client.rs. For a more robust solution,
-/// consider defining a custom K8sError enum in a follow-up PR.
-fn is_unknown_table_error(err: &anyhow::Error) -> bool {
-    let err_msg = err.to_string();
-    // Match the specific error message format from client.rs:812
-    err_msg.starts_with("Unknown table:") || err_msg.contains("Unknown table: '")
-}
-
 /// A query target representing a specific (cluster, namespace) pair to fetch
 #[derive(Debug, Clone)]
 pub struct QueryTarget {
@@ -423,8 +408,8 @@ fn create_streaming_execution(
                     }
                 }
                 Err(e) => {
-                    // Check if this is a "not found" error (404 or unknown table)
-                    if is_not_found_error(&e) || is_unknown_table_error(&e) {
+                    // Check if this is a Kubernetes "not found" (404) error
+                    if is_not_found_error(&e) {
                         debug!(
                             cluster = %target.cluster,
                             namespace = ?target.namespace,

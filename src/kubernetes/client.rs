@@ -808,10 +808,8 @@ impl K8sClientPool {
             let resource_info = match self.get_resource_info(&table, context.as_deref()).await {
                 Ok(Some(info)) => info,
                 Ok(None) => {
-                    yield Err(anyhow!(
-                        "Unknown table: '{}'. Run SHOW TABLES to see available resources.",
-                        table
-                    ));
+                    // Table not in discovery cache for this cluster - return empty results
+                    // This is expected in wildcard queries where different clusters have different CRDs
                     return;
                 }
                 Err(e) => {
