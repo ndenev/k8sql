@@ -742,7 +742,7 @@ impl K8sClientPool {
                         }
                     }
                     Err(last_error
-                        .unwrap()
+                        .expect("retry loop should always set last_error after 3 failed attempts")
                         .context(format!("Failed after 3 attempts for cluster '{}'", ctx)))
                 }
             })

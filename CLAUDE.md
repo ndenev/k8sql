@@ -158,7 +158,7 @@ Manages connections to multiple Kubernetes clusters:
 - Force fresh discovery: restart k8sql or use `--refresh-crds` flag
 
 **Retry Logic:**
-- Connection and discovery failures retry 3 times with exponential backoff (100ms, 200ms, 300ms)
+- Connection and discovery failures retry 3 times with linear backoff (100ms, 200ms, 300ms)
 - Handles intermittent network issues and proxy problems
 - All requested contexts must succeed - no partial failures (ensures predictability for scripting)
 
