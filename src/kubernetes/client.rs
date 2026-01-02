@@ -438,6 +438,20 @@ impl K8sClientPool {
                 format!("{}/{}", group, version)
             };
 
+            // Build aliases: start with shortNames, add singular if available
+            let mut aliases = schema_result.short_names.clone();
+
+            // Always add singular as additional alias if available (user preference)
+            if let Some(ref singular) = schema_result.singular {
+                let singular_lower = singular.to_lowercase();
+                // Only add if different from plural and not already in shortNames
+                if singular_lower != schema_result.plural.to_lowercase()
+                    && !aliases.contains(&singular_lower)
+                {
+                    aliases.push(singular_lower);
+                }
+            }
+
             // Create ResourceInfo
             let resource_info = super::discovery::ResourceInfo {
                 api_resource: kube::discovery::ApiResource {
@@ -453,7 +467,7 @@ impl K8sClientPool {
                     operations: vec![],
                 },
                 table_name: schema_result.plural.to_lowercase(),
-                aliases: schema_result.short_names.clone(),
+                aliases,
                 is_core: false,
                 group: group.clone(),
                 version: version.clone(),

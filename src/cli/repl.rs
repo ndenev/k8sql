@@ -1271,11 +1271,11 @@ pub async fn run_repl(mut session: K8sSessionContext, pool: Arc<K8sClientPool>) 
                     continue;
                 }
 
-                // Handle SHOW TABLES specially (clean output without catalog/schema noise)
+                // Handle SHOW TABLES specially (enhanced output with metadata)
                 if lower.trim().trim_end_matches(';') == "show tables" {
-                    let mut tables = session.list_tables_with_aliases().await;
-                    tables.sort_by(|a, b| a.0.cmp(&b.0));
-                    let result = show_tables_result(tables);
+                    let mut metadata = session.list_tables_with_metadata().await;
+                    metadata.sort_by(|a, b| a.table_name.cmp(&b.table_name));
+                    let result = show_tables_result(metadata);
                     if expanded {
                         print!("{}", format_expanded(&result));
                     } else {
