@@ -108,8 +108,10 @@ pub struct SchemaResult {
     pub short_names: Vec<String>,
     /// Plural name for the resource (table name)
     pub plural: String,
+    /// Singular name from CRD spec.names.singular (if defined)
+    pub singular: Option<String>,
     /// Resource scope (Namespaced or Cluster)
-    pub scope: kube::discovery::Scope,
+    pub scope: Scope,
 }
 
 /// Information about a discovered Kubernetes resource
@@ -331,18 +333,20 @@ pub fn find_crd_schema(
     // Extract schema fields if available
     let fields = extract_schema_fields(crd);
 
-    // Get plural and scope from CRD spec
+    // Get plural, singular, and scope from CRD spec
     let plural = crd.spec.names.plural.clone();
+    let singular = crd.spec.names.singular.clone();
     let scope = if crd.spec.scope == "Namespaced" {
-        kube::discovery::Scope::Namespaced
+        Scope::Namespaced
     } else {
-        kube::discovery::Scope::Cluster
+        Scope::Cluster
     };
 
     Some(SchemaResult {
         fields,
         short_names,
         plural,
+        singular,
         scope,
     })
 }
@@ -368,6 +372,7 @@ pub fn build_core_registry() -> ResourceRegistry {
         rbac::v1::{ClusterRole, ClusterRoleBinding, Role, RoleBinding},
         storage::v1::StorageClass,
     };
+    use k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::CustomResourceDefinition;
     use kube::Resource;
 
     let mut registry = ResourceRegistry::new();
@@ -469,6 +474,13 @@ pub fn build_core_registry() -> ResourceRegistry {
     // RBAC API (rbac.authorization.k8s.io/v1) - cluster-scoped
     add_resource!(ClusterRole, cluster, ["clusterrole"]);
     add_resource!(ClusterRoleBinding, cluster, ["clusterrolebinding"]);
+
+    // API Extensions (apiextensions.k8s.io/v1) - cluster-scoped
+    add_resource!(
+        CustomResourceDefinition,
+        cluster,
+        ["customresourcedefinition", "crd", "crds"]
+    );
 
     registry
 }
@@ -572,6 +584,19 @@ fn get_core_resource_fields(table_name: &str) -> Option<Vec<ColumnDef>> {
             ColumnDef::text("usage", "usage"),
         ]),
 
+        // ==================== CustomResourceDefinitions: CRD metadata ====================
+        "customresourcedefinitions" => Some(vec![
+            ColumnDef::text("group", "spec.group"),
+            ColumnDef::text("scope", "spec.scope"),
+            ColumnDef::text("resource_kind", "spec.names.kind"),
+            ColumnDef::text("plural", "spec.names.plural"),
+            ColumnDef::text("singular", "spec.names.singular"),
+            ColumnDef::text("short_names", "spec.names.shortNames"),
+            ColumnDef::text("categories", "spec.names.categories"),
+            // Note: spec.versions and status.conditions are too large for table display
+            // Use kubectl get crd <name> -o yaml for full schema details
+        ]),
+
         // Unknown resource - return None to trigger CRD schema detection or fallback
         _ => None,
     }
@@ -592,7 +617,15 @@ pub fn generate_schema(info: &ResourceInfo) -> Vec<ColumnDef> {
         ColumnDef::text("kind", "kind"),
         // Common metadata columns
         ColumnDef::text("name", "metadata.name"),
-        ColumnDef::text("namespace", "metadata.namespace"),
+    ];
+
+    // Only add namespace for namespaced resources (exclude cluster-scoped)
+    if info.capabilities.scope == Scope::Namespaced {
+        columns.push(ColumnDef::text("namespace", "metadata.namespace"));
+    }
+
+    // Continue with remaining metadata columns
+    columns.extend(vec![
         ColumnDef::text("uid", "metadata.uid"),
         ColumnDef::timestamp("created", "metadata.creationTimestamp"),
         ColumnDef::text("labels", "metadata.labels"),
@@ -602,7 +635,7 @@ pub fn generate_schema(info: &ResourceInfo) -> Vec<ColumnDef> {
         ColumnDef::text("resource_version", "metadata.resourceVersion"),
         ColumnDef::timestamp("deletion_timestamp", "metadata.deletionTimestamp"),
         ColumnDef::text("finalizers", "metadata.finalizers"),
-    ];
+    ]);
 
     // Add resource-specific columns with priority:
     // 1. Core resource explicit mapping

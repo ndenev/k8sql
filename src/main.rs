@@ -156,11 +156,11 @@ async fn run_batch(args: &Args) -> Result<()> {
         let normalized = query_str.trim().to_uppercase();
         let normalized = normalized.trim_end_matches(';');
 
-        // Handle SHOW TABLES specially (clean output without catalog/schema)
+        // Handle SHOW TABLES specially (enhanced output with metadata)
         if normalized == "SHOW TABLES" {
-            let mut tables = session.list_tables_with_aliases().await;
-            tables.sort_by(|a, b| a.0.cmp(&b.0));
-            let result = output::show_tables_result(tables);
+            let mut metadata = session.list_tables_with_metadata().await;
+            metadata.sort_by(|a, b| a.table_name.cmp(&b.table_name));
+            let result = output::show_tables_result(metadata);
             println!("{}", result.format(&args.output, args.no_headers));
             continue;
         }

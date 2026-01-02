@@ -19,6 +19,18 @@ use crate::output::QueryResult;
 use super::preprocess::{preprocess_sql, validate_read_only};
 use super::provider::K8sTableProvider;
 
+/// Metadata about a table (K8s resource type) for enhanced SHOW TABLES output
+#[derive(Debug, Clone)]
+pub struct TableMetadata {
+    pub table_name: String,
+    pub aliases: String,
+    pub group: String,
+    pub version: String,
+    pub kind: String,
+    pub scope: String,
+    pub resource_type: String,
+}
+
 /// A wrapper around DataFusion's SessionContext configured for K8s queries
 #[derive(Clone)]
 pub struct K8sSessionContext {
@@ -130,9 +142,9 @@ impl K8sSessionContext {
         self.ctx
     }
 
-    /// List available tables with their aliases
-    /// Returns Vec of (table_name, aliases_string)
-    pub async fn list_tables_with_aliases(&self) -> Vec<(String, String)> {
+    /// List available tables with full metadata (for enhanced SHOW TABLES output)
+    /// Returns Vec of TableMetadata with group, version, kind, scope, and type info
+    pub async fn list_tables_with_metadata(&self) -> Vec<TableMetadata> {
         if let Ok(registry) = self.pool.get_registry(None).await {
             registry
                 .list_tables()
@@ -143,7 +155,32 @@ impl K8sSessionContext {
                     } else {
                         info.aliases.join(", ")
                     };
-                    (info.table_name.clone(), aliases)
+
+                    // Convert scope enum to string
+                    let scope = match info.capabilities.scope {
+                        kube::discovery::Scope::Namespaced => "Namespaced",
+                        kube::discovery::Scope::Cluster => "Cluster",
+                    };
+
+                    // "core" for is_core==true, "crd" otherwise
+                    let resource_type = if info.is_core { "core" } else { "crd" };
+
+                    // Display "core" as group for core resources (empty group string)
+                    let group = if info.group.is_empty() {
+                        "core".to_string()
+                    } else {
+                        info.group.clone()
+                    };
+
+                    TableMetadata {
+                        table_name: info.table_name.clone(),
+                        aliases,
+                        group,
+                        version: info.version.clone(),
+                        kind: info.api_resource.kind.clone(),
+                        scope: scope.to_string(),
+                        resource_type: resource_type.to_string(),
+                    }
                 })
                 .collect()
         } else {

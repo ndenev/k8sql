@@ -14,5 +14,5 @@ mod hooks;
 mod preprocess;
 mod provider;
 
-pub use context::K8sSessionContext;
+pub use context::{K8sSessionContext, TableMetadata};
 pub use hooks::{SetConfigHook, ShowDatabasesHook, ShowTablesHook};

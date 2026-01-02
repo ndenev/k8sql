@@ -438,6 +438,27 @@ impl K8sClientPool {
                 format!("{}/{}", group, version)
             };
 
+            // Destructure schema_result to avoid cloning (move all fields at once)
+            let super::discovery::SchemaResult {
+                fields,
+                short_names,
+                plural,
+                singular,
+                scope,
+            } = schema_result;
+
+            // Build aliases: start with shortNames, add singular if available
+            let mut aliases = short_names; // Move instead of clone
+
+            // Always add singular as additional alias if available (user preference)
+            if let Some(singular) = singular {
+                let singular_lower = singular.to_lowercase();
+                // Only add if different from plural and not already in shortNames
+                if singular_lower != plural.to_lowercase() && !aliases.contains(&singular_lower) {
+                    aliases.push(singular_lower);
+                }
+            }
+
             // Create ResourceInfo
             let resource_info = super::discovery::ResourceInfo {
                 api_resource: kube::discovery::ApiResource {
@@ -445,19 +466,19 @@ impl K8sClientPool {
                     version: version.clone(),
                     api_version,
                     kind: kind.clone(),
-                    plural: schema_result.plural.clone(),
+                    plural: plural.clone(),
                 },
                 capabilities: ApiCapabilities {
-                    scope: schema_result.scope,
+                    scope,
                     subresources: vec![],
                     operations: vec![],
                 },
-                table_name: schema_result.plural.to_lowercase(),
-                aliases: schema_result.short_names.clone(),
+                table_name: plural.to_lowercase(),
+                aliases,
                 is_core: false,
                 group: group.clone(),
                 version: version.clone(),
-                custom_fields: schema_result.fields.clone(),
+                custom_fields: fields,
             };
 
             // Convert to cached format
@@ -975,5 +996,116 @@ impl K8sClientPool {
                 );
             }
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Helper function to test alias building logic in isolation
+    /// This replicates the logic from process_discovered_crds
+    fn build_aliases(
+        short_names: Vec<String>,
+        plural: String,
+        singular: Option<String>,
+    ) -> Vec<String> {
+        let mut aliases = short_names;
+
+        if let Some(singular) = singular {
+            let singular_lower = singular.to_lowercase();
+            if singular_lower != plural.to_lowercase() && !aliases.contains(&singular_lower) {
+                aliases.push(singular_lower);
+            }
+        }
+
+        aliases
+    }
+
+    #[test]
+    fn test_singular_alias_different_from_plural() {
+        // CRD with plural "certificates" and singular "certificate"
+        let short_names = vec!["cert".to_string(), "certs".to_string()];
+        let plural = "certificates".to_string();
+        let singular = Some("certificate".to_string());
+
+        let aliases = build_aliases(short_names, plural, singular);
+
+        assert_eq!(aliases.len(), 3);
+        assert!(aliases.contains(&"cert".to_string()));
+        assert!(aliases.contains(&"certs".to_string()));
+        assert!(aliases.contains(&"certificate".to_string()));
+    }
+
+    #[test]
+    fn test_singular_same_as_plural() {
+        // Edge case: singular and plural are the same
+        let short_names = vec!["data".to_string()];
+        let plural = "data".to_string();
+        let singular = Some("data".to_string());
+
+        let aliases = build_aliases(short_names, plural, singular);
+
+        // Should not add duplicate
+        assert_eq!(aliases.len(), 1);
+        assert_eq!(aliases[0], "data");
+    }
+
+    #[test]
+    fn test_singular_already_in_short_names() {
+        // CRD where singular is already in shortNames
+        let short_names = vec!["pod".to_string(), "po".to_string()];
+        let plural = "pods".to_string();
+        let singular = Some("pod".to_string());
+
+        let aliases = build_aliases(short_names, plural, singular);
+
+        // Should not add duplicate
+        assert_eq!(aliases.len(), 2);
+        assert!(aliases.contains(&"pod".to_string()));
+        assert!(aliases.contains(&"po".to_string()));
+    }
+
+    #[test]
+    fn test_no_singular_name() {
+        // CRD without singular name defined
+        let short_names = vec!["pl".to_string()];
+        let plural = "podlogs".to_string();
+        let singular = None;
+
+        let aliases = build_aliases(short_names, plural, singular);
+
+        // Should only have shortNames
+        assert_eq!(aliases.len(), 1);
+        assert_eq!(aliases[0], "pl");
+    }
+
+    #[test]
+    fn test_empty_short_names_with_singular() {
+        // CRD with no shortNames but has singular
+        let short_names = vec![];
+        let plural = "podlogs".to_string();
+        let singular = Some("podlog".to_string());
+
+        let aliases = build_aliases(short_names, plural, singular);
+
+        // Should add singular as the only alias
+        assert_eq!(aliases.len(), 1);
+        assert_eq!(aliases[0], "podlog");
+    }
+
+    #[test]
+    fn test_case_insensitive_comparison() {
+        // Test that comparison is case-insensitive
+        let short_names = vec!["cert".to_string()];
+        let plural = "Certificates".to_string();
+        let singular = Some("Certificate".to_string());
+
+        let aliases = build_aliases(short_names, plural, singular);
+
+        // Should add "certificate" (lowercased) as alias
+        assert_eq!(aliases.len(), 2);
+        assert!(aliases.contains(&"cert".to_string()));
+        assert!(aliases.contains(&"certificate".to_string()));
     }
 }

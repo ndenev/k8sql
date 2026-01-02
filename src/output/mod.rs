@@ -81,14 +81,34 @@ impl QueryResult {
     }
 }
 
-/// Create a QueryResult for SHOW TABLES output
-/// Takes a sorted list of (table_name, aliases) tuples
-pub fn show_tables_result(tables: Vec<(String, String)>) -> QueryResult {
+/// Create a QueryResult for SHOW TABLES output with full metadata
+/// Takes a list of TableMetadata with complete resource information
+pub fn show_tables_result(
+    metadata: Vec<crate::datafusion_integration::TableMetadata>,
+) -> QueryResult {
     QueryResult {
-        columns: vec!["table_name".to_string(), "aliases".to_string()],
-        rows: tables
+        columns: vec![
+            "table_name".to_string(),
+            "aliases".to_string(),
+            "group".to_string(),
+            "version".to_string(),
+            "kind".to_string(),
+            "scope".to_string(),
+            "resource_type".to_string(),
+        ],
+        rows: metadata
             .into_iter()
-            .map(|(name, aliases)| vec![name, aliases])
+            .map(|m| {
+                vec![
+                    m.table_name,
+                    m.aliases,
+                    m.group,
+                    m.version,
+                    m.kind,
+                    m.scope,
+                    m.resource_type,
+                ]
+            })
             .collect(),
     }
 }
