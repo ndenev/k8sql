@@ -12,6 +12,7 @@ use k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::{
 };
 use kube::Client;
 use kube::api::Api;
+use kube::api::ObjectList;
 use kube::discovery::{ApiCapabilities, ApiResource, Scope};
 use std::collections::HashMap;
 
@@ -100,19 +101,13 @@ impl ColumnDef {
 
 /// Result of CRD schema detection
 ///
-/// Distinguishes between successful schema extraction, legitimate absence of schema,
-/// and transient errors that shouldn't trigger silent fallback.
+/// Contains extracted schema information and short names from a CRD.
 #[derive(Debug, Clone)]
-pub enum SchemaResult {
-    /// Successfully extracted CRD information
-    Found {
-        /// Schema fields from CRD OpenAPI definition (None if no schema defined)
-        fields: Option<Vec<ColumnDef>>,
-        /// Short names from CRD spec.names.shortNames
-        short_names: Vec<String>,
-    },
-    /// Failed to fetch CRD - don't silently fall back, report the error
-    FetchError(String),
+pub struct SchemaResult {
+    /// Schema fields from CRD OpenAPI definition (None if no schema defined)
+    pub fields: Option<Vec<ColumnDef>>,
+    /// Short names from CRD spec.names.shortNames
+    pub short_names: Vec<String>,
 }
 
 /// Information about a discovered Kubernetes resource
@@ -323,75 +318,54 @@ fn camel_to_snake(s: &str) -> String {
     result
 }
 
-/// Fetch CRD schema from the CustomResourceDefinition object
+/// Find CRD schema from a pre-fetched CustomResourceDefinition list
 ///
-/// Returns:
-/// - `SchemaResult::Fields` if schema was successfully extracted
-/// - `SchemaResult::NoSchema` if CRD exists but has no schema (use fallback)
-/// - `SchemaResult::FetchError` on transient errors (don't silently fall back)
-pub async fn get_crd_schema(client: &Client, group: &str, kind: &str) -> SchemaResult {
+/// Returns `Some(SchemaResult)` if the CRD exists, `None` if not found.
+/// This is a synchronous search operation through the provided CRD list.
+pub fn find_crd_schema(
+    group: &str,
+    kind: &str,
+    crd_list: &ObjectList<CustomResourceDefinition>,
+) -> Option<SchemaResult> {
     // CRD name is plural.group (e.g., "certificates.cert-manager.io")
     // But we receive the group and kind, so we need to construct the CRD name
     // The CRD name format is: <plural>.<group>
     // We'll try to fetch by listing CRDs and matching group + kind
 
-    let api: Api<CustomResourceDefinition> = Api::all(client.clone());
-
-    // List CRDs and find matching one by group and kind
-    let crd_list = match api.list(&Default::default()).await {
-        Ok(list) => list,
-        Err(e) => {
-            return SchemaResult::FetchError(format!(
-                "Failed to list CRDs while looking for {}.{}: {}",
-                kind, group, e
-            ));
-        }
-    };
-
     // Find the CRD that matches our group and kind
     let crd = crd_list
         .items
-        .into_iter()
+        .iter()
         .find(|crd| crd.spec.group == group && crd.spec.names.kind.eq_ignore_ascii_case(kind));
 
-    match crd {
-        Some(crd) => {
-            // Extract short names from CRD spec.names.shortNames
-            let short_names = crd
-                .spec
-                .names
-                .short_names
-                .clone()
-                .unwrap_or_default()
-                .into_iter()
-                .map(|s| s.to_lowercase())
-                .collect();
+    crd.map(|crd| {
+        // Extract short names from CRD spec.names.shortNames
+        let short_names = crd
+            .spec
+            .names
+            .short_names
+            .clone()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|s| s.to_lowercase())
+            .collect();
 
-            // Extract schema fields if available
-            let fields = extract_schema_fields(&crd);
+        // Extract schema fields if available
+        let fields = extract_schema_fields(crd);
 
-            SchemaResult::Found {
-                fields,
-                short_names,
-            }
+        SchemaResult {
+            fields,
+            short_names,
         }
-        None => {
-            // Not a CRD (or CRD not found) - return empty short names, no fields
-            SchemaResult::Found {
-                fields: None,
-                short_names: Vec::new(),
-            }
-        }
-    }
+    })
 }
 
-/// Fetch CRD schemas for all non-core resources in parallel
+/// Fetch CRD schemas for all non-core resources
 ///
-/// This function updates the `custom_fields` of each ResourceInfo with the
-/// schema extracted from the CRD's OpenAPI definition.
+/// Makes a single API call to list all CRDs, then searches the list for each resource.
+/// Updates the `custom_fields` of each ResourceInfo with the schema extracted from
+/// the CRD's OpenAPI definition.
 pub async fn fetch_crd_schemas(client: &Client, resources: &mut [ResourceInfo]) -> Result<()> {
-    use futures::future::join_all;
-
     // Filter to non-core resources that might be CRDs
     let crd_resources: Vec<_> = resources
         .iter()
@@ -409,61 +383,52 @@ pub async fn fetch_crd_schemas(client: &Client, resources: &mut [ResourceInfo]) 
         crd_resources.len()
     );
 
-    // Fetch all CRD schemas in parallel
-    let futures: Vec<_> = crd_resources
-        .iter()
-        .map(|(_, group, kind)| {
-            let client = client.clone();
-            let group = group.clone();
-            let kind = kind.clone();
-            async move { get_crd_schema(&client, &group, &kind).await }
-        })
-        .collect();
+    let api: Api<CustomResourceDefinition> = Api::all(client.clone());
 
-    let results = join_all(futures).await;
+    // Fetch all CRDs once (single API call)
+    let crd_list = api.list(&Default::default()).await?;
 
-    // Update resources with fetched schemas and short names
-    for ((idx, group, kind), result) in crd_resources.iter().zip(results) {
-        match result {
-            SchemaResult::Found {
-                fields,
-                short_names,
-            } => {
-                // Add short names to aliases
-                if !short_names.is_empty() {
-                    tracing::debug!(
-                        "CRD {}.{}: adding short names {:?}",
-                        kind,
-                        group,
-                        short_names
-                    );
-                    resources[*idx].aliases.extend(short_names);
-                }
+    // Process each CRD resource synchronously (searching local list is instant)
+    for (idx, group, kind) in crd_resources.iter() {
+        let Some(SchemaResult {
+            fields,
+            short_names,
+        }) = find_crd_schema(group, kind, &crd_list)
+        else {
+            // CRD not found - skip processing
+            tracing::debug!("CRD {}.{}: not found in cluster", kind, group);
+            continue;
+        };
 
-                // Set custom fields if schema was extracted
-                match fields {
-                    Some(f) => {
-                        tracing::debug!(
-                            "CRD {}.{}: extracted {} fields from schema",
-                            kind,
-                            group,
-                            f.len()
-                        );
-                        resources[*idx].custom_fields = Some(f);
-                    }
-                    None => {
-                        tracing::debug!(
-                            "CRD {}.{}: no schema, using spec/status fallback",
-                            kind,
-                            group
-                        );
-                        // Leave custom_fields as None - generate_schema will use fallback
-                    }
-                }
+        // Add short names to aliases
+        if !short_names.is_empty() {
+            tracing::debug!(
+                "CRD {}.{}: adding short names {:?}",
+                kind,
+                group,
+                short_names
+            );
+            resources[*idx].aliases.extend(short_names);
+        }
+
+        // Set custom fields if schema was extracted
+        match fields {
+            Some(f) => {
+                tracing::debug!(
+                    "CRD {}.{}: extracted {} fields from schema",
+                    kind,
+                    group,
+                    f.len()
+                );
+                resources[*idx].custom_fields = Some(f);
             }
-            SchemaResult::FetchError(e) => {
-                tracing::warn!("CRD {}.{}: {}", kind, group, e);
-                // Leave custom_fields as None - use fallback but log the warning
+            None => {
+                tracing::debug!(
+                    "CRD {}.{}: no schema, using spec/status fallback",
+                    kind,
+                    group
+                );
+                // Leave custom_fields as None - generate_schema will use fallback
             }
         }
     }
