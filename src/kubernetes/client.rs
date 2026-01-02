@@ -18,7 +18,7 @@ use super::discovery::{ResourceInfo, ResourceRegistry};
 use crate::progress::ProgressHandle;
 
 /// How long to cache discovered resources before auto-refresh
-const REGISTRY_TTL: Duration = Duration::from_secs(300); // 5 minutes
+const REGISTRY_TTL: Duration = Duration::from_secs(1800); // 30 minutes
 
 /// Timeout for connecting to K8s API
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -691,7 +691,7 @@ impl K8sClientPool {
             super::context_matcher::ContextMatcher::new(&all_contexts).resolve(context_spec)?;
 
         // Ensure we have clients and discovered resources for all contexts IN PARALLEL
-        // Retry up to 3 times for intermittent failures (e.g., Teleport proxy issues)
+        // Retry up to 3 times for intermittent failures
         let discovery_futures: Vec<_> = matched_contexts
             .iter()
             .map(|ctx| {
