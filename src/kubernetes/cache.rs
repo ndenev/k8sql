@@ -336,10 +336,9 @@ impl ResourceCache {
         let content = std::fs::read_to_string(&path).ok()?;
         let cached: CachedResourceInfo = serde_json::from_str(&content)
             .map_err(|e| {
-                tracing::warn!(
-                    "Failed to parse CRD cache at {:?}: {}. Cache may be outdated. Run: rm -rf ~/.k8sql/cache",
-                    path, e
-                );
+                eprintln!("⚠️  Failed to parse cache file: {}", path.display());
+                eprintln!("   Error: {}", e);
+                eprintln!("   The cache may be outdated. To fix, run: rm -rf ~/.k8sql/cache");
                 e
             })
             .ok()?;
@@ -409,6 +408,7 @@ impl ResourceCache {
         let path = self.crd_path(group, version, kind);
 
         // Ensure parent directory exists (group_version directory)
+        // Note: create_dir_all is idempotent and safe for concurrent access
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("Failed to create CRD cache directory {:?}", parent))?;

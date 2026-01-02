@@ -65,8 +65,14 @@ fn is_not_found_error(err: &anyhow::Error) -> bool {
 /// Returns true for errors indicating the table/resource doesn't exist in
 /// a cluster's registry. This is expected in wildcard queries where different
 /// clusters may have different CRDs.
+///
+/// Note: This uses string matching as a pragmatic approach since the error
+/// originates from anyhow!() in client.rs. For a more robust solution,
+/// consider defining a custom K8sError enum in a follow-up PR.
 fn is_unknown_table_error(err: &anyhow::Error) -> bool {
-    err.to_string().contains("Unknown table:")
+    let err_msg = err.to_string();
+    // Match the specific error message format from client.rs:812
+    err_msg.starts_with("Unknown table:") || err_msg.contains("Unknown table: '")
 }
 
 /// A query target representing a specific (cluster, namespace) pair to fetch
