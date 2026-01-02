@@ -129,7 +129,7 @@ async fn run_batch(args: &Args) -> Result<()> {
     // If --refresh-crds flag is set, clear the CRD schema cache
     if args.refresh_crds
         && let Ok(cache) = ResourceCache::new()
-        && let Err(e) = cache.clear_groups()
+        && let Err(e) = cache.clear_crds()
     {
         eprintln!("Warning: Failed to clear CRD cache: {}", e);
     }
@@ -194,7 +194,7 @@ async fn run_interactive(args: &Args) -> Result<()> {
     // If --refresh-crds flag is set, clear the CRD schema cache
     if args.refresh_crds
         && let Ok(cache) = ResourceCache::new()
-        && let Err(e) = cache.clear_groups()
+        && let Err(e) = cache.clear_crds()
     {
         eprintln!("Warning: Failed to clear CRD cache: {}", e);
     }

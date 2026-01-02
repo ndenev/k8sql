@@ -7,7 +7,7 @@ use kube::{Api, Client, Config, api::ListParams};
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 use tracing::{debug, info, trace, warn};
@@ -25,68 +25,6 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Timeout for reading K8s API responses
 const READ_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// Maximum retry attempts for transient failures
-const MAX_RETRIES: u32 = 3;
-
-/// Base delay for exponential backoff (doubles each retry)
-const RETRY_BASE_DELAY: Duration = Duration::from_millis(100);
-
-/// Check if a kube error is retryable (transient failures)
-pub fn is_retryable_error(err: &kube::Error) -> bool {
-    match err {
-        // Network/connection errors are retryable
-        kube::Error::HyperError(_) => true,
-        // API errors: retry on transient HTTP status codes
-        // 408 = Request Timeout, 429 = Rate Limit, 500 = Internal Server Error,
-        // 502 = Bad Gateway, 503 = Service Unavailable, 504 = Gateway Timeout
-        kube::Error::Api(api_err) => {
-            matches!(api_err.code, 408 | 429 | 500 | 502 | 503 | 504)
-        }
-        kube::Error::InferConfig(_) => false,
-        kube::Error::Discovery(_) => false,
-        _ => false,
-    }
-}
-
-/// Execute an async operation with retry logic for transient failures
-pub async fn with_retry<T, F, Fut>(operation_name: &str, f: F) -> Result<T>
-where
-    F: Fn() -> Fut,
-    Fut: std::future::Future<Output = Result<T, kube::Error>>,
-{
-    let mut last_error = None;
-
-    for attempt in 0..MAX_RETRIES {
-        match f().await {
-            Ok(result) => return Ok(result),
-            Err(e) => {
-                if is_retryable_error(&e) && attempt < MAX_RETRIES - 1 {
-                    let delay = RETRY_BASE_DELAY * 2u32.pow(attempt);
-                    warn!(
-                        "{} failed (attempt {}/{}): {}, retrying in {:?}",
-                        operation_name,
-                        attempt + 1,
-                        MAX_RETRIES,
-                        e,
-                        delay
-                    );
-                    tokio::time::sleep(delay).await;
-                    last_error = Some(e);
-                } else {
-                    return Err(e.into());
-                }
-            }
-        }
-    }
-
-    Err(anyhow!(
-        "{} failed after {} retries: {}",
-        operation_name,
-        MAX_RETRIES,
-        last_error.map(|e| e.to_string()).unwrap_or_default()
-    ))
-}
 
 /// Page size for paginated list requests
 /// Smaller pages reduce memory pressure and allow faster initial response
@@ -143,10 +81,6 @@ pub struct K8sClientPool {
     progress: ProgressHandle,
     /// Local disk cache for CRD discovery results
     resource_cache: ResourceCache,
-    /// Cache hit counter for diagnostics
-    cache_hits: AtomicUsize,
-    /// Cache miss counter for diagnostics
-    cache_misses: AtomicUsize,
 }
 
 impl K8sClientPool {
@@ -160,8 +94,6 @@ impl K8sClientPool {
             current_contexts: Arc::new(RwLock::new(vec!["test-context".to_string()])),
             progress,
             resource_cache: ResourceCache::new().expect("Failed to create test cache"),
-            cache_hits: AtomicUsize::new(0),
-            cache_misses: AtomicUsize::new(0),
         }
     }
 
@@ -190,8 +122,6 @@ impl K8sClientPool {
             current_contexts: Arc::new(RwLock::new(vec![context_name])),
             progress: crate::progress::create_progress_handle(),
             resource_cache: ResourceCache::new()?,
-            cache_hits: AtomicUsize::new(0),
-            cache_misses: AtomicUsize::new(0),
         })
     }
 
@@ -287,66 +217,80 @@ impl K8sClientPool {
         Ok(())
     }
 
-    /// Load CRDs using per-API-group caching
+    /// Load CRDs using per-CRD caching
     /// Returns the number of CRDs loaded
     ///
     /// Strategy:
-    /// 1. Try to load saved cluster groups from cache (no API call)
+    /// 1. Try to load saved cluster CRD list from cache (no API call)
     /// 2. If cache is fresh and complete, use it directly
-    /// 3. Otherwise, call list_api_groups() to get current groups
-    /// 4. Load cached groups, discover only missing groups in parallel
+    /// 3. Otherwise, fetch full CRD list from cluster
+    /// 4. Load cached CRDs, discover only missing CRDs
     async fn load_crds_with_cache(
         &self,
         context: &str,
         client: &Client,
         registry: &mut ResourceRegistry,
     ) -> Result<usize> {
-        // Step 1: Try to load from cache first (no API call)
-        if let Some(cached_crd_groups) = self.resource_cache.load_cluster_groups(context) {
-            let (cached_groups, missing_groups) =
-                self.resource_cache.check_groups(&cached_crd_groups);
+        use k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::CustomResourceDefinition;
+        use kube::{Api, api::ObjectList};
 
-            // If all groups are cached, load directly without any API calls
-            if missing_groups.is_empty() {
-                let mut count = 0;
-                for cached_group in &cached_groups {
-                    for resource in &cached_group.resources {
-                        registry.add(resource.clone().into());
-                        count += 1;
-                    }
+        // Step 1: Try to load from cache first (no API call)
+        if let Some(cached_crds) = self.resource_cache.load_cluster_groups(context) {
+            let (cached_resources, missing_crds) = self.resource_cache.check_crds(&cached_crds);
+
+            // If all CRDs are cached, load directly without any API calls
+            if missing_crds.is_empty() {
+                let count = cached_resources.len();
+                for cached_resource in &cached_resources {
+                    registry.add(cached_resource.clone().into());
                 }
                 info!(
                     context = %context,
-                    cached = cached_groups.len(),
+                    cached = count,
                     "Loaded all CRDs from cache (no API calls)"
                 );
                 return Ok(count);
             }
-            // Some groups missing - fall through to API call
+            // Some CRDs missing - fall through to API call
         }
 
-        // Step 2: Get CRD API groups from cluster (single API call)
-        let crd_groups = super::discovery::get_crd_api_groups(client).await?;
+        // Step 2: Fetch full CRD list from cluster (single API call)
+        let api: Api<CustomResourceDefinition> = Api::all(client.clone());
+        let crd_list: ObjectList<CustomResourceDefinition> = api.list(&Default::default()).await?;
 
-        if crd_groups.is_empty() {
+        if crd_list.items.is_empty() {
             return Ok(0);
         }
 
-        // Step 3: Check which groups are cached vs missing
-        let (cached_groups, missing_groups) = self.resource_cache.check_groups(&crd_groups);
+        // Step 3: Extract (group, version, kind) tuples from CRD list
+        let all_crds: Vec<(String, String, String)> = crd_list
+            .items
+            .iter()
+            .flat_map(|crd| {
+                // Each CRD can have multiple versions
+                crd.spec.versions.iter().filter(|v| v.served).map(move |v| {
+                    (
+                        crd.spec.group.clone(),
+                        v.name.clone(),
+                        crd.spec.names.kind.clone(),
+                    )
+                })
+            })
+            .collect();
 
-        let cached_count = cached_groups.len();
-        let missing_count = missing_groups.len();
+        // Step 4: Check which CRDs are cached vs missing
+        let (cached_resources, missing_crds) = self.resource_cache.check_crds(&all_crds);
 
-        // Step 3: Load cached groups into registry
-        for cached_group in &cached_groups {
-            for resource in &cached_group.resources {
-                registry.add(resource.clone().into());
-            }
+        let cached_count = cached_resources.len();
+        let missing_count = missing_crds.len();
+
+        // Step 5: Load cached CRDs into registry
+        for cached_resource in &cached_resources {
+            registry.add(cached_resource.clone().into());
         }
 
-        // Step 4: Discover missing groups in parallel (if any)
-        let discovered_count = if !missing_groups.is_empty() {
+        // Step 6: Discover missing CRDs (if any)
+        let discovered_count = if !missing_crds.is_empty() {
             info!(
                 context = %context,
                 cached = cached_count,
@@ -356,7 +300,7 @@ impl K8sClientPool {
                 missing_count
             );
 
-            self.process_discovered_groups(client, context, &missing_groups, registry)
+            self.process_discovered_crds(client, context, &missing_crds, &crd_list, registry)
                 .await?
         } else {
             info!(
@@ -367,56 +311,66 @@ impl K8sClientPool {
             0
         };
 
-        // Step 5: Save cluster groups list for next time
-        if let Err(e) = self
-            .resource_cache
-            .save_cluster_groups(context, &crd_groups)
-        {
-            warn!(context = %context, error = %e, "Failed to save cluster groups");
+        // Step 7: Save cluster CRD list for next time
+        if let Err(e) = self.resource_cache.save_cluster_groups(context, &all_crds) {
+            warn!(context = %context, error = %e, "Failed to save cluster CRDs");
         }
 
         // Total CRD count
-        let crd_count = cached_groups
-            .iter()
-            .map(|g| g.resources.len())
-            .sum::<usize>()
-            + discovered_count;
+        let crd_count = cached_count + discovered_count;
 
         Ok(crd_count)
     }
 
     /// Force rediscover all CRDs from the cluster
-    /// Gets fresh list of API groups but uses cached group data when available
+    /// Gets fresh list of CRDs but uses cached CRD data when available
     async fn discover_all_crds(
         &self,
         context: &str,
         client: &Client,
         registry: &mut ResourceRegistry,
     ) -> Result<usize> {
-        // Get CRD API groups only (single API call - skips core resources)
-        let crd_groups = super::discovery::get_crd_api_groups(client).await?;
+        use k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::CustomResourceDefinition;
+        use kube::{Api, api::ObjectList};
 
-        if crd_groups.is_empty() {
+        // Fetch full CRD list from cluster (single API call)
+        let api: Api<CustomResourceDefinition> = Api::all(client.clone());
+        let crd_list: ObjectList<CustomResourceDefinition> = api.list(&Default::default()).await?;
+
+        if crd_list.items.is_empty() {
             return Ok(0);
         }
 
-        // Check which groups are cached vs missing (shared cache across clusters)
-        let (cached_groups, missing_groups) = self.resource_cache.check_groups(&crd_groups);
+        // Extract (group, version, kind) tuples from CRD list
+        let all_crds: Vec<(String, String, String)> = crd_list
+            .items
+            .iter()
+            .flat_map(|crd| {
+                crd.spec.versions.iter().filter(|v| v.served).map(move |v| {
+                    (
+                        crd.spec.group.clone(),
+                        v.name.clone(),
+                        crd.spec.names.kind.clone(),
+                    )
+                })
+            })
+            .collect();
 
-        let cached_count = cached_groups.len();
-        let missing_count = missing_groups.len();
+        // Check which CRDs are cached vs missing (shared cache across clusters)
+        let (cached_resources, missing_crds) = self.resource_cache.check_crds(&all_crds);
 
-        // Load cached groups into registry
+        let cached_count = cached_resources.len();
+        let missing_count = missing_crds.len();
+
+        // Load cached CRDs into registry
         let mut crd_count = 0;
-        for cached_group in &cached_groups {
-            for resource in &cached_group.resources {
-                registry.add(resource.clone().into());
-                crd_count += 1;
-            }
+        for cached_resource in &cached_resources {
+            registry.add(cached_resource.clone().into());
+            crd_count += 1;
         }
 
-        // Discover only missing groups in parallel (if any)
-        if !missing_groups.is_empty() {
+        // Discover only missing CRDs (if any)
+        if !missing_crds.is_empty() {
             info!(
                 context = %context,
                 cached = cached_count,
@@ -427,7 +381,7 @@ impl K8sClientPool {
             );
 
             crd_count += self
-                .process_discovered_groups(client, context, &missing_groups, registry)
+                .process_discovered_crds(client, context, &missing_crds, &crd_list, registry)
                 .await?;
         } else {
             info!(
@@ -437,65 +391,95 @@ impl K8sClientPool {
             );
         }
 
-        // Save cluster groups list
-        if let Err(e) = self
-            .resource_cache
-            .save_cluster_groups(context, &crd_groups)
-        {
-            warn!(context = %context, error = %e, "Failed to save cluster groups");
+        // Save cluster CRD list
+        if let Err(e) = self.resource_cache.save_cluster_groups(context, &all_crds) {
+            warn!(context = %context, error = %e, "Failed to save cluster CRDs");
         }
 
         Ok(crd_count)
     }
 
-    /// Process newly discovered API groups: fetch schemas, cache, and add to registry
+    /// Process newly discovered CRDs: build ResourceInfo, cache, and add to registry
     ///
     /// This helper consolidates the common pattern of:
-    /// 1. Discovering groups from the API
-    /// 2. Fetching CRD schemas from OpenAPI definitions
-    /// 3. Saving to the local cache
+    /// 1. Finding CRD schemas from the pre-fetched CRD list
+    /// 2. Building ResourceInfo for each CRD
+    /// 3. Saving individual CRDs to the local cache
     /// 4. Adding to the in-memory registry
-    async fn process_discovered_groups(
+    async fn process_discovered_crds(
         &self,
-        client: &Client,
+        _client: &Client,
         context: &str,
-        groups: &[(String, String)],
+        missing_crds: &[(String, String, String)],
+        crd_list: &kube::api::ObjectList<k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::CustomResourceDefinition>,
         registry: &mut ResourceRegistry,
     ) -> Result<usize> {
-        let mut discovered = super::discovery::discover_groups(client, groups).await?;
+        use kube::discovery::ApiCapabilities;
 
-        // Fetch CRD schemas for newly discovered resources
-        for resources in discovered.values_mut() {
-            if let Err(e) = super::discovery::fetch_crd_schemas(client, resources).await {
-                warn!(context = %context, error = %e, "Failed to fetch some CRD schemas");
-            }
-        }
-
-        // Save and add discovered groups
         let mut count = 0;
-        for ((group, version), resources) in &discovered {
-            // Convert to cached format
-            let cached_resources: Vec<CachedResourceInfo> =
-                resources.iter().map(CachedResourceInfo::from).collect();
 
-            // Save to cache
+        for (group, version, kind) in missing_crds {
+            // Find CRD schema from the already-fetched list
+            let Some(schema_result) = super::discovery::find_crd_schema(group, kind, crd_list)
+            else {
+                tracing::debug!(
+                    context = %context,
+                    kind = %kind,
+                    group = %group,
+                    "CRD not found in cluster, skipping"
+                );
+                continue;
+            };
+
+            // Build API version string
+            let api_version = if group.is_empty() {
+                version.clone()
+            } else {
+                format!("{}/{}", group, version)
+            };
+
+            // Create ResourceInfo
+            let resource_info = super::discovery::ResourceInfo {
+                api_resource: kube::discovery::ApiResource {
+                    group: group.clone(),
+                    version: version.clone(),
+                    api_version,
+                    kind: kind.clone(),
+                    plural: schema_result.plural.clone(),
+                },
+                capabilities: ApiCapabilities {
+                    scope: schema_result.scope,
+                    subresources: vec![],
+                    operations: vec![],
+                },
+                table_name: schema_result.plural.to_lowercase(),
+                aliases: schema_result.short_names.clone(),
+                is_core: false,
+                group: group.clone(),
+                version: version.clone(),
+                custom_fields: schema_result.fields.clone(),
+            };
+
+            // Convert to cached format
+            let cached_resource = CachedResourceInfo::from(&resource_info);
+
+            // Save individual CRD to cache
             if let Err(e) = self
                 .resource_cache
-                .save_group(group, version, &cached_resources)
+                .save_crd(group, version, kind, &cached_resource)
             {
                 warn!(
                     context = %context,
+                    kind = %kind,
                     group = %group,
                     error = %e,
-                    "Failed to cache API group"
+                    "Failed to cache CRD"
                 );
             }
 
             // Add to registry
-            for info in resources {
-                registry.add(info.clone());
-                count += 1;
-            }
+            registry.add(resource_info);
+            count += 1;
         }
 
         Ok(count)
@@ -545,14 +529,12 @@ impl K8sClientPool {
         {
             let clients = self.clients.read().await;
             if let Some(client) = clients.get(context) {
-                self.cache_hits.fetch_add(1, Ordering::Relaxed);
                 // Emit connected event even for cached client
                 self.progress
                     .connected(context, start.elapsed().as_millis() as u64);
                 return Ok(client.clone());
             }
         }
-        self.cache_misses.fetch_add(1, Ordering::Relaxed);
 
         // Verify context exists
         if !self.kubeconfig.contexts.iter().any(|c| c.name == context) {
@@ -729,14 +711,28 @@ impl K8sClientPool {
         table: &str,
         ctx_name: &str,
     ) -> Result<kube::api::ObjectList<DynamicObject>> {
+        const MAX_RETRIES: u32 = 3;
+        const RETRY_BASE_DELAY_MS: u64 = 100;
+
+        // Check if a kube error is retryable (transient failures)
+        let is_retryable = |err: &kube::Error| -> bool {
+            match err {
+                kube::Error::HyperError(_) => true,
+                kube::Error::Api(api_err) => {
+                    matches!(api_err.code, 408 | 429 | 500 | 502 | 503 | 504)
+                }
+                _ => false,
+            }
+        };
+
         let mut last_error = None;
 
         for attempt in 0..MAX_RETRIES {
             match api.list(params).await {
                 Ok(list) => return Ok(list),
                 Err(e) => {
-                    if is_retryable_error(&e) {
-                        let delay = RETRY_BASE_DELAY * 2u32.pow(attempt);
+                    if is_retryable(&e) {
+                        let delay = Duration::from_millis(RETRY_BASE_DELAY_MS * 2u64.pow(attempt));
                         warn!(
                             table = %table,
                             context = %ctx_name,
@@ -787,15 +783,6 @@ impl K8sClientPool {
         );
 
         params
-    }
-
-    /// Get cache statistics (hits, misses)
-    #[allow(dead_code)]
-    pub fn cache_stats(&self) -> (usize, usize) {
-        (
-            self.cache_hits.load(Ordering::Relaxed),
-            self.cache_misses.load(Ordering::Relaxed),
-        )
     }
 
     /// Stream resources from Kubernetes API as pages arrive
