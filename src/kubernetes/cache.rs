@@ -247,7 +247,12 @@ impl ResourceCache {
     /// Create a new cache manager
     pub fn new() -> Result<Self> {
         let base_dir = Self::default_cache_dir()?;
-        Ok(Self { base_dir })
+        let cache = Self { base_dir };
+
+        // Warn about old cache directory from previous versions
+        cache.warn_old_cache_dir();
+
+        Ok(cache)
     }
 
     /// Get the default cache directory (~/.k8sql/cache/)
@@ -284,6 +289,20 @@ impl ResourceCache {
         std::fs::create_dir_all(self.crds_dir())
             .context("Failed to create CRDs cache directory")?;
         Ok(())
+    }
+
+    /// Warn about old cache directory from previous versions
+    /// The cache structure changed from ~/.k8sql/cache/groups/ to ~/.k8sql/cache/crds/
+    fn warn_old_cache_dir(&self) {
+        let old_groups_dir = self.base_dir.join("groups");
+        if old_groups_dir.exists() {
+            eprintln!();
+            eprintln!("⚠️  Cache Migration Notice:");
+            eprintln!("   Found old cache directory from a previous version.");
+            eprintln!("   You can safely delete it to free up disk space:");
+            eprintln!("   rm -rf {}", old_groups_dir.display());
+            eprintln!();
+        }
     }
 
     /// Load the list of CRDs for a cluster (if cached and fresh)
