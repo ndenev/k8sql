@@ -150,6 +150,18 @@ Manages connections to multiple Kubernetes clusters:
 - Caches resource registries with TTL
 - Supports parallel queries across clusters
 
+**Discovery Cache (30-minute TTL):**
+- Resource discovery (CRDs, schemas, available tables) is cached for 30 minutes
+- `USE` commands use cached discovery for instant context switching
+- Cache reduces API load and improves performance with large kubeconfigs
+- Only discovery metadata is cached - actual resource queries always hit the API
+- Force fresh discovery: restart k8sql or use `--refresh-crds` flag
+
+**Retry Logic:**
+- Connection and discovery failures retry 3 times with linear backoff (100ms, 200ms, 300ms)
+- Handles intermittent network issues and proxy problems
+- All requested contexts must succeed - no partial failures (ensures predictability for scripting)
+
 ## Key Dependencies
 
 - **datafusion**: SQL query engine (Apache Arrow-based)

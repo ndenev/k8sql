@@ -76,6 +76,9 @@ serde_yaml = "0.9"
 # Regex for LIKE pattern matching
 regex = "1"
 
+# Pin lazy-regex to 3.4.2 (3.5.0 has a bug with regex::bytes)
+lazy-regex = "=3.4.2"
+
 # Atomic file operations
 tempfile = "3"
 

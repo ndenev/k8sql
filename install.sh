@@ -7,16 +7,19 @@
 
 set -e
 
+# Create temporary directory for downloads
+TEMP_DIR=$(mktemp -d 2>/dev/null || mktemp -d -t 'k8sql-install')
+
 # Cleanup on exit
 cleanup() {
-    if [ -f "k8sql" ]; then
-        rm -f k8sql
-    fi
-    if [ -f "k8sql.sha256" ]; then
-        rm -f k8sql.sha256
+    if [ -d "$TEMP_DIR" ]; then
+        rm -rf "$TEMP_DIR"
     fi
 }
 trap cleanup EXIT INT TERM
+
+# Change to temp directory
+cd "$TEMP_DIR"
 
 # Detect OS
 OS="$(uname -s)"
