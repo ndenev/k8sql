@@ -1,0 +1,32 @@
+---
+# Config instance in default namespace
+apiVersion: k8sql.io/v1
+kind: Config
+metadata:
+  name: test-config
+  namespace: default
+  labels:
+    app: test-config
+    env: testing
+spec:
+  key: "database.host"
+  value: "postgres.example.com"
+  enabled: true
+status:
+  applied: true
+---
+# Config instance in test-ns namespace
+apiVersion: k8sql.io/v1
+kind: Config
+metadata:
+  name: test-config-2
+  namespace: test-ns
+  labels:
+    app: test-config
+    env: staging
+spec:
+  key: "cache.ttl"
+  value: "3600"
+  enabled: false
+status:
+  applied: false

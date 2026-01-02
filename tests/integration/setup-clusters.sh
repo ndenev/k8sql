@@ -54,17 +54,19 @@ kubectl --context "k3d-$CLUSTER1" wait --for=condition=Ready nodes --all --timeo
 echo "Waiting for cluster 2 to be ready..."
 kubectl --context "k3d-$CLUSTER2" wait --for=condition=Ready nodes --all --timeout=60s
 
-# Deploy CRD to both clusters (must be done before resources that use it)
-echo "Deploying CRD to cluster 1..."
+# Deploy CRDs (must be done before resources that use them)
+echo "Deploying test-crd.yaml to both clusters..."
 kubectl --context "k3d-$CLUSTER1" apply -f "$SCRIPT_DIR/fixtures/test-crd.yaml"
-
-echo "Deploying CRD to cluster 2..."
 kubectl --context "k3d-$CLUSTER2" apply -f "$SCRIPT_DIR/fixtures/test-crd.yaml"
 
-# Wait for CRD to be established
-echo "Waiting for CRD to be established..."
+echo "Deploying test-crd-2.yaml to cluster 2 only (different CRDs per cluster test)..."
+kubectl --context "k3d-$CLUSTER2" apply -f "$SCRIPT_DIR/fixtures/test-crd-2.yaml"
+
+# Wait for CRDs to be established
+echo "Waiting for CRDs to be established..."
 kubectl --context "k3d-$CLUSTER1" wait --for=condition=Established crd/testresources.k8sql.io --timeout=30s
 kubectl --context "k3d-$CLUSTER2" wait --for=condition=Established crd/testresources.k8sql.io --timeout=30s
+kubectl --context "k3d-$CLUSTER2" wait --for=condition=Established crd/configs.k8sql.io --timeout=30s
 
 # Deploy test resources to cluster 1
 echo "Deploying test resources to cluster 1..."
@@ -73,6 +75,10 @@ kubectl --context "k3d-$CLUSTER1" apply -f "$SCRIPT_DIR/fixtures/test-resources.
 # Deploy test resources to cluster 2
 echo "Deploying test resources to cluster 2..."
 kubectl --context "k3d-$CLUSTER2" apply -f "$SCRIPT_DIR/fixtures/test-resources.yaml"
+
+# Deploy Config CRD resources to cluster 2 only
+echo "Deploying Config resources to cluster 2 only..."
+kubectl --context "k3d-$CLUSTER2" apply -f "$SCRIPT_DIR/fixtures/test-config-resources.yaml"
 
 # Create an extra namespace only in cluster 2 for differentiation
 echo "Creating cluster2-only namespace..."
