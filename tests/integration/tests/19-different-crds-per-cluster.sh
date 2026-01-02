@@ -48,6 +48,9 @@ assert_min_row_count "testresources across both clusters" "k3d-k8sql-test-1" \
 # Multi-cluster wildcard query for configs (exists only in cluster 2)
 # Must query from cluster 2's context (which knows about configs table)
 # Cluster 1 will return 404 (handled gracefully), cluster 2 returns data
+echo "DEBUG: Running wildcard query..."
+$K8SQL -c "k3d-k8sql-test-2" -q "SELECT name, _cluster FROM configs WHERE _cluster = '*'" -o json 2>&1 | head -30
+
 assert_row_count "configs wildcard query from cluster 2 context" "k3d-k8sql-test-2" \
     "SELECT name, _cluster FROM configs WHERE _cluster = '*'" 2
 
