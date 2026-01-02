@@ -23,7 +23,11 @@ assert_row_count "Query testresources in cluster 1" "k3d-k8sql-test-1" \
 assert_row_count "Query testresources in cluster 2" "k3d-k8sql-test-2" \
     "SELECT name FROM testresources WHERE namespace = 'default'" 1
 
-# Query configs works in cluster 2
+# Query configs works in cluster 2  
+# First, test that we can query at all (debug output)
+echo "DEBUG: Testing configs query in cluster 2..."
+$K8SQL -c "k3d-k8sql-test-2" -q "SELECT name FROM configs WHERE namespace = 'default'" -o json 2>&1 | head -20
+
 assert_row_count "Query configs in cluster 2" "k3d-k8sql-test-2" \
     "SELECT name FROM configs WHERE namespace = 'default'" 1
 
