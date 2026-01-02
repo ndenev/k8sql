@@ -60,6 +60,15 @@ fn is_not_found_error(err: &anyhow::Error) -> bool {
     false
 }
 
+/// Check if an error is an "unknown table" error
+///
+/// Returns true for errors indicating the table/resource doesn't exist in
+/// a cluster's registry. This is expected in wildcard queries where different
+/// clusters may have different CRDs.
+fn is_unknown_table_error(err: &anyhow::Error) -> bool {
+    err.to_string().contains("Unknown table:")
+}
+
 /// A query target representing a specific (cluster, namespace) pair to fetch
 #[derive(Debug, Clone)]
 pub struct QueryTarget {
@@ -410,13 +419,13 @@ fn create_streaming_execution(
                     }
                 }
                 Err(e) => {
-                    // Check if this is a "not found" error (404)
-                    if is_not_found_error(&e) {
+                    // Check if this is a "not found" error (404 or unknown table)
+                    if is_not_found_error(&e) || is_unknown_table_error(&e) {
                         debug!(
                             cluster = %target.cluster,
                             namespace = ?target.namespace,
                             table = %table_name,
-                            "Resource/namespace not found, returning empty results"
+                            "Resource/table not found in cluster, returning empty results"
                         );
                         // Don't yield anything, just stop - partition returns no results
                         return;
