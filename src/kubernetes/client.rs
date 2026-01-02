@@ -691,34 +691,89 @@ impl K8sClientPool {
             super::context_matcher::ContextMatcher::new(&all_contexts).resolve(context_spec)?;
 
         // Ensure we have clients and discovered resources for all contexts IN PARALLEL
+        // Retry up to 3 times for intermittent failures (e.g., Teleport proxy issues)
         let discovery_futures: Vec<_> = matched_contexts
             .iter()
             .map(|ctx| {
                 let ctx = ctx.clone();
                 async move {
-                    self.get_or_create_client(&ctx)
-                        .await
-                        .with_context(|| format!("Failed to connect to cluster '{}'", ctx))?;
-                    self.discover_resources_for_context(&ctx, force_refresh)
-                        .await
-                        .with_context(|| {
-                            format!("Failed to discover resources for cluster '{}'", ctx)
-                        })?;
-                    Ok::<_, anyhow::Error>(())
+                    let mut last_error = None;
+                    for attempt in 1..=3 {
+                        match self.get_or_create_client(&ctx).await {
+                            Ok(_) => {
+                                // Client connected, now discover resources
+                                match self
+                                    .discover_resources_for_context(&ctx, force_refresh)
+                                    .await
+                                {
+                                    Ok(_) => return Ok::<_, anyhow::Error>(()),
+                                    Err(e) => {
+                                        warn!(
+                                            context = %ctx,
+                                            attempt = attempt,
+                                            error = %e,
+                                            "Discovery failed, retrying..."
+                                        );
+                                        last_error = Some(e);
+                                        if attempt < 3 {
+                                            tokio::time::sleep(std::time::Duration::from_millis(
+                                                100 * attempt as u64,
+                                            ))
+                                            .await;
+                                        }
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                warn!(
+                                    context = %ctx,
+                                    attempt = attempt,
+                                    error = %e,
+                                    "Connection failed, retrying..."
+                                );
+                                last_error = Some(e);
+                                if attempt < 3 {
+                                    tokio::time::sleep(std::time::Duration::from_millis(
+                                        100 * attempt as u64,
+                                    ))
+                                    .await;
+                                }
+                            }
+                        }
+                    }
+                    Err(last_error
+                        .unwrap()
+                        .context(format!("Failed after 3 attempts for cluster '{}'", ctx)))
                 }
             })
             .collect();
 
         let results = futures::future::join_all(discovery_futures).await;
 
-        // Check for any errors - collect all failures
-        let errors: Vec<_> = results.into_iter().filter_map(|r| r.err()).collect();
-        if !errors.is_empty() {
-            // Return first error (with context info now included)
-            return Err(errors.into_iter().next().unwrap());
+        // Check for any errors - fail if ANY context fails (after retries)
+        // This ensures predictable behavior for scripting and avoids misleading partial success
+        let mut failed_contexts = Vec::new();
+        for (ctx, result) in matched_contexts.iter().zip(results.iter()) {
+            if let Err(e) = result {
+                failed_contexts.push((ctx.clone(), e.to_string()));
+            }
         }
 
-        // Update current contexts
+        if !failed_contexts.is_empty() {
+            let error_summary = failed_contexts
+                .iter()
+                .map(|(ctx, e)| format!("  - {}: {}", ctx, e))
+                .collect::<Vec<_>>()
+                .join("\n");
+            return Err(anyhow!(
+                "Failed to load {} of {} requested contexts:\n{}",
+                failed_contexts.len(),
+                matched_contexts.len(),
+                error_summary
+            ));
+        }
+
+        // All contexts loaded successfully - update current contexts
         *self.current_contexts.write().await = matched_contexts;
 
         Ok(())
