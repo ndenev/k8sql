@@ -12,8 +12,6 @@ spec:
   key: "database.host"
   value: "postgres.example.com"
   enabled: true
-status:
-  applied: true
 ---
 # Config instance in test-ns namespace
 apiVersion: k8sql.io/v1
@@ -28,5 +26,3 @@ spec:
   key: "cache.ttl"
   value: "3600"
   enabled: false
-status:
-  applied: false

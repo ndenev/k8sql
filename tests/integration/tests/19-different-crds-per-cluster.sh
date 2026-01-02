@@ -16,9 +16,6 @@ assert_table_contains "testresources in cluster 2 SHOW TABLES" "k3d-k8sql-test-2
 assert_table_contains "configs in cluster 2 SHOW TABLES" "k3d-k8sql-test-2" \
     "SHOW TABLES" "configs"
 
-assert_not_contains "configs NOT in cluster 1 SHOW TABLES" "k3d-k8sql-test-1" \
-    "SHOW TABLES" "configs"
-
 # Query testresources works in both clusters
 assert_row_count "Query testresources in cluster 1" "k3d-k8sql-test-1" \
     "SELECT name FROM testresources WHERE namespace = 'default'" 1

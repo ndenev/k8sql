@@ -78,7 +78,17 @@ kubectl --context "k3d-$CLUSTER2" apply -f "$SCRIPT_DIR/fixtures/test-resources.
 
 # Deploy Config CRD resources to cluster 2 only
 echo "Deploying Config resources to cluster 2 only..."
-kubectl --context "k3d-$CLUSTER2" apply -f "$SCRIPT_DIR/fixtures/test-config-resources.yaml"
+kubectl --context "k3d-$CLUSTER2" apply -f "$SCRIPT_DIR/fixtures/test-config-resources.yaml" || {
+    echo "Failed to deploy Config resources"
+    exit 1
+}
+
+# Verify Config resources were created
+echo "Verifying Config resources in cluster 2..."
+kubectl --context "k3d-$CLUSTER2" get configs -A || {
+    echo "Config resources not found in cluster 2"
+    exit 1
+}
 
 # Create an extra namespace only in cluster 2 for differentiation
 echo "Creating cluster2-only namespace..."
