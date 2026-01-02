@@ -81,6 +81,8 @@ pub struct CachedResourceInfo {
     // CRD schema fields (extracted from OpenAPI definition)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub custom_fields: Option<Vec<CachedColumnDef>>,
+    // Cache metadata
+    pub created_at: u64,
 }
 
 impl From<&ResourceInfo> for CachedResourceInfo {
@@ -102,6 +104,10 @@ impl From<&ResourceInfo> for CachedResourceInfo {
                 .custom_fields
                 .as_ref()
                 .map(|fields| fields.iter().map(CachedColumnDef::from).collect()),
+            created_at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
         }
     }
 }
@@ -139,11 +145,11 @@ impl From<CachedResourceInfo> for ResourceInfo {
     }
 }
 
-/// Cluster API groups list (which groups this cluster has)
+/// Cluster CRD list (which CRDs this cluster has)
 #[derive(Debug, Serialize, Deserialize)]
-pub struct ClusterGroups {
-    /// List of (group, version) pairs
-    pub groups: Vec<(String, String)>,
+pub struct ClusterCRDs {
+    /// List of (group, version, kind) tuples
+    pub crds: Vec<(String, String, String)>,
     /// When this was cached
     pub created_at: u64,
 }
@@ -157,45 +163,14 @@ fn is_cache_fresh(created_at: u64, ttl: Duration) -> bool {
     now.saturating_sub(created_at) < ttl.as_secs()
 }
 
-impl ClusterGroups {
-    pub fn new(groups: Vec<(String, String)>) -> Self {
+impl ClusterCRDs {
+    pub fn new(crds: Vec<(String, String, String)>) -> Self {
         Self {
-            groups,
+            crds,
             created_at: SystemTime::now()
                 .duration_since(SystemTime::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs(),
-        }
-    }
-
-    pub fn is_fresh(&self, ttl: Duration) -> bool {
-        is_cache_fresh(self.created_at, ttl)
-    }
-}
-
-/// Cached resources for a single API group
-#[derive(Debug, Serialize, Deserialize)]
-pub struct CachedGroup {
-    /// API group name (empty string for core)
-    pub group: String,
-    /// API version
-    pub version: String,
-    /// When this was cached
-    pub created_at: u64,
-    /// Resources in this group
-    pub resources: Vec<CachedResourceInfo>,
-}
-
-impl CachedGroup {
-    pub fn new(group: String, version: String, resources: Vec<CachedResourceInfo>) -> Self {
-        Self {
-            group,
-            version,
-            created_at: SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs(),
-            resources,
         }
     }
 
@@ -218,43 +193,75 @@ fn sanitize_filename(name: &str, allow_underscore: bool) -> String {
         .collect()
 }
 
-/// Compute a cache key for an API group
-pub fn group_cache_key(group: &str, version: &str) -> String {
+/// Compute a cache key for a CRD (group_version format for directory, kind for filename)
+pub fn crd_cache_key(group: &str, version: &str, kind: &str) -> (String, String) {
     let safe_group = if group.is_empty() {
         "core".to_string()
     } else {
         sanitize_filename(group, false)
     };
-    format!("{}_{}", safe_group, version)
+    let dir_name = format!("{}_{}", safe_group, version);
+    let file_name = format!("{}.json", sanitize_filename(kind, false));
+    (dir_name, file_name)
 }
 
-/// Resource cache manager with per-API-group caching
+/// Resource cache manager with per-CRD caching
 ///
 /// Cache structure:
 /// ```
 /// ~/.cache/k8sql/
-///   groups/
-///     <group>_<version>.json   # Resources for this API group (shared across clusters)
+///   crds/
+///     <group>_<version>/
+///       <kind>.json            # Individual CRD cached independently
 ///   clusters/
-///     <cluster>.json           # List of (group, version) pairs this cluster has
+///     <cluster>.json           # List of (group, version, kind) tuples this cluster has
 /// ```
 ///
-/// This enables efficient incremental updates:
-/// - If a cluster adds one new CRD, only that API group needs to be discovered
-/// - Common CRDs (cert-manager, istio, etc.) are shared across clusters
+/// Example:
+/// ```
+/// ~/.cache/k8sql/
+///   crds/
+///     core_v1/
+///       Pod.json
+///       Service.json
+///     cert-manager_io_v1/
+///       Certificate.json
+///       Issuer.json
+///   clusters/
+///     prod-cluster.json        # [("apps", "v1", "Deployment"), ...]
+/// ```
+///
+/// This enables correct multi-cluster caching:
+/// - Different clusters can have different CRDs in the same API group
+/// - Each CRD cached independently (no false cache hits)
+/// - Common CRDs are still shared across clusters (same file)
 ///
 /// Caching strategy:
-/// - Cluster groups list: 1 hour TTL (detect new/removed CRDs)
+/// - Cluster CRD list: 1 hour TTL (detect new/removed CRDs)
 /// - CRD schemas: Indefinite (schemas rarely change, refresh via --refresh-crds)
+///
+/// Thread safety:
+/// - write_lock protects concurrent writes from multiple threads
+/// - Atomic file writes (tempfile + rename) protect against crashes and multiple processes
 pub struct ResourceCache {
     base_dir: PathBuf,
+    /// Protects cache writes from concurrent threads
+    write_lock: std::sync::Mutex<()>,
 }
 
 impl ResourceCache {
     /// Create a new cache manager
     pub fn new() -> Result<Self> {
         let base_dir = Self::default_cache_dir()?;
-        Ok(Self { base_dir })
+        let cache = Self {
+            base_dir,
+            write_lock: std::sync::Mutex::new(()),
+        };
+
+        // Warn about old cache directory from previous versions
+        cache.warn_old_cache_dir();
+
+        Ok(cache)
     }
 
     /// Get the default cache directory (~/.k8sql/cache/)
@@ -267,9 +274,9 @@ impl ResourceCache {
         self.base_dir.join("clusters")
     }
 
-    /// Get the groups directory
-    fn groups_dir(&self) -> PathBuf {
-        self.base_dir.join("groups")
+    /// Get the CRDs directory
+    fn crds_dir(&self) -> PathBuf {
+        self.base_dir.join("crds")
     }
 
     /// Get the cluster mapping file path
@@ -278,57 +285,78 @@ impl ResourceCache {
         self.clusters_dir().join(format!("{}.json", safe_name))
     }
 
-    /// Get the group cache file path
-    fn group_path(&self, group: &str, version: &str) -> PathBuf {
-        let key = group_cache_key(group, version);
-        self.groups_dir().join(format!("{}.json", key))
+    /// Get the CRD cache file path (two-level structure: crds/{group}_{version}/{kind}.json)
+    fn crd_path(&self, group: &str, version: &str, kind: &str) -> PathBuf {
+        let (dir_name, file_name) = crd_cache_key(group, version, kind);
+        self.crds_dir().join(dir_name).join(file_name)
     }
 
     /// Ensure cache directories exist
     fn ensure_dirs(&self) -> Result<()> {
         std::fs::create_dir_all(self.clusters_dir())
             .context("Failed to create clusters cache directory")?;
-        std::fs::create_dir_all(self.groups_dir())
-            .context("Failed to create groups cache directory")?;
+        std::fs::create_dir_all(self.crds_dir())
+            .context("Failed to create CRDs cache directory")?;
         Ok(())
     }
 
-    /// Load the list of API groups for a cluster (if cached and fresh)
+    /// Warn about old cache directory from previous versions
+    /// The cache structure changed from ~/.k8sql/cache/groups/ to ~/.k8sql/cache/crds/
+    fn warn_old_cache_dir(&self) {
+        let old_groups_dir = self.base_dir.join("groups");
+        if old_groups_dir.exists() {
+            eprintln!();
+            eprintln!("⚠️  Cache Migration Notice:");
+            eprintln!("   Found old cache directory from a previous version.");
+            eprintln!("   You can safely delete it to free up disk space:");
+            eprintln!("   rm -rf {}", old_groups_dir.display());
+            eprintln!();
+        }
+    }
+
+    /// Load the list of CRDs for a cluster (if cached and fresh)
     /// Uses CLUSTER_GROUPS_TTL (1 hour) to detect new/removed CRDs
-    pub fn load_cluster_groups(&self, cluster: &str) -> Option<Vec<(String, String)>> {
+    pub fn load_cluster_groups(&self, cluster: &str) -> Option<Vec<(String, String, String)>> {
         let path = self.cluster_path(cluster);
         if !path.exists() {
             return None;
         }
 
         let content = std::fs::read_to_string(&path).ok()?;
-        let cluster_groups: ClusterGroups = serde_json::from_str(&content).ok()?;
+        let cluster_crds: ClusterCRDs = serde_json::from_str(&content).ok()?;
 
-        if cluster_groups.is_fresh(CLUSTER_GROUPS_TTL) {
-            Some(cluster_groups.groups)
+        if cluster_crds.is_fresh(CLUSTER_GROUPS_TTL) {
+            Some(cluster_crds.crds)
         } else {
             let _ = std::fs::remove_file(&path);
             None
         }
     }
 
-    /// Load a single API group's resources (cached indefinitely)
+    /// Load a single CRD's resource (cached indefinitely)
     /// CRD schemas rarely change, so we cache them forever.
     /// Use --refresh-crds or clear the cache to force a refresh.
-    pub fn load_group(&self, group: &str, version: &str) -> Option<CachedGroup> {
-        let path = self.group_path(group, version);
+    pub fn load_crd(&self, group: &str, version: &str, kind: &str) -> Option<CachedResourceInfo> {
+        let path = self.crd_path(group, version, kind);
         if !path.exists() {
             return None;
         }
 
         let content = std::fs::read_to_string(&path).ok()?;
-        let cached: CachedGroup = serde_json::from_str(&content).ok()?;
+        let cached: CachedResourceInfo = serde_json::from_str(&content)
+            .map_err(|e| {
+                eprintln!("⚠️  Failed to parse cache file: {}", path.display());
+                eprintln!("   Error: {}", e);
+                eprintln!("   The cache may be outdated. To fix, run: rm -rf ~/.k8sql/cache");
+                e
+            })
+            .ok()?;
 
         // CRD schemas are cached indefinitely (SCHEMA_CACHE_TTL = None)
         // Only refresh on error or explicit --refresh-crds flag
         match SCHEMA_CACHE_TTL {
             Some(ttl) => {
-                if cached.is_fresh(ttl) {
+                if is_cache_fresh(cached.created_at, ttl) {
                     Some(cached)
                 } else {
                     let _ = std::fs::remove_file(&path);
@@ -339,57 +367,106 @@ impl ResourceCache {
         }
     }
 
-    /// Check which API groups are missing from cache
-    /// Returns (cached_groups, missing_groups)
-    pub fn check_groups(
+    /// Check which CRDs are missing from cache
+    /// Returns (cached_crds, missing_crds)
+    pub fn check_crds(
         &self,
-        api_groups: &[(String, String)],
-    ) -> (Vec<CachedGroup>, Vec<(String, String)>) {
+        crds: &[(String, String, String)],
+    ) -> (Vec<CachedResourceInfo>, Vec<(String, String, String)>) {
         let mut cached = Vec::new();
         let mut missing = Vec::new();
 
-        for (group, version) in api_groups {
-            if let Some(cached_group) = self.load_group(group, version) {
-                cached.push(cached_group);
+        for (group, version, kind) in crds {
+            if let Some(cached_crd) = self.load_crd(group, version, kind) {
+                cached.push(cached_crd);
             } else {
-                missing.push((group.clone(), version.clone()));
+                missing.push((group.clone(), version.clone(), kind.clone()));
             }
         }
 
         (cached, missing)
     }
 
-    /// Save the list of API groups for a cluster
-    pub fn save_cluster_groups(&self, cluster: &str, groups: &[(String, String)]) -> Result<()> {
+    /// Save the list of CRDs for a cluster with thread-safe atomic writes
+    pub fn save_cluster_groups(
+        &self,
+        cluster: &str,
+        crds: &[(String, String, String)],
+    ) -> Result<()> {
         self.ensure_dirs()?;
 
-        let cluster_groups = ClusterGroups::new(groups.to_vec());
-        let content = serde_json::to_string_pretty(&cluster_groups)
-            .context("Failed to serialize cluster groups")?;
+        // Serialize first (outside the lock)
+        let cluster_crds = ClusterCRDs::new(crds.to_vec());
+        let content = serde_json::to_string_pretty(&cluster_crds)
+            .context("Failed to serialize cluster CRDs")?;
+
+        // Acquire write lock for thread safety
+        let _lock = self.write_lock.lock().unwrap();
 
         let path = self.cluster_path(cluster);
-        std::fs::write(&path, content)
-            .with_context(|| format!("Failed to write cluster groups to {:?}", path))?;
+
+        // Atomic write: create temp file in same directory, write, then rename
+        let temp_file = tempfile::NamedTempFile::new_in(
+            path.parent().unwrap_or_else(|| std::path::Path::new(".")),
+        )
+        .context("Failed to create temp file for cluster CRDs")?;
+
+        std::fs::write(temp_file.path(), &content).with_context(|| {
+            format!(
+                "Failed to write temp cluster CRDs to {:?}",
+                temp_file.path()
+            )
+        })?;
+
+        // Atomically rename to final path
+        temp_file
+            .persist(&path)
+            .with_context(|| format!("Failed to persist cluster CRDs to {:?}", path))?;
 
         Ok(())
     }
 
-    /// Save a single API group's resources
-    pub fn save_group(
+    /// Save a single CRD's resource with thread-safe atomic writes
+    ///
+    /// Uses both:
+    /// - Mutex for thread safety (parallel cluster discovery)
+    /// - Atomic writes (tempfile + rename) for crash safety and multi-process safety
+    pub fn save_crd(
         &self,
         group: &str,
         version: &str,
-        resources: &[CachedResourceInfo],
+        kind: &str,
+        resource: &CachedResourceInfo,
     ) -> Result<()> {
-        self.ensure_dirs()?;
-
-        let cached = CachedGroup::new(group.to_string(), version.to_string(), resources.to_vec());
+        // Serialize first (outside the lock)
         let content =
-            serde_json::to_string_pretty(&cached).context("Failed to serialize group cache")?;
+            serde_json::to_string_pretty(resource).context("Failed to serialize CRD cache")?;
 
-        let path = self.group_path(group, version);
-        std::fs::write(&path, content)
-            .with_context(|| format!("Failed to write group cache to {:?}", path))?;
+        // Acquire write lock for thread safety
+        let _lock = self.write_lock.lock().unwrap();
+
+        let path = self.crd_path(group, version, kind);
+
+        // Ensure parent directory exists
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("Failed to create CRD cache directory {:?}", parent))?;
+        }
+
+        // Atomic write: create temp file in same directory, write, then rename
+        // This protects against crashes and multiple k8sql instances
+        let temp_file = tempfile::NamedTempFile::new_in(
+            path.parent().unwrap_or_else(|| std::path::Path::new(".")),
+        )
+        .context("Failed to create temp file for CRD cache")?;
+
+        std::fs::write(temp_file.path(), &content)
+            .with_context(|| format!("Failed to write temp CRD cache to {:?}", temp_file.path()))?;
+
+        // Atomically rename to final path (atomic on Unix-like systems)
+        temp_file
+            .persist(&path)
+            .with_context(|| format!("Failed to persist CRD cache to {:?}", path))?;
 
         Ok(())
     }
@@ -413,12 +490,12 @@ impl ResourceCache {
         Ok(())
     }
 
-    /// Clear all cached CRD schemas (groups directory)
+    /// Clear all cached CRD schemas (crds directory)
     /// Called when --refresh-crds flag is used
-    pub fn clear_groups(&self) -> Result<()> {
-        let groups_dir = self.groups_dir();
-        if groups_dir.exists() {
-            std::fs::remove_dir_all(&groups_dir)?;
+    pub fn clear_crds(&self) -> Result<()> {
+        let crds_dir = self.crds_dir();
+        if crds_dir.exists() {
+            std::fs::remove_dir_all(&crds_dir)?;
         }
         Ok(())
     }
@@ -440,6 +517,7 @@ mod tests {
         let temp_dir = TempDir::new().expect("Failed to create temp dir");
         let cache = ResourceCache {
             base_dir: temp_dir.path().to_path_buf(),
+            write_lock: std::sync::Mutex::new(()),
         };
         (cache, temp_dir)
     }
@@ -461,35 +539,41 @@ mod tests {
             aliases: vec![name.to_lowercase()],
             is_core: false,
             custom_fields: None,
+            created_at: SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
         }
     }
 
     #[test]
-    fn test_group_cache_key_core() {
+    fn test_crd_cache_key_core() {
         // Empty group should become "core"
-        assert_eq!(group_cache_key("", "v1"), "core_v1");
+        let (dir, file) = crd_cache_key("", "v1", "Pod");
+        assert_eq!(dir, "core_v1");
+        assert_eq!(file, "Pod.json");
     }
 
     #[test]
-    fn test_group_cache_key_simple() {
-        assert_eq!(group_cache_key("apps", "v1"), "apps_v1");
+    fn test_crd_cache_key_simple() {
+        let (dir, file) = crd_cache_key("apps", "v1", "Deployment");
+        assert_eq!(dir, "apps_v1");
+        assert_eq!(file, "Deployment.json");
     }
 
     #[test]
-    fn test_group_cache_key_with_dots() {
+    fn test_crd_cache_key_with_dots() {
         // Dots should be replaced with underscores
-        assert_eq!(
-            group_cache_key("cert-manager.io", "v1"),
-            "cert-manager_io_v1"
-        );
+        let (dir, file) = crd_cache_key("cert-manager.io", "v1", "Certificate");
+        assert_eq!(dir, "cert-manager_io_v1");
+        assert_eq!(file, "Certificate.json");
     }
 
     #[test]
-    fn test_group_cache_key_complex() {
-        assert_eq!(
-            group_cache_key("networking.k8s.io", "v1"),
-            "networking_k8s_io_v1"
-        );
+    fn test_crd_cache_key_complex() {
+        let (dir, file) = crd_cache_key("networking.k8s.io", "v1", "Ingress");
+        assert_eq!(dir, "networking_k8s_io_v1");
+        assert_eq!(file, "Ingress.json");
     }
 
     #[test]
@@ -568,162 +652,200 @@ mod tests {
     }
 
     #[test]
-    fn test_cluster_groups_freshness() {
-        let groups = ClusterGroups::new(vec![
-            ("apps".to_string(), "v1".to_string()),
-            ("batch".to_string(), "v1".to_string()),
+    fn test_cluster_crds_freshness() {
+        let crds = ClusterCRDs::new(vec![
+            (
+                "apps".to_string(),
+                "v1".to_string(),
+                "Deployment".to_string(),
+            ),
+            ("batch".to_string(), "v1".to_string(), "Job".to_string()),
         ]);
 
         // Should be fresh with default TTL
-        assert!(groups.is_fresh(Duration::from_secs(60)));
+        assert!(crds.is_fresh(Duration::from_secs(60)));
 
         // Should be fresh with 1 second TTL (just created)
-        assert!(groups.is_fresh(Duration::from_secs(1)));
+        assert!(crds.is_fresh(Duration::from_secs(1)));
 
         // Should not be fresh with 0 TTL
-        assert!(!groups.is_fresh(Duration::from_secs(0)));
+        assert!(!crds.is_fresh(Duration::from_secs(0)));
     }
 
     #[test]
-    fn test_cached_group_freshness() {
-        let group = CachedGroup::new(
-            "cert-manager.io".to_string(),
-            "v1".to_string(),
-            vec![sample_cached_resource(
-                "Certificate",
-                "cert-manager.io",
-                "v1",
-            )],
-        );
+    fn test_cached_resource_freshness() {
+        let resource = sample_cached_resource("Certificate", "cert-manager.io", "v1");
 
         // Should be fresh with default TTL
-        assert!(group.is_fresh(Duration::from_secs(60)));
+        assert!(is_cache_fresh(resource.created_at, Duration::from_secs(60)));
 
         // Should not be fresh with 0 TTL
-        assert!(!group.is_fresh(Duration::from_secs(0)));
+        assert!(!is_cache_fresh(resource.created_at, Duration::from_secs(0)));
     }
 
     #[test]
-    fn test_save_and_load_group() {
+    fn test_save_and_load_crd() {
         let (cache, _temp_dir) = test_cache();
 
-        let resources = vec![
-            sample_cached_resource("Certificate", "cert-manager.io", "v1"),
-            sample_cached_resource("Issuer", "cert-manager.io", "v1"),
-        ];
+        let certificate = sample_cached_resource("Certificate", "cert-manager.io", "v1");
+        let issuer = sample_cached_resource("Issuer", "cert-manager.io", "v1");
 
-        // Save the group
+        // Save individual CRDs
         cache
-            .save_group("cert-manager.io", "v1", &resources)
-            .expect("Failed to save group");
+            .save_crd("cert-manager.io", "v1", "Certificate", &certificate)
+            .expect("Failed to save Certificate CRD");
+        cache
+            .save_crd("cert-manager.io", "v1", "Issuer", &issuer)
+            .expect("Failed to save Issuer CRD");
 
-        // Load it back
-        let loaded = cache
-            .load_group("cert-manager.io", "v1")
-            .expect("Failed to load group");
+        // Load them back
+        let loaded_cert = cache
+            .load_crd("cert-manager.io", "v1", "Certificate")
+            .expect("Failed to load Certificate CRD");
+        let loaded_issuer = cache
+            .load_crd("cert-manager.io", "v1", "Issuer")
+            .expect("Failed to load Issuer CRD");
 
-        assert_eq!(loaded.group, "cert-manager.io");
-        assert_eq!(loaded.version, "v1");
-        assert_eq!(loaded.resources.len(), 2);
-        assert_eq!(loaded.resources[0].kind, "Certificate");
-        assert_eq!(loaded.resources[1].kind, "Issuer");
+        assert_eq!(loaded_cert.group, "cert-manager.io");
+        assert_eq!(loaded_cert.version, "v1");
+        assert_eq!(loaded_cert.kind, "Certificate");
+
+        assert_eq!(loaded_issuer.group, "cert-manager.io");
+        assert_eq!(loaded_issuer.version, "v1");
+        assert_eq!(loaded_issuer.kind, "Issuer");
     }
 
     #[test]
-    fn test_save_and_load_cluster_groups() {
+    fn test_save_and_load_cluster_crds() {
         let (cache, _temp_dir) = test_cache();
 
-        let groups = vec![
-            ("apps".to_string(), "v1".to_string()),
-            ("cert-manager.io".to_string(), "v1".to_string()),
-            ("".to_string(), "v1".to_string()), // core API
+        let crds = vec![
+            (
+                "apps".to_string(),
+                "v1".to_string(),
+                "Deployment".to_string(),
+            ),
+            (
+                "cert-manager.io".to_string(),
+                "v1".to_string(),
+                "Certificate".to_string(),
+            ),
+            ("".to_string(), "v1".to_string(), "Pod".to_string()), // core API
         ];
 
-        // Save cluster groups
+        // Save cluster CRDs
         cache
-            .save_cluster_groups("test-cluster", &groups)
-            .expect("Failed to save cluster groups");
+            .save_cluster_groups("test-cluster", &crds)
+            .expect("Failed to save cluster CRDs");
 
         // Load them back
         let loaded = cache
             .load_cluster_groups("test-cluster")
-            .expect("Failed to load cluster groups");
+            .expect("Failed to load cluster CRDs");
 
         assert_eq!(loaded.len(), 3);
-        assert!(loaded.contains(&("apps".to_string(), "v1".to_string())));
-        assert!(loaded.contains(&("cert-manager.io".to_string(), "v1".to_string())));
+        assert!(loaded.contains(&(
+            "apps".to_string(),
+            "v1".to_string(),
+            "Deployment".to_string()
+        )));
+        assert!(loaded.contains(&(
+            "cert-manager.io".to_string(),
+            "v1".to_string(),
+            "Certificate".to_string()
+        )));
+        assert!(loaded.contains(&("".to_string(), "v1".to_string(), "Pod".to_string())));
     }
 
     #[test]
-    fn test_check_groups_all_cached() {
+    fn test_check_crds_all_cached() {
         let (cache, _temp_dir) = test_cache();
 
-        // Save some groups
+        // Save some CRDs
         cache
-            .save_group(
+            .save_crd(
                 "apps",
                 "v1",
-                &[sample_cached_resource("Deployment", "apps", "v1")],
+                "Deployment",
+                &sample_cached_resource("Deployment", "apps", "v1"),
             )
             .unwrap();
         cache
-            .save_group(
+            .save_crd(
                 "batch",
                 "v1",
-                &[sample_cached_resource("Job", "batch", "v1")],
+                "Job",
+                &sample_cached_resource("Job", "batch", "v1"),
             )
             .unwrap();
 
-        // Check groups - all should be cached
-        let api_groups = vec![
-            ("apps".to_string(), "v1".to_string()),
-            ("batch".to_string(), "v1".to_string()),
+        // Check CRDs - all should be cached
+        let crds = vec![
+            (
+                "apps".to_string(),
+                "v1".to_string(),
+                "Deployment".to_string(),
+            ),
+            ("batch".to_string(), "v1".to_string(), "Job".to_string()),
         ];
 
-        let (cached, missing) = cache.check_groups(&api_groups);
+        let (cached, missing) = cache.check_crds(&crds);
 
         assert_eq!(cached.len(), 2);
         assert!(missing.is_empty());
     }
 
     #[test]
-    fn test_check_groups_some_missing() {
+    fn test_check_crds_some_missing() {
         let (cache, _temp_dir) = test_cache();
 
-        // Save only one group
+        // Save only one CRD
         cache
-            .save_group(
+            .save_crd(
                 "apps",
                 "v1",
-                &[sample_cached_resource("Deployment", "apps", "v1")],
+                "Deployment",
+                &sample_cached_resource("Deployment", "apps", "v1"),
             )
             .unwrap();
 
-        // Check groups - one cached, one missing
-        let api_groups = vec![
-            ("apps".to_string(), "v1".to_string()),
-            ("batch".to_string(), "v1".to_string()),
+        // Check CRDs - one cached, one missing
+        let crds = vec![
+            (
+                "apps".to_string(),
+                "v1".to_string(),
+                "Deployment".to_string(),
+            ),
+            ("batch".to_string(), "v1".to_string(), "Job".to_string()),
         ];
 
-        let (cached, missing) = cache.check_groups(&api_groups);
+        let (cached, missing) = cache.check_crds(&crds);
 
         assert_eq!(cached.len(), 1);
         assert_eq!(cached[0].group, "apps");
+        assert_eq!(cached[0].kind, "Deployment");
         assert_eq!(missing.len(), 1);
-        assert_eq!(missing[0], ("batch".to_string(), "v1".to_string()));
+        assert_eq!(
+            missing[0],
+            ("batch".to_string(), "v1".to_string(), "Job".to_string())
+        );
     }
 
     #[test]
-    fn test_check_groups_all_missing() {
+    fn test_check_crds_all_missing() {
         let (cache, _temp_dir) = test_cache();
 
         // Don't save anything
-        let api_groups = vec![
-            ("apps".to_string(), "v1".to_string()),
-            ("batch".to_string(), "v1".to_string()),
+        let crds = vec![
+            (
+                "apps".to_string(),
+                "v1".to_string(),
+                "Deployment".to_string(),
+            ),
+            ("batch".to_string(), "v1".to_string(), "Job".to_string()),
         ];
 
-        let (cached, missing) = cache.check_groups(&api_groups);
+        let (cached, missing) = cache.check_crds(&crds);
 
         assert!(cached.is_empty());
         assert_eq!(missing.len(), 2);
@@ -733,9 +855,16 @@ mod tests {
     fn test_clear_cluster() {
         let (cache, _temp_dir) = test_cache();
 
-        // Save cluster groups
+        // Save cluster CRDs
         cache
-            .save_cluster_groups("test-cluster", &[("apps".to_string(), "v1".to_string())])
+            .save_cluster_groups(
+                "test-cluster",
+                &[(
+                    "apps".to_string(),
+                    "v1".to_string(),
+                    "Deployment".to_string(),
+                )],
+            )
             .unwrap();
 
         // Verify it exists
@@ -754,13 +883,21 @@ mod tests {
 
         // Save some data
         cache
-            .save_cluster_groups("cluster1", &[("apps".to_string(), "v1".to_string())])
+            .save_cluster_groups(
+                "cluster1",
+                &[(
+                    "apps".to_string(),
+                    "v1".to_string(),
+                    "Deployment".to_string(),
+                )],
+            )
             .unwrap();
         cache
-            .save_group(
+            .save_crd(
                 "apps",
                 "v1",
-                &[sample_cached_resource("Deployment", "apps", "v1")],
+                "Deployment",
+                &sample_cached_resource("Deployment", "apps", "v1"),
             )
             .unwrap();
 
@@ -769,7 +906,7 @@ mod tests {
 
         // Verify everything is gone
         assert!(cache.load_cluster_groups("cluster1").is_none());
-        assert!(cache.load_group("apps", "v1").is_none());
+        assert!(cache.load_crd("apps", "v1", "Deployment").is_none());
     }
 
     #[test]
@@ -780,7 +917,14 @@ mod tests {
         let cluster_name = "arn:aws:eks:us-west-2:123456789:cluster/my-cluster";
 
         cache
-            .save_cluster_groups(cluster_name, &[("apps".to_string(), "v1".to_string())])
+            .save_cluster_groups(
+                cluster_name,
+                &[(
+                    "apps".to_string(),
+                    "v1".to_string(),
+                    "Deployment".to_string(),
+                )],
+            )
             .unwrap();
 
         // Should be able to load it back

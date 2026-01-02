@@ -322,7 +322,6 @@ impl ExecutionPlan for K8sExecutionPlan {
             table_name,
             target,
             api_filters,
-            schema.clone(),
             fetch_limit,
             columns,
             rows_fetched,
@@ -344,7 +343,6 @@ fn create_streaming_execution(
     table_name: String,
     target: QueryTarget,
     api_filters: ApiFilters,
-    schema: SchemaRef,
     fetch_limit: Option<usize>,
     columns: Arc<Vec<ColumnDef>>,
     rows_fetched: datafusion::physical_plan::metrics::Count,
@@ -410,16 +408,15 @@ fn create_streaming_execution(
                     }
                 }
                 Err(e) => {
-                    // Check if this is a "not found" error (404)
+                    // Check if this is a Kubernetes "not found" (404) error
                     if is_not_found_error(&e) {
                         debug!(
                             cluster = %target.cluster,
                             namespace = ?target.namespace,
                             table = %table_name,
-                            "Resource/namespace not found, returning empty results"
+                            "Resource/table not found in cluster, returning empty results"
                         );
-                        // Yield empty batch and stop
-                        yield RecordBatch::new_empty(schema.clone());
+                        // Don't yield anything, just stop - partition returns no results
                         return;
                     } else {
                         // Real errors should fail

@@ -10,8 +10,6 @@ use anyhow::Result;
 use k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::{
     CustomResourceDefinition, JSONSchemaProps,
 };
-use kube::Client;
-use kube::api::Api;
 use kube::api::ObjectList;
 use kube::discovery::{ApiCapabilities, ApiResource, Scope};
 use std::collections::HashMap;
@@ -101,13 +99,17 @@ impl ColumnDef {
 
 /// Result of CRD schema detection
 ///
-/// Contains extracted schema information and short names from a CRD.
+/// Contains extracted schema information and metadata from a CRD.
 #[derive(Debug, Clone)]
 pub struct SchemaResult {
     /// Schema fields from CRD OpenAPI definition (None if no schema defined)
     pub fields: Option<Vec<ColumnDef>>,
     /// Short names from CRD spec.names.shortNames
     pub short_names: Vec<String>,
+    /// Plural name for the resource (table name)
+    pub plural: String,
+    /// Resource scope (Namespaced or Cluster)
+    pub scope: kube::discovery::Scope,
 }
 
 /// Information about a discovered Kubernetes resource
@@ -227,24 +229,6 @@ impl ResourceRegistry {
     }
 }
 
-/// Check if an API group is a core Kubernetes group (not a CRD)
-///
-/// Core groups are:
-/// 1. Groups we have static k8s-openapi types for (apps, batch, etc.)
-/// 2. All *.k8s.io groups (core K8s APIs like authorization.k8s.io, events.k8s.io)
-pub fn is_core_api_group(group: &str) -> bool {
-    // Empty string is core/v1
-    if group.is_empty() {
-        return true;
-    }
-    // All *.k8s.io groups are core Kubernetes APIs
-    if group.ends_with(".k8s.io") {
-        return true;
-    }
-    // These are the short names without .k8s.io suffix
-    matches!(group, "apps" | "batch" | "policy" | "autoscaling")
-}
-
 /// Map OpenAPI schema type to column data type
 fn openapi_type_to_column_type(schema: &JSONSchemaProps) -> ColumnDataType {
     // Check format first for more specific types
@@ -327,115 +311,45 @@ pub fn find_crd_schema(
     kind: &str,
     crd_list: &ObjectList<CustomResourceDefinition>,
 ) -> Option<SchemaResult> {
-    // CRD name is plural.group (e.g., "certificates.cert-manager.io")
-    // But we receive the group and kind, so we need to construct the CRD name
-    // The CRD name format is: <plural>.<group>
-    // We'll try to fetch by listing CRDs and matching group + kind
-
     // Find the CRD that matches our group and kind
     let crd = crd_list
         .items
         .iter()
-        .find(|crd| crd.spec.group == group && crd.spec.names.kind.eq_ignore_ascii_case(kind));
+        .find(|crd| crd.spec.group == group && crd.spec.names.kind.eq_ignore_ascii_case(kind))?;
 
-    crd.map(|crd| {
-        // Extract short names from CRD spec.names.shortNames
-        let short_names = crd
-            .spec
-            .names
-            .short_names
-            .clone()
-            .unwrap_or_default()
-            .into_iter()
-            .map(|s| s.to_lowercase())
-            .collect();
+    // Extract short names from CRD spec.names.shortNames
+    let short_names = crd
+        .spec
+        .names
+        .short_names
+        .clone()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|s| s.to_lowercase())
+        .collect();
 
-        // Extract schema fields if available
-        let fields = extract_schema_fields(crd);
+    // Extract schema fields if available
+    let fields = extract_schema_fields(crd);
 
-        SchemaResult {
-            fields,
-            short_names,
-        }
+    // Get plural and scope from CRD spec
+    let plural = crd.spec.names.plural.clone();
+    let scope = if crd.spec.scope == "Namespaced" {
+        kube::discovery::Scope::Namespaced
+    } else {
+        kube::discovery::Scope::Cluster
+    };
+
+    Some(SchemaResult {
+        fields,
+        short_names,
+        plural,
+        scope,
     })
 }
 
 /// Fetch CRD schemas for all non-core resources
 ///
 /// Makes a single API call to list all CRDs, then searches the list for each resource.
-/// Updates the `custom_fields` of each ResourceInfo with the schema extracted from
-/// the CRD's OpenAPI definition.
-pub async fn fetch_crd_schemas(client: &Client, resources: &mut [ResourceInfo]) -> Result<()> {
-    // Filter to non-core resources that might be CRDs
-    let crd_resources: Vec<_> = resources
-        .iter()
-        .enumerate()
-        .filter(|(_, r)| !r.is_core && get_core_resource_fields(&r.table_name).is_none())
-        .map(|(i, r)| (i, r.group.clone(), r.api_resource.kind.clone()))
-        .collect();
-
-    if crd_resources.is_empty() {
-        return Ok(());
-    }
-
-    tracing::debug!(
-        "Fetching schemas for {} potential CRDs",
-        crd_resources.len()
-    );
-
-    let api: Api<CustomResourceDefinition> = Api::all(client.clone());
-
-    // Fetch all CRDs once (single API call)
-    let crd_list = api.list(&Default::default()).await?;
-
-    // Process each CRD resource synchronously (searching local list is instant)
-    for (idx, group, kind) in crd_resources.iter() {
-        let Some(SchemaResult {
-            fields,
-            short_names,
-        }) = find_crd_schema(group, kind, &crd_list)
-        else {
-            // CRD not found - skip processing
-            tracing::debug!("CRD {}.{}: not found in cluster", kind, group);
-            continue;
-        };
-
-        // Add short names to aliases
-        if !short_names.is_empty() {
-            tracing::debug!(
-                "CRD {}.{}: adding short names {:?}",
-                kind,
-                group,
-                short_names
-            );
-            resources[*idx].aliases.extend(short_names);
-        }
-
-        // Set custom fields if schema was extracted
-        match fields {
-            Some(f) => {
-                tracing::debug!(
-                    "CRD {}.{}: extracted {} fields from schema",
-                    kind,
-                    group,
-                    f.len()
-                );
-                resources[*idx].custom_fields = Some(f);
-            }
-            None => {
-                tracing::debug!(
-                    "CRD {}.{}: no schema, using spec/status fallback",
-                    kind,
-                    group
-                );
-                // Leave custom_fields as None - generate_schema will use fallback
-            }
-        }
-    }
-
-    Ok(())
-}
-
 /// Build a registry with just core resources using k8s-openapi types (no discovery, instant startup)
 ///
 /// This uses compile-time type information from k8s-openapi, so it automatically
@@ -557,140 +471,6 @@ pub fn build_core_registry() -> ResourceRegistry {
     add_resource!(ClusterRoleBinding, cluster, ["clusterrolebinding"]);
 
     registry
-}
-
-/// Get CRD API groups only (single API call with retry)
-/// Returns (group_name, version) pairs for non-core groups only
-/// Core resources come from k8s-openapi at compile time, so we skip them
-pub async fn get_crd_api_groups(client: &Client) -> Result<Vec<(String, String)>> {
-    use super::client::with_retry;
-
-    let t0 = std::time::Instant::now();
-    let api_group_list = with_retry("list_api_groups", || client.list_api_groups()).await?;
-    tracing::debug!(
-        "get_crd_api_groups: list_api_groups {:?} ({} groups)",
-        t0.elapsed(),
-        api_group_list.groups.len()
-    );
-
-    let mut api_groups: Vec<(String, String)> = Vec::new();
-    for group in &api_group_list.groups {
-        // Skip core K8s API groups - we have static types for these
-        if is_core_api_group(&group.name) {
-            continue;
-        }
-
-        if let Some(pref) = group.preferred_version.as_ref() {
-            api_groups.push((group.name.clone(), pref.version.clone()));
-        } else if let Some(first) = group.versions.first() {
-            api_groups.push((group.name.clone(), first.version.clone()));
-        }
-    }
-
-    Ok(api_groups)
-}
-
-/// Discover resources for specific API groups only (parallel with retry)
-/// Returns a map of (group, version) -> Vec<ResourceInfo>
-pub async fn discover_groups(
-    client: &Client,
-    groups: &[(String, String)],
-) -> Result<std::collections::HashMap<(String, String), Vec<ResourceInfo>>> {
-    use super::client::with_retry;
-    use futures::future::join_all;
-    use kube::discovery::oneshot;
-
-    let t0 = std::time::Instant::now();
-    let num_groups = groups.len();
-    let futures: Vec<_> = groups
-        .iter()
-        .map(|(group_name, version)| {
-            let client = client.clone();
-            let group = group_name.clone();
-            let ver = version.clone();
-            async move {
-                let t = std::time::Instant::now();
-                let op_name = format!("discover_group({})", &group);
-                let result = with_retry(&op_name, || {
-                    let client = client.clone();
-                    let group = group.clone();
-                    async move { oneshot::group(&client, &group).await }
-                })
-                .await;
-                ((group, ver), result, t.elapsed())
-            }
-        })
-        .collect();
-
-    let results = join_all(futures).await;
-    tracing::debug!("discover_groups x{}: {:?} total", num_groups, t0.elapsed());
-
-    // Log slowest groups
-    let mut timings: Vec<_> = results
-        .iter()
-        .map(|((g, _), _, t)| (g.as_str(), *t))
-        .collect();
-    timings.sort_by(|a, b| b.1.cmp(&a.1));
-    for (group, elapsed) in timings.iter().take(5) {
-        tracing::debug!("  slowest: {} {:?}", group, elapsed);
-    }
-
-    let mut discovered: std::collections::HashMap<(String, String), Vec<ResourceInfo>> =
-        std::collections::HashMap::new();
-
-    for ((group_name, version), result, _elapsed) in results {
-        let group = match result {
-            Ok(g) => g,
-            Err(e) => {
-                tracing::debug!(group = %group_name, error = %e, "Failed to discover API group");
-                continue;
-            }
-        };
-
-        let mut resources = Vec::new();
-        for (ar, caps) in group.recommended_resources() {
-            // Skip subresources (e.g., pods/log, pods/exec)
-            if ar.plural.contains('/') {
-                continue;
-            }
-
-            // Determine table name (plural, lowercase)
-            let table_name = ar.plural.to_lowercase();
-
-            // Mark as core if from a standard K8s API group
-            let is_core = matches!(
-                ar.group.as_str(),
-                "" | "apps"
-                    | "batch"
-                    | "networking.k8s.io"
-                    | "policy"
-                    | "rbac.authorization.k8s.io"
-                    | "storage.k8s.io"
-                    | "autoscaling"
-                    | "coordination.k8s.io"
-            );
-
-            // Use lowercase kind as a basic alias
-            let aliases = vec![ar.kind.to_lowercase()];
-
-            let info = ResourceInfo {
-                api_resource: ar.clone(),
-                capabilities: caps.clone(),
-                table_name,
-                aliases,
-                is_core,
-                group: ar.group.clone(),
-                version: ar.version.clone(),
-                custom_fields: None, // Will be populated by fetch_crd_schemas()
-            };
-
-            resources.push(info);
-        }
-
-        discovered.insert((group_name, version), resources);
-    }
-
-    Ok(discovered)
 }
 
 /// Get resource-specific columns for core Kubernetes resources.
