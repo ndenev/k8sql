@@ -492,72 +492,72 @@ fn get_core_resource_fields(table_name: &str) -> Option<Vec<ColumnDef>> {
         | "resourcequotas"
         | "limitranges"
         | "leases" => Some(vec![
-            ColumnDef::text("spec", "spec"),
-            ColumnDef::text("status", "status"),
+            ColumnDef::text("spec", "/spec"),
+            ColumnDef::text("status", "/status"),
         ]),
 
         // ==================== RBAC: rules pattern ====================
         // Role and ClusterRole have rules array, not spec/status
         "roles" | "clusterroles" => Some(vec![
-            ColumnDef::text("rules", "rules"),
-            ColumnDef::text("aggregation_rule", "aggregationRule"),
+            ColumnDef::text("rules", "/rules"),
+            ColumnDef::text("aggregation_rule", "/aggregationRule"),
         ]),
 
         // ==================== RBAC: binding pattern ====================
         // RoleBinding and ClusterRoleBinding reference a role and subjects
         "rolebindings" | "clusterrolebindings" => Some(vec![
-            ColumnDef::text("role_ref", "roleRef"),
-            ColumnDef::text("subjects", "subjects"),
+            ColumnDef::text("role_ref", "/roleRef"),
+            ColumnDef::text("subjects", "/subjects"),
         ]),
 
         // ==================== ServiceAccount: flat fields ====================
         "serviceaccounts" => Some(vec![
-            ColumnDef::text("secrets", "secrets"),
-            ColumnDef::text("image_pull_secrets", "imagePullSecrets"),
+            ColumnDef::text("secrets", "/secrets"),
+            ColumnDef::text("image_pull_secrets", "/imagePullSecrets"),
             ColumnDef::text(
                 "automount_service_account_token",
-                "automountServiceAccountToken",
+                "/automountServiceAccountToken",
             ),
         ]),
 
         // ==================== Endpoints: subsets pattern ====================
-        "endpoints" => Some(vec![ColumnDef::text("subsets", "subsets")]),
+        "endpoints" => Some(vec![ColumnDef::text("subsets", "/subsets")]),
 
         // ==================== ConfigMap/Secret: data pattern ====================
         "configmaps" => Some(vec![
-            ColumnDef::text("data", "data"),
-            ColumnDef::text("binary_data", "binaryData"),
-            ColumnDef::text("immutable", "immutable"),
+            ColumnDef::text("data", "/data"),
+            ColumnDef::text("binary_data", "/binaryData"),
+            ColumnDef::text("immutable", "/immutable"),
         ]),
         "secrets" => Some(vec![
-            ColumnDef::text("type", "type"),
-            ColumnDef::text("data", "data"),
-            ColumnDef::text("string_data", "stringData"),
-            ColumnDef::text("immutable", "immutable"),
+            ColumnDef::text("type", "/type"),
+            ColumnDef::text("data", "/data"),
+            ColumnDef::text("string_data", "/stringData"),
+            ColumnDef::text("immutable", "/immutable"),
         ]),
 
         // ==================== Events: flat structure ====================
         "events" => Some(vec![
-            ColumnDef::text("type", "type"),
-            ColumnDef::text("reason", "reason"),
-            ColumnDef::text("message", "message"),
-            ColumnDef::integer("count", "count"),
-            ColumnDef::timestamp("first_timestamp", "firstTimestamp"),
-            ColumnDef::timestamp("last_timestamp", "lastTimestamp"),
-            ColumnDef::text("involved_object", "involvedObject"),
-            ColumnDef::text("source", "source"),
+            ColumnDef::text("type", "/type"),
+            ColumnDef::text("reason", "/reason"),
+            ColumnDef::text("message", "/message"),
+            ColumnDef::integer("count", "/count"),
+            ColumnDef::timestamp("first_timestamp", "/firstTimestamp"),
+            ColumnDef::timestamp("last_timestamp", "/lastTimestamp"),
+            ColumnDef::text("involved_object", "/involvedObject"),
+            ColumnDef::text("source", "/source"),
         ]),
 
         // ==================== Metrics: special structure ====================
         "podmetrics" => Some(vec![
-            ColumnDef::timestamp("timestamp", "timestamp"),
-            ColumnDef::text("window", "window"),
-            ColumnDef::text("containers", "containers"),
+            ColumnDef::timestamp("timestamp", "/timestamp"),
+            ColumnDef::text("window", "/window"),
+            ColumnDef::text("containers", "/containers"),
         ]),
         "nodemetrics" => Some(vec![
-            ColumnDef::timestamp("timestamp", "timestamp"),
-            ColumnDef::text("window", "window"),
-            ColumnDef::text("usage", "usage"),
+            ColumnDef::timestamp("timestamp", "/timestamp"),
+            ColumnDef::text("window", "/window"),
+            ColumnDef::text("usage", "/usage"),
         ]),
 
         // ==================== CustomResourceDefinitions: CRD metadata ====================
