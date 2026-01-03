@@ -19,16 +19,17 @@ use crate::output::QueryResult;
 use super::preprocess::{preprocess_sql, validate_read_only};
 use super::provider::K8sTableProvider;
 
-/// Metadata about a table (K8s resource type) for enhanced SHOW TABLES output
+/// Table information with native types (for data layer)
+/// Formatting is done in the presentation layer (output module)
 #[derive(Debug, Clone)]
-pub struct TableMetadata {
+pub struct TableInfo {
     pub table_name: String,
-    pub aliases: String,
+    pub aliases: Vec<String>, // Keep as Vec (not joined)
     pub group: String,
     pub version: String,
     pub kind: String,
-    pub scope: String,
-    pub resource_type: String,
+    pub scope: kube::discovery::Scope, // Keep as enum (not string)
+    pub is_core: bool,                 // Keep as bool (not "core"/"crd")
 }
 
 /// A wrapper around DataFusion's SessionContext configured for K8s queries
@@ -57,11 +58,9 @@ impl K8sSessionContext {
         // Register JSON functions for querying spec/status fields
         datafusion_functions_json::register_all(&mut ctx)?;
 
-        // Get the resource registry and register each resource as a table
         let registry = pool.get_registry(None).await?;
         let tables = registry.list_tables();
 
-        // Report table registration start
         pool.progress().registering_tables(tables.len());
 
         for info in tables {
@@ -78,7 +77,7 @@ impl K8sSessionContext {
                 );
             }
 
-            // Also register aliases (ignore conflicts)
+            // Register aliases (ignore conflicts)
             for alias in &info.aliases {
                 let alias_provider = K8sTableProvider::new(info.clone(), Arc::clone(pool));
                 let _ = ctx.register_table(alias, Arc::new(alias_provider));
@@ -90,7 +89,6 @@ impl K8sSessionContext {
 
     /// Execute a SQL query and return the results as Arrow RecordBatches
     pub async fn execute_sql(&self, sql: &str) -> DFResult<Vec<RecordBatch>> {
-        // Validate that the statement is read-only before execution
         validate_read_only(sql)
             .map_err(|e| datafusion::error::DataFusionError::Plan(e.to_string()))?;
 
@@ -142,45 +140,21 @@ impl K8sSessionContext {
         self.ctx
     }
 
-    /// List available tables with full metadata (for enhanced SHOW TABLES output)
-    /// Returns Vec of TableMetadata with group, version, kind, scope, and type info
-    pub async fn list_tables_with_metadata(&self) -> Vec<TableMetadata> {
+    /// List available tables with full metadata (raw data, not formatted)
+    /// Returns Vec of TableInfo with native types for presentation layer to format
+    pub async fn list_tables_with_metadata(&self) -> Vec<TableInfo> {
         if let Ok(registry) = self.pool.get_registry(None).await {
             registry
                 .list_tables()
                 .into_iter()
-                .map(|info| {
-                    let aliases = if info.aliases.is_empty() {
-                        String::new()
-                    } else {
-                        info.aliases.join(", ")
-                    };
-
-                    // Convert scope enum to string
-                    let scope = match info.capabilities.scope {
-                        kube::discovery::Scope::Namespaced => "Namespaced",
-                        kube::discovery::Scope::Cluster => "Cluster",
-                    };
-
-                    // "core" for is_core==true, "crd" otherwise
-                    let resource_type = if info.is_core { "core" } else { "crd" };
-
-                    // Display "core" as group for core resources (empty group string)
-                    let group = if info.group.is_empty() {
-                        "core".to_string()
-                    } else {
-                        info.group.clone()
-                    };
-
-                    TableMetadata {
-                        table_name: info.table_name.clone(),
-                        aliases,
-                        group,
-                        version: info.version.clone(),
-                        kind: info.api_resource.kind.clone(),
-                        scope: scope.to_string(),
-                        resource_type: resource_type.to_string(),
-                    }
+                .map(|info| TableInfo {
+                    table_name: info.table_name.clone(),
+                    aliases: info.aliases.clone(),
+                    group: info.group.clone(),
+                    version: info.version.clone(),
+                    kind: info.api_resource.kind.clone(),
+                    scope: info.capabilities.scope.clone(),
+                    is_core: info.is_core,
                 })
                 .collect()
         } else {

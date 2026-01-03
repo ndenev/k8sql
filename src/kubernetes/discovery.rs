@@ -55,7 +55,7 @@ pub struct ColumnDef {
     pub name: String,
     /// Arrow data type
     pub data_type: ColumnDataType,
-    /// JSON path to extract value (e.g., "metadata.name")
+    /// JSON Pointer (RFC 6901) to extract value (e.g., "/metadata/name")
     pub json_path: Option<String>,
 }
 
@@ -167,53 +167,29 @@ impl ResourceRegistry {
     pub fn add(&mut self, mut info: ResourceInfo) {
         let original_table_name = info.table_name.clone();
 
-        // Check if this table already exists
-        if let Some(existing) = self.by_table_name.get(&original_table_name) {
-            if existing.is_core && !info.is_core {
-                // Core exists, rename incoming non-core to its Kind name
+        // Check if this table name is already taken
+        if let Some(_existing) = self.by_table_name.get(&original_table_name) {
+            // Core resources always take priority - rename incoming non-core to Kind
+            // Note: core resources added first (build_core_registry), so incoming core
+            // with existing non-core shouldn't happen; both-core also shouldn't happen
+            if !info.is_core {
                 let kind_name = info.api_resource.kind.to_lowercase();
                 if self.by_table_name.contains_key(&kind_name) {
                     return; // Kind name also conflicts, skip
                 }
                 info.table_name = kind_name;
                 info.aliases = vec![];
-            } else if !existing.is_core && info.is_core {
-                // Non-core exists, core is arriving - move non-core to Kind name first
-                let existing_owned = existing.clone();
-                let kind_name = existing_owned.api_resource.kind.to_lowercase();
-
-                if !self.by_table_name.contains_key(&kind_name) {
-                    // Re-register existing non-core under its Kind name
-                    let mut renamed = existing_owned;
-                    renamed.table_name = kind_name.clone();
-                    renamed.aliases = vec![];
-
-                    self.alias_map.insert(kind_name.clone(), kind_name.clone());
-                    self.by_table_name.insert(kind_name, renamed);
-                }
-                // Remove the old entry's alias mapping (will be replaced by core)
-                // Core will be added normally below
-            } else if !existing.is_core && !info.is_core {
-                // Both non-core with same name - rename incoming to Kind name
-                let kind_name = info.api_resource.kind.to_lowercase();
-                if self.by_table_name.contains_key(&kind_name) {
-                    return;
-                }
-                info.table_name = kind_name;
-                info.aliases = vec![];
             }
-            // If both are core (shouldn't happen), later one wins
+            // else: both core - shouldn't happen, but later wins if it does
         }
 
-        // Add aliases
+        // Register aliases and store
         for alias in &info.aliases {
             self.alias_map
                 .insert(alias.clone(), info.table_name.clone());
         }
-        // Add the table name itself as an alias
         self.alias_map
             .insert(info.table_name.clone(), info.table_name.clone());
-        // Store the resource info
         self.by_table_name.insert(info.table_name.clone(), info);
     }
 
@@ -277,7 +253,7 @@ fn extract_schema_fields(crd: &CustomResourceDefinition) -> Option<Vec<ColumnDef
         fields.push(ColumnDef {
             name: col_name,
             data_type: col_type,
-            json_path: Some(name.clone()),
+            json_path: Some(format!("/{}", name)),
         });
     }
 
@@ -516,83 +492,83 @@ fn get_core_resource_fields(table_name: &str) -> Option<Vec<ColumnDef>> {
         | "resourcequotas"
         | "limitranges"
         | "leases" => Some(vec![
-            ColumnDef::text("spec", "spec"),
-            ColumnDef::text("status", "status"),
+            ColumnDef::text("spec", "/spec"),
+            ColumnDef::text("status", "/status"),
         ]),
 
         // ==================== RBAC: rules pattern ====================
         // Role and ClusterRole have rules array, not spec/status
         "roles" | "clusterroles" => Some(vec![
-            ColumnDef::text("rules", "rules"),
-            ColumnDef::text("aggregation_rule", "aggregationRule"),
+            ColumnDef::text("rules", "/rules"),
+            ColumnDef::text("aggregation_rule", "/aggregationRule"),
         ]),
 
         // ==================== RBAC: binding pattern ====================
         // RoleBinding and ClusterRoleBinding reference a role and subjects
         "rolebindings" | "clusterrolebindings" => Some(vec![
-            ColumnDef::text("role_ref", "roleRef"),
-            ColumnDef::text("subjects", "subjects"),
+            ColumnDef::text("role_ref", "/roleRef"),
+            ColumnDef::text("subjects", "/subjects"),
         ]),
 
         // ==================== ServiceAccount: flat fields ====================
         "serviceaccounts" => Some(vec![
-            ColumnDef::text("secrets", "secrets"),
-            ColumnDef::text("image_pull_secrets", "imagePullSecrets"),
+            ColumnDef::text("secrets", "/secrets"),
+            ColumnDef::text("image_pull_secrets", "/imagePullSecrets"),
             ColumnDef::text(
                 "automount_service_account_token",
-                "automountServiceAccountToken",
+                "/automountServiceAccountToken",
             ),
         ]),
 
         // ==================== Endpoints: subsets pattern ====================
-        "endpoints" => Some(vec![ColumnDef::text("subsets", "subsets")]),
+        "endpoints" => Some(vec![ColumnDef::text("subsets", "/subsets")]),
 
         // ==================== ConfigMap/Secret: data pattern ====================
         "configmaps" => Some(vec![
-            ColumnDef::text("data", "data"),
-            ColumnDef::text("binary_data", "binaryData"),
-            ColumnDef::text("immutable", "immutable"),
+            ColumnDef::text("data", "/data"),
+            ColumnDef::text("binary_data", "/binaryData"),
+            ColumnDef::text("immutable", "/immutable"),
         ]),
         "secrets" => Some(vec![
-            ColumnDef::text("type", "type"),
-            ColumnDef::text("data", "data"),
-            ColumnDef::text("string_data", "stringData"),
-            ColumnDef::text("immutable", "immutable"),
+            ColumnDef::text("type", "/type"),
+            ColumnDef::text("data", "/data"),
+            ColumnDef::text("string_data", "/stringData"),
+            ColumnDef::text("immutable", "/immutable"),
         ]),
 
         // ==================== Events: flat structure ====================
         "events" => Some(vec![
-            ColumnDef::text("type", "type"),
-            ColumnDef::text("reason", "reason"),
-            ColumnDef::text("message", "message"),
-            ColumnDef::integer("count", "count"),
-            ColumnDef::timestamp("first_timestamp", "firstTimestamp"),
-            ColumnDef::timestamp("last_timestamp", "lastTimestamp"),
-            ColumnDef::text("involved_object", "involvedObject"),
-            ColumnDef::text("source", "source"),
+            ColumnDef::text("type", "/type"),
+            ColumnDef::text("reason", "/reason"),
+            ColumnDef::text("message", "/message"),
+            ColumnDef::integer("count", "/count"),
+            ColumnDef::timestamp("first_timestamp", "/firstTimestamp"),
+            ColumnDef::timestamp("last_timestamp", "/lastTimestamp"),
+            ColumnDef::text("involved_object", "/involvedObject"),
+            ColumnDef::text("source", "/source"),
         ]),
 
         // ==================== Metrics: special structure ====================
         "podmetrics" => Some(vec![
-            ColumnDef::timestamp("timestamp", "timestamp"),
-            ColumnDef::text("window", "window"),
-            ColumnDef::text("containers", "containers"),
+            ColumnDef::timestamp("timestamp", "/timestamp"),
+            ColumnDef::text("window", "/window"),
+            ColumnDef::text("containers", "/containers"),
         ]),
         "nodemetrics" => Some(vec![
-            ColumnDef::timestamp("timestamp", "timestamp"),
-            ColumnDef::text("window", "window"),
-            ColumnDef::text("usage", "usage"),
+            ColumnDef::timestamp("timestamp", "/timestamp"),
+            ColumnDef::text("window", "/window"),
+            ColumnDef::text("usage", "/usage"),
         ]),
 
         // ==================== CustomResourceDefinitions: CRD metadata ====================
         "customresourcedefinitions" => Some(vec![
-            ColumnDef::text("group", "spec.group"),
-            ColumnDef::text("scope", "spec.scope"),
-            ColumnDef::text("resource_kind", "spec.names.kind"),
-            ColumnDef::text("plural", "spec.names.plural"),
-            ColumnDef::text("singular", "spec.names.singular"),
-            ColumnDef::text("short_names", "spec.names.shortNames"),
-            ColumnDef::text("categories", "spec.names.categories"),
+            ColumnDef::text("group", "/spec/group"),
+            ColumnDef::text("scope", "/spec/scope"),
+            ColumnDef::text("resource_kind", "/spec/names/kind"),
+            ColumnDef::text("plural", "/spec/names/plural"),
+            ColumnDef::text("singular", "/spec/names/singular"),
+            ColumnDef::text("short_names", "/spec/names/shortNames"),
+            ColumnDef::text("categories", "/spec/names/categories"),
             // Note: spec.versions and status.conditions are too large for table display
             // Use kubectl get crd <name> -o yaml for full schema details
         ]),
@@ -613,28 +589,28 @@ pub fn generate_schema(info: &ResourceInfo) -> Vec<ColumnDef> {
         // Virtual column for cluster/context name
         ColumnDef::text_raw("_cluster"),
         // API version and kind - self-describing columns for CRD safety
-        ColumnDef::text("api_version", "apiVersion"),
-        ColumnDef::text("kind", "kind"),
+        ColumnDef::text("api_version", "/apiVersion"),
+        ColumnDef::text("kind", "/kind"),
         // Common metadata columns
-        ColumnDef::text("name", "metadata.name"),
+        ColumnDef::text("name", "/metadata/name"),
     ];
 
     // Only add namespace for namespaced resources (exclude cluster-scoped)
     if info.capabilities.scope == Scope::Namespaced {
-        columns.push(ColumnDef::text("namespace", "metadata.namespace"));
+        columns.push(ColumnDef::text("namespace", "/metadata/namespace"));
     }
 
     // Continue with remaining metadata columns
     columns.extend(vec![
-        ColumnDef::text("uid", "metadata.uid"),
-        ColumnDef::timestamp("created", "metadata.creationTimestamp"),
-        ColumnDef::text("labels", "metadata.labels"),
-        ColumnDef::text("annotations", "metadata.annotations"),
-        ColumnDef::text("owner_references", "metadata.ownerReferences"),
-        ColumnDef::integer("generation", "metadata.generation"),
-        ColumnDef::text("resource_version", "metadata.resourceVersion"),
-        ColumnDef::timestamp("deletion_timestamp", "metadata.deletionTimestamp"),
-        ColumnDef::text("finalizers", "metadata.finalizers"),
+        ColumnDef::text("uid", "/metadata/uid"),
+        ColumnDef::timestamp("created", "/metadata/creationTimestamp"),
+        ColumnDef::text("labels", "/metadata/labels"),
+        ColumnDef::text("annotations", "/metadata/annotations"),
+        ColumnDef::text("owner_references", "/metadata/ownerReferences"),
+        ColumnDef::integer("generation", "/metadata/generation"),
+        ColumnDef::text("resource_version", "/metadata/resourceVersion"),
+        ColumnDef::timestamp("deletion_timestamp", "/metadata/deletionTimestamp"),
+        ColumnDef::text("finalizers", "/metadata/finalizers"),
     ]);
 
     // Add resource-specific columns with priority:
@@ -649,8 +625,8 @@ pub fn generate_schema(info: &ResourceInfo) -> Vec<ColumnDef> {
         columns.extend(fields.clone());
     } else {
         // Unknown resource or CRD without schema - fall back to spec/status
-        columns.push(ColumnDef::text("spec", "spec"));
-        columns.push(ColumnDef::text("status", "status"));
+        columns.push(ColumnDef::text("spec", "/spec"));
+        columns.push(ColumnDef::text("status", "/status"));
     }
 
     columns
