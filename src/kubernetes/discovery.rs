@@ -625,8 +625,8 @@ pub fn generate_schema(info: &ResourceInfo) -> Vec<ColumnDef> {
         columns.extend(fields.clone());
     } else {
         // Unknown resource or CRD without schema - fall back to spec/status
-        columns.push(ColumnDef::text("spec", "spec"));
-        columns.push(ColumnDef::text("status", "status"));
+        columns.push(ColumnDef::text("spec", "/spec"));
+        columns.push(ColumnDef::text("status", "/status"));
     }
 
     columns
