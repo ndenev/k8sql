@@ -253,7 +253,7 @@ fn extract_schema_fields(crd: &CustomResourceDefinition) -> Option<Vec<ColumnDef
         fields.push(ColumnDef {
             name: col_name,
             data_type: col_type,
-            json_path: Some(name.clone()),
+            json_path: Some(format!("/{}", name)),
         });
     }
 
