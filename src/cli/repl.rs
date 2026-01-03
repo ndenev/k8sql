@@ -1335,13 +1335,6 @@ pub async fn run_repl(mut session: K8sSessionContext, pool: Arc<K8sClientPool>) 
                     session_clone.execute_sql_to_strings(&input_owned).await
                 });
 
-                // Create SIGINT handler for this query
-                // Safe: created after readline() returns, dropped after query completes
-                // This ensures no interference with rustyline's Ctrl+C handling
-                let mut sigint =
-                    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
-                        .expect("Failed to create SIGINT handler");
-
                 // Pin the query handle for use in select!
                 tokio::pin!(query_handle);
 
@@ -1349,8 +1342,8 @@ pub async fn run_repl(mut session: K8sSessionContext, pool: Arc<K8sClientPool>) 
                 let result = loop {
                     tokio::select! {
                         biased;
-                        // Ctrl+C pressed - cancel the query
-                        _ = sigint.recv() => {
+                        // Ctrl+C pressed - cancel the query (cross-platform)
+                        _ = tokio::signal::ctrl_c() => {
                             query_handle.abort();
                             break Err(QueryCancelled);
                         }
