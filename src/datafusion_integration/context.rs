@@ -57,11 +57,9 @@ impl K8sSessionContext {
         // Register JSON functions for querying spec/status fields
         datafusion_functions_json::register_all(&mut ctx)?;
 
-        // Get the resource registry and register each resource as a table
         let registry = pool.get_registry(None).await?;
         let tables = registry.list_tables();
 
-        // Report table registration start
         pool.progress().registering_tables(tables.len());
 
         for info in tables {
@@ -78,7 +76,7 @@ impl K8sSessionContext {
                 );
             }
 
-            // Also register aliases (ignore conflicts)
+            // Register aliases (ignore conflicts)
             for alias in &info.aliases {
                 let alias_provider = K8sTableProvider::new(info.clone(), Arc::clone(pool));
                 let _ = ctx.register_table(alias, Arc::new(alias_provider));
@@ -90,7 +88,6 @@ impl K8sSessionContext {
 
     /// Execute a SQL query and return the results as Arrow RecordBatches
     pub async fn execute_sql(&self, sql: &str) -> DFResult<Vec<RecordBatch>> {
-        // Validate that the statement is read-only before execution
         validate_read_only(sql)
             .map_err(|e| datafusion::error::DataFusionError::Plan(e.to_string()))?;
 

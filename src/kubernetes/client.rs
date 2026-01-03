@@ -284,16 +284,13 @@ impl K8sClientPool {
             return Ok(0);
         }
 
-        // Step 3: Extract (group, version, kind) tuples from CRD list
         let all_crds = extract_served_crd_versions(&crd_list);
 
-        // Step 4: Check which CRDs are cached vs missing
         let (cached_resources, missing_crds) = self.resource_cache.check_crds(&all_crds);
 
         let cached_count = cached_resources.len();
         let missing_count = missing_crds.len();
 
-        // Step 5: Load cached CRDs into registry
         for cached_resource in &cached_resources {
             registry.add(cached_resource.clone().into());
         }
@@ -320,7 +317,6 @@ impl K8sClientPool {
             0
         };
 
-        // Step 7: Save cluster CRD list for next time
         if let Err(e) = self.resource_cache.save_cluster_groups(context, &all_crds) {
             warn!(context = %context, error = %e, "Failed to save cluster CRDs");
         }
