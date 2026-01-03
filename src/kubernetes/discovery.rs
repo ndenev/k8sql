@@ -167,53 +167,29 @@ impl ResourceRegistry {
     pub fn add(&mut self, mut info: ResourceInfo) {
         let original_table_name = info.table_name.clone();
 
-        // Check if this table already exists
-        if let Some(existing) = self.by_table_name.get(&original_table_name) {
-            if existing.is_core && !info.is_core {
-                // Core exists, rename incoming non-core to its Kind name
+        // Check if this table name is already taken
+        if let Some(_existing) = self.by_table_name.get(&original_table_name) {
+            // Core resources always take priority - rename incoming non-core to Kind
+            // Note: core resources added first (build_core_registry), so incoming core
+            // with existing non-core shouldn't happen; both-core also shouldn't happen
+            if !info.is_core {
                 let kind_name = info.api_resource.kind.to_lowercase();
                 if self.by_table_name.contains_key(&kind_name) {
                     return; // Kind name also conflicts, skip
                 }
                 info.table_name = kind_name;
                 info.aliases = vec![];
-            } else if !existing.is_core && info.is_core {
-                // Non-core exists, core is arriving - move non-core to Kind name first
-                let existing_owned = existing.clone();
-                let kind_name = existing_owned.api_resource.kind.to_lowercase();
-
-                if !self.by_table_name.contains_key(&kind_name) {
-                    // Re-register existing non-core under its Kind name
-                    let mut renamed = existing_owned;
-                    renamed.table_name = kind_name.clone();
-                    renamed.aliases = vec![];
-
-                    self.alias_map.insert(kind_name.clone(), kind_name.clone());
-                    self.by_table_name.insert(kind_name, renamed);
-                }
-                // Remove the old entry's alias mapping (will be replaced by core)
-                // Core will be added normally below
-            } else if !existing.is_core && !info.is_core {
-                // Both non-core with same name - rename incoming to Kind name
-                let kind_name = info.api_resource.kind.to_lowercase();
-                if self.by_table_name.contains_key(&kind_name) {
-                    return;
-                }
-                info.table_name = kind_name;
-                info.aliases = vec![];
             }
-            // If both are core (shouldn't happen), later one wins
+            // else: both core - shouldn't happen, but later wins if it does
         }
 
-        // Add aliases
+        // Register aliases and store
         for alias in &info.aliases {
             self.alias_map
                 .insert(alias.clone(), info.table_name.clone());
         }
-        // Add the table name itself as an alias
         self.alias_map
             .insert(info.table_name.clone(), info.table_name.clone());
-        // Store the resource info
         self.by_table_name.insert(info.table_name.clone(), info);
     }
 
