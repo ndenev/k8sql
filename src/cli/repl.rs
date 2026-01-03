@@ -1377,11 +1377,26 @@ pub async fn run_repl(mut session: K8sSessionContext, pool: Arc<K8sClientPool>) 
                     }
                 };
 
+                // Maximum rows to format as a table (larger results should use -o json/csv)
+                const MAX_TABLE_ROWS: usize = 10_000;
+
                 match result {
                     Ok(Ok(result)) => {
                         if result.rows.is_empty() {
                             spinner.finish_and_clear();
                             println!("{}", style("(0 rows)").dim());
+                        } else if result.rows.len() > MAX_TABLE_ROWS && !expanded {
+                            // Too many rows for table formatting - suggest alternatives
+                            spinner.finish_and_clear();
+                            println!(
+                                "{} {} rows is too large for table display.",
+                                style("Warning:").yellow().bold(),
+                                result.rows.len()
+                            );
+                            println!(
+                                "{}",
+                                style("Use -o json, -o csv, or add LIMIT to your query.").dim()
+                            );
                         } else {
                             // Show formatting progress for large results
                             spinner
