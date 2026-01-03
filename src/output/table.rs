@@ -12,13 +12,25 @@ pub const MAX_JSON_COLUMN_WIDTH: usize = 60;
 pub const WIDE_COLUMNS: &[&str] = &["spec", "status", "labels", "annotations", "data"];
 
 /// Truncate a string to max_len chars, adding "..." if truncated
+/// Optimized: O(1) truncation using byte slicing with UTF-8 boundary detection
 pub fn truncate_value(s: &str, max_len: usize) -> Cow<'_, str> {
-    if s.chars().count() <= max_len {
-        Cow::Borrowed(s)
-    } else {
-        let truncated: String = s.chars().take(max_len.saturating_sub(3)).collect();
-        Cow::Owned(format!("{}...", truncated))
+    // Fast path: if byte length is under limit, char count must be too
+    if s.len() <= max_len {
+        return Cow::Borrowed(s);
     }
+
+    // For long strings, truncate at byte boundary near max_len
+    // This is O(1) instead of O(n) char iteration
+    let truncate_at = max_len.saturating_sub(3);
+
+    // Find valid UTF-8 boundary by backing up from truncate_at
+    // UTF-8 continuation bytes have pattern 10xxxxxx (0x80..0xBF)
+    let mut end = truncate_at.min(s.len());
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+
+    Cow::Owned(format!("{}...", &s[..end]))
 }
 
 pub struct TableFormatter;

@@ -416,6 +416,12 @@ fn create_streaming_execution(
                             table = %table_name,
                             "Resource/table not found in cluster, returning empty results"
                         );
+                        // Report completion with 0 rows before returning
+                        pool.progress().cluster_complete(
+                            &target.cluster,
+                            0,
+                            start.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
+                        );
                         // Don't yield anything, just stop - partition returns no results
                         return;
                     } else {

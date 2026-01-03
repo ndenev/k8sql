@@ -29,6 +29,9 @@ use crate::progress::{ProgressUpdate, run_with_progress};
 // SQL keywords from sqlparser (for completion)
 use datafusion::sql::sqlparser::keywords::ALL_KEYWORDS;
 
+/// Marker for cancelled queries (Ctrl+C during execution)
+struct QueryCancelled;
+
 // For extracting function signatures
 use datafusion::logical_expr::{Signature, TypeSignature};
 
@@ -1317,6 +1320,9 @@ pub async fn run_repl(mut session: K8sSessionContext, pool: Arc<K8sClientPool>) 
                 let spinner = create_spinner("Executing query...");
                 let start = Instant::now();
 
+                // Reset progress counters for the new query
+                pool.progress().reset();
+
                 // Subscribe to progress updates
                 let mut progress_rx = pool.progress().subscribe();
 
@@ -1325,14 +1331,29 @@ pub async fn run_repl(mut session: K8sSessionContext, pool: Arc<K8sClientPool>) 
                 let input_owned = input.to_string();
 
                 // Spawn query execution
-                let mut query_handle = tokio::spawn(async move {
+                let query_handle = tokio::spawn(async move {
                     session_clone.execute_sql_to_strings(&input_owned).await
                 });
+
+                // Create SIGINT handler for this query
+                // Safe: created after readline() returns, dropped after query completes
+                // This ensures no interference with rustyline's Ctrl+C handling
+                let mut sigint =
+                    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+                        .expect("Failed to create SIGINT handler");
+
+                // Pin the query handle for use in select!
+                tokio::pin!(query_handle);
 
                 // Listen for progress updates while query runs
                 let result = loop {
                     tokio::select! {
                         biased;
+                        // Ctrl+C pressed - cancel the query
+                        _ = sigint.recv() => {
+                            query_handle.abort();
+                            break Err(QueryCancelled);
+                        }
                         // Check for progress updates
                         progress = progress_rx.recv() => {
                             match progress {
@@ -1369,16 +1390,37 @@ pub async fn run_repl(mut session: K8sSessionContext, pool: Arc<K8sClientPool>) 
                         }
                         // Query completed
                         query_result = &mut query_handle => {
-                            break query_result;
+                            break Ok(query_result);
                         }
                     }
                 };
 
+                // Maximum rows for table display (comfy_table is slow for large results)
+                const MAX_TABLE_ROWS: usize = 1_000;
+
                 match result {
-                    Ok(Ok(result)) => {
+                    // Query cancelled by Ctrl+C
+                    Err(QueryCancelled) => {
+                        spinner.finish_and_clear();
+                        println!("{}", style("Query cancelled.").yellow());
+                    }
+                    // Query completed successfully
+                    Ok(Ok(Ok(result))) => {
                         if result.rows.is_empty() {
                             spinner.finish_and_clear();
                             println!("{}", style("(0 rows)").dim());
+                        } else if result.rows.len() > MAX_TABLE_ROWS && !expanded {
+                            // Too many rows for table formatting - suggest alternatives
+                            spinner.finish_and_clear();
+                            println!(
+                                "{} {} rows is too large for table display.",
+                                style("Warning:").yellow().bold(),
+                                result.rows.len()
+                            );
+                            println!(
+                                "{}",
+                                style("Use \\x for expanded mode, add LIMIT, or use batch mode (-o json/csv).").dim()
+                            );
                         } else {
                             // Show formatting progress for large results
                             spinner
@@ -1407,11 +1449,18 @@ pub async fn run_repl(mut session: K8sSessionContext, pool: Arc<K8sClientPool>) 
                             );
                         }
                     }
-                    Ok(Err(e)) => {
+                    // Query returned an error
+                    Ok(Ok(Err(e))) => {
                         spinner.finish_and_clear();
                         println!("{} {}", style("Error:").red().bold(), style(e).red());
                     }
-                    Err(e) => {
+                    // Task was aborted (shouldn't happen normally)
+                    Ok(Err(e)) if e.is_cancelled() => {
+                        spinner.finish_and_clear();
+                        println!("{}", style("Query cancelled.").yellow());
+                    }
+                    // Task panicked
+                    Ok(Err(e)) => {
                         spinner.finish_and_clear();
                         println!(
                             "{} {}",
