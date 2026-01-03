@@ -174,6 +174,9 @@ async fn run_batch(args: &Args) -> Result<()> {
             continue;
         }
 
+        // Reset progress counters for the new query
+        pool.progress().reset();
+
         match session.execute_sql_to_strings(&query_str).await {
             Ok(result) => {
                 println!("{}", result.format(&args.output, args.no_headers));

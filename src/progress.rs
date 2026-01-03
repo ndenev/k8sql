@@ -79,10 +79,13 @@ impl ProgressReporter {
         self.sender.subscribe()
     }
 
-    /// Report query start
+    /// Report query start for a table scan
+    /// Accumulates totals for multi-table queries (JOINs)
     pub fn start_query(&self, table: &str, cluster_count: usize) {
-        self.clusters_done.store(0, Ordering::SeqCst);
-        self.clusters_total.store(cluster_count, Ordering::SeqCst);
+        // Accumulate total instead of resetting - multi-table queries
+        // call this once per table, and we want combined progress
+        self.clusters_total
+            .fetch_add(cluster_count, Ordering::SeqCst);
         let _ = self.sender.send(ProgressUpdate::StartingQuery {
             table: table.to_string(),
             cluster_count,
@@ -143,6 +146,12 @@ impl ProgressReporter {
             self.clusters_done.load(Ordering::SeqCst),
             self.clusters_total.load(Ordering::SeqCst),
         )
+    }
+
+    /// Reset progress counters for a new top-level query
+    pub fn reset(&self) {
+        self.clusters_done.store(0, Ordering::SeqCst);
+        self.clusters_total.store(0, Ordering::SeqCst);
     }
 }
 
@@ -318,7 +327,7 @@ mod tests {
     }
 
     #[test]
-    fn test_start_query_resets_counters() {
+    fn test_start_query_accumulates_and_reset() {
         let reporter = ProgressReporter::new();
 
         // First query
@@ -327,9 +336,17 @@ mod tests {
         reporter.cluster_complete("c2", 10, 100);
         assert_eq!(reporter.progress(), (2, 3));
 
-        // Start a new query - should reset
+        // Second table in same query - should accumulate
         reporter.start_query("deployments", 2);
-        assert_eq!(reporter.progress(), (0, 2));
+        assert_eq!(reporter.progress(), (2, 5)); // done stays, total accumulates
+
+        // Explicit reset for new top-level query
+        reporter.reset();
+        assert_eq!(reporter.progress(), (0, 0));
+
+        // New query starts fresh
+        reporter.start_query("services", 1);
+        assert_eq!(reporter.progress(), (0, 1));
     }
 
     #[test]

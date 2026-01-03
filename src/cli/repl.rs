@@ -1317,6 +1317,9 @@ pub async fn run_repl(mut session: K8sSessionContext, pool: Arc<K8sClientPool>) 
                 let spinner = create_spinner("Executing query...");
                 let start = Instant::now();
 
+                // Reset progress counters for the new query
+                pool.progress().reset();
+
                 // Subscribe to progress updates
                 let mut progress_rx = pool.progress().subscribe();
 
