@@ -189,7 +189,7 @@ async fn run_batch(args: &Args) -> Result<()> {
 }
 
 async fn run_interactive(args: &Args) -> Result<()> {
-    use progress::{ProgressUpdate, create_spinner};
+    use progress::{ProgressUpdate, run_with_progress};
 
     // If --refresh-crds flag is set, clear the CRD schema cache
     if args.refresh_crds
@@ -215,92 +215,69 @@ async fn run_interactive(args: &Args) -> Result<()> {
 
     let initial_context = extract_initial_context(context_spec.as_deref());
 
-    // Create a spinner for startup with elapsed time
-    let spinner = create_spinner("Connecting to Kubernetes...");
-
     // Create pool and subscribe to progress BEFORE initialization
     let pool = Arc::new(K8sClientPool::new(initial_context)?);
-    let mut progress_rx = pool.progress().subscribe();
+    let progress_rx = pool.progress().subscribe();
 
     // Initialize pool and create session with progress updates
-    let session_result = {
-        let pool = Arc::clone(&pool);
-        let mut init_handle = Box::pin(async move {
+    let mut session = run_with_progress(
+        "Connecting to Kubernetes...",
+        progress_rx,
+        async {
             pool.initialize().await?;
-            K8sSessionContext::new(pool).await
-        });
-
-        loop {
-            tokio::select! {
-                biased;
-                progress = progress_rx.recv() => {
-                    match progress {
-                        Ok(ProgressUpdate::Connecting { cluster }) => {
-                            spinner.set_message(format!("Connecting to {}...", cluster));
-                        }
-                        Ok(ProgressUpdate::Discovering { cluster }) => {
-                            spinner.set_message(format!("Discovering resources on {}...", cluster));
-                        }
-                        Ok(ProgressUpdate::DiscoveryComplete { cluster, table_count, .. }) => {
-                            spinner.set_message(format!("{}: {} tables found", cluster, table_count));
-                        }
-                        Ok(ProgressUpdate::RegisteringTables { count }) => {
-                            spinner.set_message(format!("Registering {} tables...", count));
-                        }
-                        _ => {}
-                    }
-                }
-                result = &mut init_handle => {
-                    break result;
-                }
+            K8sSessionContext::new(Arc::clone(&pool)).await
+        },
+        |spinner, update| match update {
+            ProgressUpdate::Connecting { cluster } => {
+                spinner.set_message(format!("Connecting to {}...", cluster));
             }
-        }
-    };
-
-    spinner.finish_and_clear();
-
-    let mut session = session_result?;
+            ProgressUpdate::Discovering { cluster } => {
+                spinner.set_message(format!("Discovering resources on {}...", cluster));
+            }
+            ProgressUpdate::DiscoveryComplete {
+                cluster,
+                table_count,
+                ..
+            } => {
+                spinner.set_message(format!("{}: {} tables found", cluster, table_count));
+            }
+            ProgressUpdate::RegisteringTables { count } => {
+                spinner.set_message(format!("Registering {} tables...", count));
+            }
+            _ => {}
+        },
+    )
+    .await?;
 
     // If multi-context or pattern, switch to all matching contexts
     if is_multi_or_pattern_spec(context_spec.as_deref())
         && let Some(ref spec) = context_spec
     {
-        // Create a new spinner for the multi-context switch
-        let spinner = create_spinner("Restoring saved contexts...");
-        let mut progress_rx = pool.progress().subscribe();
+        let progress_rx = pool.progress().subscribe();
+        let spec = spec.clone();
 
-        // Run switch_context with progress updates
-        let switch_result = {
-            let pool = Arc::clone(&pool);
-            let spec = spec.clone();
-            let mut switch_handle =
-                Box::pin(async move { pool.switch_context(&spec, false).await });
-
-            loop {
-                tokio::select! {
-                    biased;
-                    progress = progress_rx.recv() => {
-                        match progress {
-                            Ok(ProgressUpdate::Connecting { cluster }) => {
-                                spinner.set_message(format!("Connecting to {}...", cluster));
-                            }
-                            Ok(ProgressUpdate::Discovering { cluster }) => {
-                                spinner.set_message(format!("Discovering resources on {}...", cluster));
-                            }
-                            Ok(ProgressUpdate::DiscoveryComplete { cluster, table_count, .. }) => {
-                                spinner.set_message(format!("{}: {} tables found", cluster, table_count));
-                            }
-                            _ => {}
-                        }
-                    }
-                    result = &mut switch_handle => {
-                        break result;
-                    }
+        let switch_result = run_with_progress(
+            "Restoring saved contexts...",
+            progress_rx,
+            async { pool.switch_context(&spec, false).await },
+            |spinner, update| match update {
+                ProgressUpdate::Connecting { cluster } => {
+                    spinner.set_message(format!("Connecting to {}...", cluster));
                 }
-            }
-        };
-
-        spinner.finish_and_clear();
+                ProgressUpdate::Discovering { cluster } => {
+                    spinner.set_message(format!("Discovering resources on {}...", cluster));
+                }
+                ProgressUpdate::DiscoveryComplete {
+                    cluster,
+                    table_count,
+                    ..
+                } => {
+                    spinner.set_message(format!("{}: {} tables found", cluster, table_count));
+                }
+                _ => {}
+            },
+        )
+        .await;
 
         if let Err(e) = switch_result {
             if using_saved {
