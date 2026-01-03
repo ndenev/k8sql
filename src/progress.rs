@@ -160,6 +160,63 @@ pub fn create_progress_handle() -> ProgressHandle {
     Arc::new(ProgressReporter::new())
 }
 
+/// Run an async operation with a progress spinner
+///
+/// This generic helper runs an async operation while displaying progress updates
+/// via a spinner. The caller provides a handler function that decides how to
+/// update the spinner based on each progress event.
+///
+/// # Arguments
+/// - `spinner_msg`: Initial message to display on the spinner
+/// - `progress_rx`: Receiver for progress updates
+/// - `future`: The async operation to run
+/// - `handle_progress`: Callback invoked for each progress event with `(&spinner, event)`
+///
+/// # Returns
+/// The result of the async operation
+///
+/// # Example
+/// ```ignore
+/// run_with_progress("Loading...", progress_rx, async_op, |spinner, update| {
+///     match update {
+///         ProgressUpdate::Connecting { cluster } => {
+///             spinner.set_message(format!("Connecting to {}...", cluster));
+///         }
+///         _ => {}
+///     }
+/// }).await
+/// ```
+pub async fn run_with_progress<F, H>(
+    spinner_msg: &str,
+    mut progress_rx: broadcast::Receiver<ProgressUpdate>,
+    future: F,
+    mut handle_progress: H,
+) -> F::Output
+where
+    F: std::future::Future,
+    H: FnMut(&ProgressBar, ProgressUpdate),
+{
+    use tokio::pin;
+    pin!(future);
+
+    let spinner = create_spinner(spinner_msg);
+
+    loop {
+        tokio::select! {
+            biased;
+            progress = progress_rx.recv() => {
+                if let Ok(update) = progress {
+                    handle_progress(&spinner, update);
+                }
+            }
+            result = &mut future => {
+                spinner.finish_and_clear();
+                return result;
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

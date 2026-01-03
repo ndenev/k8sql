@@ -24,7 +24,7 @@ use crate::output::{
     MAX_JSON_COLUMN_WIDTH, QueryResult, WIDE_COLUMNS, show_databases_result, show_tables_result,
     truncate_value,
 };
-use crate::progress::ProgressUpdate;
+use crate::progress::{ProgressUpdate, run_with_progress};
 
 // SQL keywords from sqlparser (for completion)
 use datafusion::sql::sqlparser::keywords::ALL_KEYWORDS;
@@ -1176,45 +1176,39 @@ pub async fn run_repl(mut session: K8sSessionContext, pool: Arc<K8sClientPool>) 
                 if is_use_command {
                     let context_spec = input.trim()[4..].trim().trim_end_matches(';');
 
-                    // Show spinner during context switch
-                    let spinner = create_spinner("Switching context...");
-                    let mut progress_rx = pool.progress().subscribe();
+                    let progress_rx = pool.progress().subscribe();
+                    let context_spec = context_spec.to_string();
 
                     // Run switch_context with progress updates
                     // Use force_refresh=false to use cached discovery (faster, more reliable)
-                    let switch_result = {
-                        let pool = Arc::clone(&pool);
-                        let context_spec = context_spec.to_string();
-                        let mut switch_handle =
-                            Box::pin(
-                                async move { pool.switch_context(&context_spec, false).await },
-                            );
-
-                        loop {
-                            tokio::select! {
-                                biased;
-                                progress = progress_rx.recv() => {
-                                    match progress {
-                                        Ok(ProgressUpdate::Connecting { cluster }) => {
-                                            spinner.set_message(format!("Connecting to {}...", cluster));
-                                        }
-                                        Ok(ProgressUpdate::Discovering { cluster }) => {
-                                            spinner.set_message(format!("Discovering resources on {}...", cluster));
-                                        }
-                                        Ok(ProgressUpdate::DiscoveryComplete { cluster, table_count, .. }) => {
-                                            spinner.set_message(format!("{}: {} tables found", cluster, table_count));
-                                        }
-                                        _ => {}
-                                    }
-                                }
-                                result = &mut switch_handle => {
-                                    break result;
-                                }
+                    let switch_result = run_with_progress(
+                        "Switching context...",
+                        progress_rx,
+                        async { pool.switch_context(&context_spec, false).await },
+                        |spinner, update| match update {
+                            ProgressUpdate::Connecting { cluster } => {
+                                spinner.set_message(format!("Connecting to {}...", cluster));
                             }
-                        }
-                    };
-
-                    spinner.finish_and_clear();
+                            ProgressUpdate::Discovering { cluster } => {
+                                spinner.set_message(format!(
+                                    "Discovering resources on {}...",
+                                    cluster
+                                ));
+                            }
+                            ProgressUpdate::DiscoveryComplete {
+                                cluster,
+                                table_count,
+                                ..
+                            } => {
+                                spinner.set_message(format!(
+                                    "{}: {} tables found",
+                                    cluster, table_count
+                                ));
+                            }
+                            _ => {}
+                        },
+                    )
+                    .await;
 
                     if let Err(e) = switch_result {
                         println!("{} {}", style("Error:").red().bold(), style(e).red());
@@ -1338,6 +1332,7 @@ pub async fn run_repl(mut session: K8sSessionContext, pool: Arc<K8sClientPool>) 
                 // Listen for progress updates while query runs
                 let result = loop {
                     tokio::select! {
+                        biased;
                         // Check for progress updates
                         progress = progress_rx.recv() => {
                             match progress {

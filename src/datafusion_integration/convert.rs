@@ -118,33 +118,9 @@ impl<'a> ColumnBuilder<'a> {
     /// while timestamp/integer builders use get_nested_value() to access raw
     /// JSON values for type-specific parsing.
     fn build_string_array(&self) -> Result<(ArrayRef, Field)> {
-        // Pre-allocate capacity to avoid reallocations during build
+        // Pre-allocate with reasonable estimate (StringBuilder auto-resizes efficiently)
         let num_rows = self.resources.len();
-
-        // Estimate total string capacity by sampling (avoids double iteration)
-        // We sample first few rows to estimate average string length
-        let sample_size = num_rows.min(10);
-        let mut sample_total_len = 0usize;
-        let mut sample_non_null_count = 0usize;
-        for i in 0..sample_size {
-            if let Some(value) = extract_field_value(
-                &self.resources[i],
-                &self.col.name,
-                self.col.json_path.as_deref(),
-            ) {
-                sample_total_len += value.len();
-                sample_non_null_count += 1;
-            }
-        }
-        // Calculate average based on non-null values to avoid underestimation
-        let avg_len = if sample_non_null_count > 0 {
-            sample_total_len / sample_non_null_count
-        } else {
-            32 // Fallback if all sampled values are null
-        };
-        let estimated_capacity = avg_len * num_rows;
-
-        let mut builder = StringBuilder::with_capacity(num_rows, estimated_capacity);
+        let mut builder = StringBuilder::with_capacity(num_rows, num_rows * 64);
 
         for resource in self.resources {
             match extract_field_value(resource, &self.col.name, self.col.json_path.as_deref()) {

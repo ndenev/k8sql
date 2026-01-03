@@ -18,6 +18,40 @@ use std::time::{Duration, SystemTime};
 use super::discovery::{ColumnDataType, ColumnDef, ResourceInfo};
 use crate::config;
 
+/// Get current UNIX timestamp in seconds
+fn current_timestamp() -> u64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+/// Atomically write content to a file using tempfile + rename
+///
+/// Creates a temporary file in the same directory, writes content, then
+/// atomically renames it to the final path. This ensures:
+/// - Crash safety: Incomplete writes don't corrupt the target file
+/// - Multi-process safety: Other processes see either old or new content, never partial
+fn atomic_write(path: &std::path::Path, content: &[u8]) -> Result<()> {
+    use tempfile::NamedTempFile;
+
+    // Create temp file in same directory as target
+    let temp_file =
+        NamedTempFile::new_in(path.parent().unwrap_or_else(|| std::path::Path::new(".")))
+            .context("Failed to create temp file")?;
+
+    // Write content to temp file
+    std::fs::write(temp_file.path(), content)
+        .with_context(|| format!("Failed to write temp file {:?}", temp_file.path()))?;
+
+    // Atomically rename to final path (atomic on Unix-like systems)
+    temp_file
+        .persist(path)
+        .with_context(|| format!("Failed to persist file to {:?}", path))?;
+
+    Ok(())
+}
+
 /// TTL for cluster groups list (1 hour)
 /// This determines how often we check which CRDs a cluster has
 const CLUSTER_GROUPS_TTL: Duration = Duration::from_secs(60 * 60);
@@ -104,10 +138,7 @@ impl From<&ResourceInfo> for CachedResourceInfo {
                 .custom_fields
                 .as_ref()
                 .map(|fields| fields.iter().map(CachedColumnDef::from).collect()),
-            created_at: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_secs(),
+            created_at: current_timestamp(),
         }
     }
 }
@@ -156,10 +187,7 @@ pub struct ClusterCRDs {
 
 /// Check if a cached entry is still fresh based on creation time and TTL
 fn is_cache_fresh(created_at: u64, ttl: Duration) -> bool {
-    let now = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
+    let now = current_timestamp();
     now.saturating_sub(created_at) < ttl.as_secs()
 }
 
@@ -167,10 +195,7 @@ impl ClusterCRDs {
     pub fn new(crds: Vec<(String, String, String)>) -> Self {
         Self {
             crds,
-            created_at: SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs(),
+            created_at: current_timestamp(),
         }
     }
 
@@ -405,23 +430,8 @@ impl ResourceCache {
 
         let path = self.cluster_path(cluster);
 
-        // Atomic write: create temp file in same directory, write, then rename
-        let temp_file = tempfile::NamedTempFile::new_in(
-            path.parent().unwrap_or_else(|| std::path::Path::new(".")),
-        )
-        .context("Failed to create temp file for cluster CRDs")?;
-
-        std::fs::write(temp_file.path(), &content).with_context(|| {
-            format!(
-                "Failed to write temp cluster CRDs to {:?}",
-                temp_file.path()
-            )
-        })?;
-
-        // Atomically rename to final path
-        temp_file
-            .persist(&path)
-            .with_context(|| format!("Failed to persist cluster CRDs to {:?}", path))?;
+        // Atomic write with tempfile + rename for crash and multi-process safety
+        atomic_write(&path, content.as_bytes()).context("Failed to write cluster CRDs")?;
 
         Ok(())
     }
@@ -453,20 +463,8 @@ impl ResourceCache {
                 .with_context(|| format!("Failed to create CRD cache directory {:?}", parent))?;
         }
 
-        // Atomic write: create temp file in same directory, write, then rename
-        // This protects against crashes and multiple k8sql instances
-        let temp_file = tempfile::NamedTempFile::new_in(
-            path.parent().unwrap_or_else(|| std::path::Path::new(".")),
-        )
-        .context("Failed to create temp file for CRD cache")?;
-
-        std::fs::write(temp_file.path(), &content)
-            .with_context(|| format!("Failed to write temp CRD cache to {:?}", temp_file.path()))?;
-
-        // Atomically rename to final path (atomic on Unix-like systems)
-        temp_file
-            .persist(&path)
-            .with_context(|| format!("Failed to persist CRD cache to {:?}", path))?;
+        // Atomic write with tempfile + rename for crash and multi-process safety
+        atomic_write(&path, content.as_bytes()).context("Failed to write CRD cache")?;
 
         Ok(())
     }
