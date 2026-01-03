@@ -83,6 +83,28 @@ pub struct K8sClientPool {
     resource_cache: ResourceCache,
 }
 
+/// Extract (group, version, kind) tuples from CRD list
+/// Only includes served versions (v.served == true)
+fn extract_served_crd_versions(
+    crd_list: &kube::api::ObjectList<
+        k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::CustomResourceDefinition,
+    >,
+) -> Vec<(String, String, String)> {
+    crd_list
+        .items
+        .iter()
+        .flat_map(|crd| {
+            crd.spec.versions.iter().filter(|v| v.served).map(move |v| {
+                (
+                    crd.spec.group.clone(),
+                    v.name.clone(),
+                    crd.spec.names.kind.clone(),
+                )
+            })
+        })
+        .collect()
+}
+
 impl K8sClientPool {
     /// Create a minimal client pool for unit tests (no kubeconfig required)
     #[cfg(test)]
@@ -263,20 +285,7 @@ impl K8sClientPool {
         }
 
         // Step 3: Extract (group, version, kind) tuples from CRD list
-        let all_crds: Vec<(String, String, String)> = crd_list
-            .items
-            .iter()
-            .flat_map(|crd| {
-                // Each CRD can have multiple versions
-                crd.spec.versions.iter().filter(|v| v.served).map(move |v| {
-                    (
-                        crd.spec.group.clone(),
-                        v.name.clone(),
-                        crd.spec.names.kind.clone(),
-                    )
-                })
-            })
-            .collect();
+        let all_crds = extract_served_crd_versions(&crd_list);
 
         // Step 4: Check which CRDs are cached vs missing
         let (cached_resources, missing_crds) = self.resource_cache.check_crds(&all_crds);
@@ -342,19 +351,7 @@ impl K8sClientPool {
         }
 
         // Extract (group, version, kind) tuples from CRD list
-        let all_crds: Vec<(String, String, String)> = crd_list
-            .items
-            .iter()
-            .flat_map(|crd| {
-                crd.spec.versions.iter().filter(|v| v.served).map(move |v| {
-                    (
-                        crd.spec.group.clone(),
-                        v.name.clone(),
-                        crd.spec.names.kind.clone(),
-                    )
-                })
-            })
-            .collect();
+        let all_crds = extract_served_crd_versions(&crd_list);
 
         // Check which CRDs are cached vs missing (shared cache across clusters)
         let (cached_resources, missing_crds) = self.resource_cache.check_crds(&all_crds);
