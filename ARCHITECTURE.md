@@ -5,52 +5,24 @@ k8sql exposes the Kubernetes API as a SQL-compatible database using [Apache Data
 ## High-Level Architecture
 
 ```mermaid
-flowchart TB
-    subgraph UI["User Interface Layer"]
-        REPL["REPL Mode<br/>(Interactive)"]
-        Batch["Batch Mode<br/>(-q, -f)"]
-        Daemon["Daemon Mode<br/>(PostgreSQL Wire)"]
-    end
-
-    subgraph QE["Query Engine Layer"]
-        Context["K8sSessionContext"]
-        Provider["K8sTableProvider"]
-        Convert["JSON → Arrow"]
-    end
-
-    subgraph DS["Data Source Layer"]
-        Pool["K8sClientPool"]
-        Discovery["Resource Discovery"]
-        Cache["Multi-Level Cache"]
-    end
-
-    subgraph K8s["Kubernetes Clusters"]
-        C1["Cluster 1"]
-        C2["Cluster 2"]
-        CN["Cluster N"]
-    end
-
-    UI --> QE
-    QE --> DS
-    DS --> K8s
+flowchart LR
+    UI[User Interface] --> QE[Query Engine]
+    QE --> DS[Data Source]
+    DS --> K8s[Kubernetes]
 ```
 
 ## Query Execution Flow
 
 ```mermaid
-flowchart LR
-    SQL["SQL Query"] --> Preprocess["Preprocess<br/>(fix ->> precedence)"]
-    Preprocess --> DF["DataFusion<br/>Parse & Plan"]
-    DF --> Provider["TableProvider<br/>Extract Filters"]
-    Provider --> API["K8s API<br/>(with filters)"]
-    API --> Stream["Stream Pages"]
-    Stream --> Arrow["Convert to<br/>Arrow Batches"]
-    Arrow --> DFExec["DataFusion<br/>Execute"]
-    DFExec --> Format["Format Output"]
-    Format --> Result["Results"]
-
-    style SQL fill:#e1f5fe
-    style Result fill:#c8e6c9
+flowchart TB
+    SQL[SQL Query] --> Preprocess[Preprocess]
+    Preprocess --> Parse[Parse & Plan]
+    Parse --> Extract[Extract Filters]
+    Extract --> API[K8s API]
+    API --> Stream[Stream Pages]
+    Stream --> Arrow[JSON to Arrow]
+    Arrow --> Exec[Execute]
+    Exec --> Format[Format Output]
 ```
 
 **Execution Steps**:
@@ -98,15 +70,11 @@ flowchart LR
 
 ```mermaid
 flowchart LR
-    Query["Query"] --> MemCache{"Memory<br/>Cache<br/>(30min TTL)"}
-    MemCache -->|hit| Result["Return"]
-    MemCache -->|miss| DiskCache{"Disk<br/>Cache<br/>(~/.k8sql/cache)"}
-    DiskCache -->|hit| MemUpdate["Update Memory"] --> Result
-    DiskCache -->|miss| API["K8s API"] --> DiskUpdate["Update Disk"] --> MemUpdate
-
-    style MemCache fill:#fff3e0
-    style DiskCache fill:#e3f2fd
-    style API fill:#fce4ec
+    Query --> MemCache{Memory Cache}
+    MemCache -->|hit| Result[Return]
+    MemCache -->|miss| DiskCache{Disk Cache}
+    DiskCache -->|hit| Result
+    DiskCache -->|miss| API[K8s API] --> DiskCache
 ```
 
 **Caching Strategy**:
