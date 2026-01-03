@@ -55,7 +55,7 @@ pub struct ColumnDef {
     pub name: String,
     /// Arrow data type
     pub data_type: ColumnDataType,
-    /// JSON path to extract value (e.g., "metadata.name")
+    /// JSON Pointer (RFC 6901) to extract value (e.g., "/metadata/name")
     pub json_path: Option<String>,
 }
 
@@ -562,13 +562,13 @@ fn get_core_resource_fields(table_name: &str) -> Option<Vec<ColumnDef>> {
 
         // ==================== CustomResourceDefinitions: CRD metadata ====================
         "customresourcedefinitions" => Some(vec![
-            ColumnDef::text("group", "spec.group"),
-            ColumnDef::text("scope", "spec.scope"),
-            ColumnDef::text("resource_kind", "spec.names.kind"),
-            ColumnDef::text("plural", "spec.names.plural"),
-            ColumnDef::text("singular", "spec.names.singular"),
-            ColumnDef::text("short_names", "spec.names.shortNames"),
-            ColumnDef::text("categories", "spec.names.categories"),
+            ColumnDef::text("group", "/spec/group"),
+            ColumnDef::text("scope", "/spec/scope"),
+            ColumnDef::text("resource_kind", "/spec/names/kind"),
+            ColumnDef::text("plural", "/spec/names/plural"),
+            ColumnDef::text("singular", "/spec/names/singular"),
+            ColumnDef::text("short_names", "/spec/names/shortNames"),
+            ColumnDef::text("categories", "/spec/names/categories"),
             // Note: spec.versions and status.conditions are too large for table display
             // Use kubectl get crd <name> -o yaml for full schema details
         ]),
@@ -589,28 +589,28 @@ pub fn generate_schema(info: &ResourceInfo) -> Vec<ColumnDef> {
         // Virtual column for cluster/context name
         ColumnDef::text_raw("_cluster"),
         // API version and kind - self-describing columns for CRD safety
-        ColumnDef::text("api_version", "apiVersion"),
-        ColumnDef::text("kind", "kind"),
+        ColumnDef::text("api_version", "/apiVersion"),
+        ColumnDef::text("kind", "/kind"),
         // Common metadata columns
-        ColumnDef::text("name", "metadata.name"),
+        ColumnDef::text("name", "/metadata/name"),
     ];
 
     // Only add namespace for namespaced resources (exclude cluster-scoped)
     if info.capabilities.scope == Scope::Namespaced {
-        columns.push(ColumnDef::text("namespace", "metadata.namespace"));
+        columns.push(ColumnDef::text("namespace", "/metadata/namespace"));
     }
 
     // Continue with remaining metadata columns
     columns.extend(vec![
-        ColumnDef::text("uid", "metadata.uid"),
-        ColumnDef::timestamp("created", "metadata.creationTimestamp"),
-        ColumnDef::text("labels", "metadata.labels"),
-        ColumnDef::text("annotations", "metadata.annotations"),
-        ColumnDef::text("owner_references", "metadata.ownerReferences"),
-        ColumnDef::integer("generation", "metadata.generation"),
-        ColumnDef::text("resource_version", "metadata.resourceVersion"),
-        ColumnDef::timestamp("deletion_timestamp", "metadata.deletionTimestamp"),
-        ColumnDef::text("finalizers", "metadata.finalizers"),
+        ColumnDef::text("uid", "/metadata/uid"),
+        ColumnDef::timestamp("created", "/metadata/creationTimestamp"),
+        ColumnDef::text("labels", "/metadata/labels"),
+        ColumnDef::text("annotations", "/metadata/annotations"),
+        ColumnDef::text("owner_references", "/metadata/ownerReferences"),
+        ColumnDef::integer("generation", "/metadata/generation"),
+        ColumnDef::text("resource_version", "/metadata/resourceVersion"),
+        ColumnDef::timestamp("deletion_timestamp", "/metadata/deletionTimestamp"),
+        ColumnDef::text("finalizers", "/metadata/finalizers"),
     ]);
 
     // Add resource-specific columns with priority:

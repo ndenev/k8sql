@@ -115,7 +115,7 @@ impl<'a> ColumnBuilder<'a> {
     /// Build a simple string column by extracting values from JSON
     ///
     /// Note: Uses extract_field_value() which handles JSON value formatting,
-    /// while timestamp/integer builders use get_nested_value() to access raw
+    /// while timestamp/integer builders use pointer() to access raw
     /// JSON values for type-specific parsing.
     fn build_string_array(&self) -> Result<(ArrayRef, Field)> {
         // Pre-allocate with reasonable estimate (StringBuilder auto-resizes efficiently)
@@ -141,7 +141,7 @@ impl<'a> ColumnBuilder<'a> {
 
         for resource in self.resources {
             let path = self.col.json_path.as_deref().unwrap_or(&self.col.name);
-            let value = get_nested_value(resource, path);
+            let value = resource.pointer(path).unwrap_or(&serde_json::Value::Null);
 
             match value.as_str() {
                 Some(s) => {
@@ -170,7 +170,7 @@ impl<'a> ColumnBuilder<'a> {
 
         for resource in self.resources {
             let path = self.col.json_path.as_deref().unwrap_or(&self.col.name);
-            let value = get_nested_value(resource, path);
+            let value = resource.pointer(path).unwrap_or(&serde_json::Value::Null);
 
             match value {
                 serde_json::Value::Number(n) => {
@@ -217,30 +217,20 @@ fn extract_field_value(
     field_name: &str,
     json_path: Option<&str>,
 ) -> Option<String> {
-    let path = json_path.unwrap_or(field_name);
-    let value = get_nested_value(resource, path);
+    // All production column definitions use JSON Pointer format (RFC 6901)
+    // When json_path is None, use field_name as JSON Pointer (prepend '/' for top-level fields)
+    let json_pointer = match json_path {
+        Some(path) => path,
+        None => {
+            // Construct JSON Pointer from field_name (e.g., "name" -> "/name")
+            return resource.get(field_name).and_then(format_json_value);
+        }
+    };
+
+    let value = resource
+        .pointer(json_pointer)
+        .unwrap_or(&serde_json::Value::Null);
     format_json_value(value)
-}
-
-/// Navigate a dotted path in a JSON value
-fn get_nested_value<'a>(value: &'a serde_json::Value, path: &str) -> &'a serde_json::Value {
-    let mut current = value;
-
-    for part in path.split('.') {
-        current = match current {
-            serde_json::Value::Object(map) => map.get(part).unwrap_or(&serde_json::Value::Null),
-            serde_json::Value::Array(arr) => {
-                if let Ok(idx) = part.parse::<usize>() {
-                    arr.get(idx).unwrap_or(&serde_json::Value::Null)
-                } else {
-                    &serde_json::Value::Null
-                }
-            }
-            _ => &serde_json::Value::Null,
-        };
-    }
-
-    current
 }
 
 /// Format a JSON value as a string for storage/display
@@ -261,89 +251,6 @@ fn format_json_value(value: &serde_json::Value) -> Option<String> {
 mod tests {
     use super::*;
     use datafusion::arrow::array::Array;
-
-    #[test]
-    fn test_get_nested_value() {
-        let json = serde_json::json!({
-            "metadata": {
-                "name": "test-pod",
-                "namespace": "default"
-            },
-            "status": {
-                "phase": "Running"
-            }
-        });
-
-        assert_eq!(
-            *get_nested_value(&json, "metadata.name"),
-            serde_json::json!("test-pod")
-        );
-        assert_eq!(
-            *get_nested_value(&json, "status.phase"),
-            serde_json::json!("Running")
-        );
-        assert_eq!(
-            *get_nested_value(&json, "nonexistent"),
-            serde_json::Value::Null
-        );
-    }
-
-    #[test]
-    fn test_get_nested_value_array_index() {
-        let json = serde_json::json!({
-            "containers": [
-                {"name": "nginx", "image": "nginx:latest"},
-                {"name": "sidecar", "image": "sidecar:v1"}
-            ]
-        });
-
-        // Access array by index
-        let first_container = get_nested_value(&json, "containers.0");
-        assert_eq!(first_container["name"], "nginx");
-
-        let second_name = get_nested_value(&json, "containers.1.name");
-        assert_eq!(*second_name, "sidecar");
-
-        // Out of bounds returns null
-        let oob = get_nested_value(&json, "containers.10");
-        assert_eq!(*oob, serde_json::Value::Null);
-
-        // Non-numeric index on array returns null
-        let invalid = get_nested_value(&json, "containers.invalid");
-        assert_eq!(*invalid, serde_json::Value::Null);
-    }
-
-    #[test]
-    fn test_get_nested_value_deeply_nested() {
-        let json = serde_json::json!({
-            "spec": {
-                "containers": [
-                    {
-                        "resources": {
-                            "limits": {
-                                "cpu": "100m",
-                                "memory": "128Mi"
-                            }
-                        }
-                    }
-                ]
-            }
-        });
-
-        let cpu = get_nested_value(&json, "spec.containers.0.resources.limits.cpu");
-        assert_eq!(*cpu, "100m");
-    }
-
-    #[test]
-    fn test_get_nested_value_primitive_path() {
-        // Trying to navigate into a primitive value
-        let json = serde_json::json!({
-            "name": "test"
-        });
-
-        let result = get_nested_value(&json, "name.nested");
-        assert_eq!(*result, serde_json::Value::Null);
-    }
 
     #[test]
     fn test_format_json_value_null() {
@@ -411,12 +318,12 @@ mod tests {
             ColumnDef {
                 name: "name".to_string(),
                 data_type: ColumnDataType::Text,
-                json_path: Some("metadata.name".to_string()),
+                json_path: Some("/metadata/name".to_string()),
             },
             ColumnDef {
                 name: "namespace".to_string(),
                 data_type: ColumnDataType::Text,
-                json_path: Some("metadata.namespace".to_string()),
+                json_path: Some("/metadata/namespace".to_string()),
             },
         ];
 
@@ -439,7 +346,7 @@ mod tests {
             }
         });
 
-        let result = extract_field_value(&resource, "name", Some("metadata.name"));
+        let result = extract_field_value(&resource, "name", Some("/metadata/name"));
         assert_eq!(result, Some("nginx-pod".to_string()));
     }
 
@@ -457,7 +364,7 @@ mod tests {
     fn test_extract_field_value_missing() {
         let resource = serde_json::json!({});
 
-        let result = extract_field_value(&resource, "name", Some("metadata.name"));
+        let result = extract_field_value(&resource, "name", Some("/metadata/name"));
         assert_eq!(result, None);
     }
 
@@ -483,7 +390,7 @@ mod tests {
         let col = ColumnDef {
             name: "name".to_string(),
             data_type: ColumnDataType::Text,
-            json_path: Some("metadata.name".to_string()),
+            json_path: Some("/metadata/name".to_string()),
         };
 
         let resources = vec![
