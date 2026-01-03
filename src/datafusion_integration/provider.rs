@@ -900,83 +900,131 @@ mod tests {
         K8sTableProvider::new(resource_info, pool)
     }
 
+    /// Helper to create equality filter (column = value)
+    fn eq_filter(column: &str, value: impl Into<String>) -> Expr {
+        Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(Expr::Column(Column::new_unqualified(column))),
+            op: Operator::Eq,
+            right: Box::new(Expr::Literal(
+                datafusion::common::ScalarValue::Utf8(Some(value.into())),
+                None,
+            )),
+        })
+    }
+
+    /// Helper to create not-equals filter (column != value)
+    fn ne_filter(column: &str, value: impl Into<String>) -> Expr {
+        Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(Expr::Column(Column::new_unqualified(column))),
+            op: Operator::NotEq,
+            right: Box::new(Expr::Literal(
+                datafusion::common::ScalarValue::Utf8(Some(value.into())),
+                None,
+            )),
+        })
+    }
+
+    /// Helper to create greater-than filter (column > value)
+    fn gt_filter(column: &str, value: impl Into<String>) -> Expr {
+        Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(Expr::Column(Column::new_unqualified(column))),
+            op: Operator::Gt,
+            right: Box::new(Expr::Literal(
+                datafusion::common::ScalarValue::Utf8(Some(value.into())),
+                None,
+            )),
+        })
+    }
+
+    /// Helper to create LIKE filter (column LIKE pattern)
+    fn like_filter(column: &str, pattern: impl Into<String>) -> Expr {
+        Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(Expr::Column(Column::new_unqualified(column))),
+            op: Operator::LikeMatch,
+            right: Box::new(Expr::Literal(
+                datafusion::common::ScalarValue::Utf8(Some(pattern.into())),
+                None,
+            )),
+        })
+    }
+
+    /// Helper to create IN filter (column IN (values))
+    fn in_filter(column: &str, values: &[&str]) -> Expr {
+        Expr::InList(InList {
+            expr: Box::new(Expr::Column(Column::new_unqualified(column))),
+            list: values
+                .iter()
+                .map(|v| {
+                    Expr::Literal(
+                        datafusion::common::ScalarValue::Utf8(Some(v.to_string())),
+                        None,
+                    )
+                })
+                .collect(),
+            negated: false,
+        })
+    }
+
+    /// Helper to create AND filter (left AND right)
+    fn and_filter(left: Expr, right: Expr) -> Expr {
+        Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(left),
+            op: Operator::And,
+            right: Box::new(right),
+        })
+    }
+
+    /// Helper to assert Exact pushdown
+    fn assert_exact(result: &[TableProviderFilterPushDown]) {
+        assert_eq!(result.len(), 1);
+        assert!(matches!(result[0], TableProviderFilterPushDown::Exact));
+    }
+
+    /// Helper to assert Inexact pushdown
+    fn assert_inexact(result: &[TableProviderFilterPushDown]) {
+        assert_eq!(result.len(), 1);
+        assert!(matches!(result[0], TableProviderFilterPushDown::Inexact));
+    }
+
+    /// Helper to assert Unsupported pushdown
+    fn assert_unsupported(result: &[TableProviderFilterPushDown]) {
+        assert_eq!(result.len(), 1);
+        assert!(matches!(
+            result[0],
+            TableProviderFilterPushDown::Unsupported
+        ));
+    }
+
     #[test]
     fn test_filter_pushdown_namespace_equals() {
         let provider = create_test_provider();
-        let filter = Expr::BinaryExpr(BinaryExpr {
-            left: Box::new(Expr::Column(Column::new_unqualified("namespace"))),
-            op: Operator::Eq,
-            right: Box::new(Expr::Literal(
-                datafusion::common::ScalarValue::Utf8(Some("default".to_string())),
-                None,
-            )),
-        });
-
+        let filter = eq_filter("namespace", "default");
         let result = provider.supports_filters_pushdown(&[&filter]).unwrap();
-
-        assert_eq!(result.len(), 1);
-        assert!(matches!(result[0], TableProviderFilterPushDown::Exact));
+        assert_exact(&result);
     }
 
     #[test]
     fn test_filter_pushdown_cluster_equals() {
         let provider = create_test_provider();
-        let filter = Expr::BinaryExpr(BinaryExpr {
-            left: Box::new(Expr::Column(Column::new_unqualified("_cluster"))),
-            op: Operator::Eq,
-            right: Box::new(Expr::Literal(
-                datafusion::common::ScalarValue::Utf8(Some("prod".to_string())),
-                None,
-            )),
-        });
-
+        let filter = eq_filter("_cluster", "prod");
         let result = provider.supports_filters_pushdown(&[&filter]).unwrap();
-
-        assert_eq!(result.len(), 1);
-        assert!(matches!(result[0], TableProviderFilterPushDown::Exact));
+        assert_exact(&result);
     }
 
     #[test]
     fn test_filter_pushdown_namespace_in_list() {
         let provider = create_test_provider();
-        let filter = Expr::InList(InList {
-            expr: Box::new(Expr::Column(Column::new_unqualified("namespace"))),
-            list: vec![
-                Expr::Literal(
-                    datafusion::common::ScalarValue::Utf8(Some("ns1".to_string())),
-                    None,
-                ),
-                Expr::Literal(
-                    datafusion::common::ScalarValue::Utf8(Some("ns2".to_string())),
-                    None,
-                ),
-            ],
-            negated: false,
-        });
-
+        let filter = in_filter("namespace", &["ns1", "ns2"]);
         let result = provider.supports_filters_pushdown(&[&filter]).unwrap();
-
-        assert_eq!(result.len(), 1);
-        assert!(matches!(result[0], TableProviderFilterPushDown::Exact));
+        assert_exact(&result);
     }
 
     #[test]
     fn test_filter_pushdown_name_field_selector() {
         let provider = create_test_provider();
-        // name = 'test' is now pushed as metadata.name field selector
-        let filter = Expr::BinaryExpr(BinaryExpr {
-            left: Box::new(Expr::Column(Column::new_unqualified("name"))),
-            op: Operator::Eq,
-            right: Box::new(Expr::Literal(
-                datafusion::common::ScalarValue::Utf8(Some("test".to_string())),
-                None,
-            )),
-        });
-
+        let filter = eq_filter("name", "my-pod");
         let result = provider.supports_filters_pushdown(&[&filter]).unwrap();
-
-        assert_eq!(result.len(), 1);
-        assert!(matches!(result[0], TableProviderFilterPushDown::Exact));
+        assert_exact(&result);
     }
 
     #[test]
@@ -1125,67 +1173,25 @@ mod tests {
     #[test]
     fn test_field_selector_name_not_equals_inexact() {
         let provider = create_test_provider();
-
-        // Test that name != 'x' uses Inexact pushdown for NULL semantics
-        let name_filter = Expr::BinaryExpr(BinaryExpr {
-            left: Box::new(Expr::Column(Column::new_unqualified("name"))),
-            op: Operator::NotEq,
-            right: Box::new(Expr::Literal(
-                datafusion::common::ScalarValue::Utf8(Some("excluded-pod".to_string())),
-                None,
-            )),
-        });
-
-        let result = provider.supports_filters_pushdown(&[&name_filter]).unwrap();
-
-        assert_eq!(result.len(), 1);
-        assert!(matches!(result[0], TableProviderFilterPushDown::Inexact));
+        let filter = ne_filter("name", "excluded-pod");
+        let result = provider.supports_filters_pushdown(&[&filter]).unwrap();
+        assert_inexact(&result);
     }
 
     #[test]
     fn test_field_selector_unsupported_operator_greater_than() {
         let provider = create_test_provider();
-
-        // Field selectors don't support > operator
-        let filter = Expr::BinaryExpr(BinaryExpr {
-            left: Box::new(Expr::Column(Column::new_unqualified("name"))),
-            op: Operator::Gt,
-            right: Box::new(Expr::Literal(
-                datafusion::common::ScalarValue::Utf8(Some("pod-a".to_string())),
-                None,
-            )),
-        });
-
+        let filter = gt_filter("name", "pod-a");
         let result = provider.supports_filters_pushdown(&[&filter]).unwrap();
-
-        assert_eq!(result.len(), 1);
-        assert!(matches!(
-            result[0],
-            TableProviderFilterPushDown::Unsupported
-        ));
+        assert_unsupported(&result);
     }
 
     #[test]
     fn test_field_selector_unsupported_operator_like() {
         let provider = create_test_provider();
-
-        // Field selectors don't support LIKE
-        let filter = Expr::BinaryExpr(BinaryExpr {
-            left: Box::new(Expr::Column(Column::new_unqualified("name"))),
-            op: Operator::LikeMatch,
-            right: Box::new(Expr::Literal(
-                datafusion::common::ScalarValue::Utf8(Some("pod-%".to_string())),
-                None,
-            )),
-        });
-
+        let filter = like_filter("name", "pod-%");
         let result = provider.supports_filters_pushdown(&[&filter]).unwrap();
-
-        assert_eq!(result.len(), 1);
-        assert!(matches!(
-            result[0],
-            TableProviderFilterPushDown::Unsupported
-        ));
+        assert_unsupported(&result);
     }
 
     #[test]
@@ -1230,18 +1236,7 @@ mod tests {
     #[test]
     fn test_field_selector_extraction_format() {
         let provider = create_test_provider();
-
-        // Create filters that should be extracted
-        let name_filter = Expr::BinaryExpr(BinaryExpr {
-            left: Box::new(Expr::Column(Column::new_unqualified("name"))),
-            op: Operator::Eq,
-            right: Box::new(Expr::Literal(
-                datafusion::common::ScalarValue::Utf8(Some("my-pod".to_string())),
-                None,
-            )),
-        });
-
-        // Extract field selectors
+        let name_filter = eq_filter("name", "my-pod");
         let result = provider.extract_field_selectors(&[name_filter]);
 
         // Should produce "metadata.name=my-pod"
