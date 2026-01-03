@@ -82,10 +82,8 @@ impl QueryResult {
 }
 
 /// Create a QueryResult for SHOW TABLES output with full metadata
-/// Takes a list of TableMetadata with complete resource information
-pub fn show_tables_result(
-    metadata: Vec<crate::datafusion_integration::TableMetadata>,
-) -> QueryResult {
+/// Takes raw TableInfo and formats it for display
+pub fn show_tables_result(tables: Vec<crate::datafusion_integration::TableInfo>) -> QueryResult {
     QueryResult {
         columns: vec![
             "table_name".to_string(),
@@ -96,17 +94,40 @@ pub fn show_tables_result(
             "scope".to_string(),
             "resource_type".to_string(),
         ],
-        rows: metadata
+        rows: tables
             .into_iter()
-            .map(|m| {
+            .map(|t| {
+                // Format aliases: join with ", " or empty string
+                let aliases = if t.aliases.is_empty() {
+                    String::new()
+                } else {
+                    t.aliases.join(", ")
+                };
+
+                // Format scope enum to string
+                let scope = match t.scope {
+                    kube::discovery::Scope::Namespaced => "Namespaced",
+                    kube::discovery::Scope::Cluster => "Cluster",
+                };
+
+                // Format is_core bool to "core"/"crd"
+                let resource_type = if t.is_core { "core" } else { "crd" };
+
+                // Display "core" as group for core resources (empty group)
+                let group = if t.group.is_empty() {
+                    "core".to_string()
+                } else {
+                    t.group
+                };
+
                 vec![
-                    m.table_name,
-                    m.aliases,
-                    m.group,
-                    m.version,
-                    m.kind,
-                    m.scope,
-                    m.resource_type,
+                    t.table_name,
+                    aliases,
+                    group,
+                    t.version,
+                    t.kind,
+                    scope.to_string(),
+                    resource_type.to_string(),
                 ]
             })
             .collect(),
