@@ -537,10 +537,7 @@ mod tests {
             aliases: vec![name.to_lowercase()],
             is_core: false,
             custom_fields: None,
-            created_at: SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .unwrap()
-                .as_secs(),
+            created_at: current_timestamp(),
         }
     }
 

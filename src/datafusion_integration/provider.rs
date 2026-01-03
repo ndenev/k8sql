@@ -475,6 +475,21 @@ impl std::fmt::Debug for K8sTableProvider {
     }
 }
 
+/// Returns the appropriate filter pushdown level for equality operators.
+///
+/// `!=` (NotEq) needs Inexact to ensure SQL NULL semantics:
+/// - K8s treats `key!=value` as "not equal OR missing"
+/// - SQL treats `NULL != 'value'` as NULL (excluded from results)
+///
+/// By returning Inexact, DataFusion re-applies the filter after K8s API.
+fn pushdown_for_equality_op(op: Operator) -> TableProviderFilterPushDown {
+    if op == Operator::NotEq {
+        TableProviderFilterPushDown::Inexact
+    } else {
+        TableProviderFilterPushDown::Exact
+    }
+}
+
 #[async_trait]
 impl TableProvider for K8sTableProvider {
     fn as_any(&self) -> &dyn Any {
@@ -581,14 +596,7 @@ impl TableProvider for K8sTableProvider {
                             && (binary.op == Operator::Eq || binary.op == Operator::NotEq)
                             && matches!(binary.right.as_ref(), Expr::Literal(..))
                         {
-                            // != needs Inexact to ensure SQL NULL semantics:
-                            // K8s treats key!=value as "not equal OR missing"
-                            // SQL treats NULL != 'value' as NULL (excluded from results)
-                            // By returning Inexact, DataFusion re-applies the filter
-                            if binary.op == Operator::NotEq {
-                                return TableProviderFilterPushDown::Inexact;
-                            }
-                            return TableProviderFilterPushDown::Exact;
+                            return pushdown_for_equality_op(binary.op);
                         }
 
                         // NEW: Check for field selector patterns
@@ -606,11 +614,7 @@ impl TableProvider for K8sTableProvider {
                             if FIELD_SELECTOR_REGISTRY
                                 .is_supported(&self.resource_info.table_name, &field_path)
                             {
-                                // != needs Inexact for same reasons as labels
-                                if binary.op == Operator::NotEq {
-                                    return TableProviderFilterPushDown::Inexact;
-                                }
-                                return TableProviderFilterPushDown::Exact;
+                                return pushdown_for_equality_op(binary.op);
                             }
                         }
                     }
@@ -631,11 +635,7 @@ impl TableProvider for K8sTableProvider {
                         if FIELD_SELECTOR_REGISTRY
                             .is_supported(&self.resource_info.table_name, field_path)
                         {
-                            // != needs Inexact for same reasons as labels
-                            if binary.op == Operator::NotEq {
-                                return TableProviderFilterPushDown::Inexact;
-                            }
-                            return TableProviderFilterPushDown::Exact;
+                            return pushdown_for_equality_op(binary.op);
                         }
                     }
                 }
