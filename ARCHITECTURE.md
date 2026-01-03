@@ -59,7 +59,7 @@ flowchart LR
 2. **DataFusion Parse** - SQL parsing and logical plan creation
 3. **TableProvider** - Extract pushable filters (namespace, labels, field selectors)
 4. **K8s API Call** - Fetch resources with server-side filtering
-5. **Stream Pages** - Paginated results (500 items/page) with early termination on LIMIT
+5. **Stream Pages** - Paginated results (500 items/page)
 6. **Convert to Arrow** - Transform JSON to typed Arrow RecordBatches
 7. **DataFusion Execute** - Apply remaining filters, projections, aggregations
 8. **Format Output** - Render as table, JSON, CSV, or YAML
@@ -129,9 +129,11 @@ flowchart LR
 | **convert** | `src/datafusion_integration/convert.rs` | JSON to Arrow conversion |
 | **filter_extraction** | `src/datafusion_integration/filter_extraction.rs` | SQL filter extraction utilities |
 | **execution** | `src/datafusion_integration/execution.rs` | Custom ExecutionPlan with streaming |
+| **hooks** | `src/datafusion_integration/hooks.rs` | Query hooks (SET, SHOW for pgwire) |
 | **client** | `src/kubernetes/client.rs` | Multi-cluster connection pooling |
 | **discovery** | `src/kubernetes/discovery.rs` | Resource discovery and schema generation |
 | **cache** | `src/kubernetes/cache.rs` | Disk-based resource cache |
 | **field_selectors** | `src/kubernetes/field_selectors.rs` | K8s field selector registry |
+| **context_matcher** | `src/kubernetes/context_matcher.rs` | Glob pattern matching for contexts |
 | **progress** | `src/progress.rs` | Progress reporting for async operations |
 | **config** | `src/config.rs` | User configuration persistence |
