@@ -125,66 +125,17 @@ async fn main() -> Result<()> {
     run_interactive(&args).await
 }
 
-/// Parse SQL file content into individual statements.
-/// Splits on semicolons, removes comments, handles multi-line queries.
-fn parse_sql_file(content: &str) -> Vec<String> {
-    let mut statements = Vec::new();
-    let mut current = String::new();
-    let mut in_single_quote = false;
-    let mut in_double_quote = false;
-    let mut chars = content.chars().peekable();
+/// Parse SQL file content into individual statements using sqlparser.
+/// Returns statements as strings, preserving the original SQL text.
+fn parse_sql_file(content: &str) -> Result<Vec<String>> {
+    use datafusion::sql::sqlparser::dialect::GenericDialect;
+    use datafusion::sql::sqlparser::parser::Parser;
 
-    while let Some(c) = chars.next() {
-        match c {
-            '\'' if !in_double_quote => {
-                in_single_quote = !in_single_quote;
-                current.push(c);
-            }
-            '"' if !in_single_quote => {
-                in_double_quote = !in_double_quote;
-                current.push(c);
-            }
-            '-' if !in_single_quote && !in_double_quote && chars.peek() == Some(&'-') => {
-                // Line comment: skip until end of line (including the newline)
-                chars.next(); // consume second '-'
-                for next in chars.by_ref() {
-                    if next == '\n' {
-                        break;
-                    }
-                }
-            }
-            '/' if !in_single_quote && !in_double_quote && chars.peek() == Some(&'*') => {
-                // Block comment: skip until */
-                chars.next(); // consume '*'
-                let mut prev = ' ';
-                for next in chars.by_ref() {
-                    if prev == '*' && next == '/' {
-                        break;
-                    }
-                    prev = next;
-                }
-            }
-            ';' if !in_single_quote && !in_double_quote => {
-                // End of statement
-                let stmt = current.trim().to_string();
-                if !stmt.is_empty() {
-                    statements.push(stmt);
-                }
-                current.clear();
-            }
-            _ => {
-                current.push(c);
-            }
-        }
-    }
+    let dialect = GenericDialect {};
+    let statements = Parser::parse_sql(&dialect, content)
+        .map_err(|e| anyhow::anyhow!("SQL parse error: {}", e))?;
 
-    // Handle final statement (may not have trailing semicolon)
-    let stmt = current.trim().to_string();
-    if !stmt.is_empty() {
-        statements.push(stmt);
-    }
-
-    statements
+    Ok(statements.into_iter().map(|s| s.to_string()).collect())
 }
 
 async fn run_batch(args: &Args) -> Result<()> {
@@ -205,7 +156,7 @@ async fn run_batch(args: &Args) -> Result<()> {
         vec![query.clone()]
     } else if let Some(file) = &args.file {
         let content = std::fs::read_to_string(file)?;
-        parse_sql_file(&content)
+        parse_sql_file(&content)?
     } else {
         return Ok(());
     };
