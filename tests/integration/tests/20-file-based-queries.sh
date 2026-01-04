@@ -5,7 +5,6 @@ source "$SCRIPT_DIR/../lib.sh"
 
 echo "=== File-Based Query Execution Tests ==="
 
-K8SQL="${K8SQL:-../../bin/k8sql}"
 TEST_CONTEXT="k3d-k8sql-test-1"
 TMP_DIR=$(mktemp -d)
 
@@ -149,18 +148,19 @@ else
 fi
 
 # Test 10: File with --no-headers flag
+# Compare line counts: with headers should have one more line than without
 cat > "$TMP_DIR/no-headers.sql" << 'EOF'
-SELECT name FROM namespaces LIMIT 1
+SELECT name FROM namespaces LIMIT 3
 EOF
 
-result=$($K8SQL -c "$TEST_CONTEXT" -f "$TMP_DIR/no-headers.sql" -o csv --no-headers 2>/dev/null)
-# With --no-headers, the first line should be data, not "name"
-first_line=$(echo "$result" | head -1)
-if [[ "$first_line" != "name" ]] && [[ -n "$first_line" ]]; then
+with_headers=$($K8SQL -c "$TEST_CONTEXT" -f "$TMP_DIR/no-headers.sql" -o csv 2>/dev/null | wc -l)
+without_headers=$($K8SQL -c "$TEST_CONTEXT" -f "$TMP_DIR/no-headers.sql" -o csv --no-headers 2>/dev/null | wc -l)
+# With headers should have exactly one more line (the header row)
+if [[ $((with_headers - without_headers)) -eq 1 ]]; then
     echo -e "${GREEN}✓${NC} File execution with --no-headers works"
     PASS=$((PASS + 1))
 else
-    echo -e "${RED}✗${NC} --no-headers flag not working with file input"
+    echo -e "${RED}✗${NC} --no-headers flag not working (with: $with_headers, without: $without_headers)"
     FAIL=$((FAIL + 1))
 fi
 
