@@ -27,10 +27,10 @@ else
     FAIL=$((FAIL + 1))
 fi
 
-# Test 2: Multiple queries in file (each line is a separate query)
+# Test 2: Multiple queries in file (separated by semicolons)
 cat > "$TMP_DIR/multi-query.sql" << 'EOF'
-SELECT COUNT(*) as cnt FROM namespaces
-SELECT name FROM configmaps WHERE namespace = 'default' LIMIT 1
+SELECT COUNT(*) as cnt FROM namespaces;
+SELECT name FROM configmaps WHERE namespace = 'default' LIMIT 1;
 EOF
 
 result=$($K8SQL -c "$TEST_CONTEXT" -f "$TMP_DIR/multi-query.sql" 2>/dev/null)
@@ -46,9 +46,9 @@ fi
 # Test 3: Comments are skipped (lines starting with --)
 cat > "$TMP_DIR/with-comments.sql" << 'EOF'
 -- This is a comment that should be ignored
-SELECT name FROM namespaces LIMIT 1
+SELECT name FROM namespaces LIMIT 1;
 -- Another comment
-SELECT COUNT(*) as total FROM pods
+SELECT COUNT(*) as total FROM pods;
 EOF
 
 result=$($K8SQL -c "$TEST_CONTEXT" -f "$TMP_DIR/with-comments.sql" 2>/dev/null)
@@ -64,9 +64,9 @@ fi
 # Test 4: Empty lines are skipped
 cat > "$TMP_DIR/with-empty-lines.sql" << 'EOF'
 
-SELECT name FROM namespaces LIMIT 1
+SELECT name FROM namespaces LIMIT 1;
 
-SELECT COUNT(*) as cnt FROM pods
+SELECT COUNT(*) as cnt FROM pods;
 
 EOF
 
