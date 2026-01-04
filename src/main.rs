@@ -125,6 +125,58 @@ async fn main() -> Result<()> {
     run_interactive(&args).await
 }
 
+/// Parse SQL file content into individual statements.
+/// Splits on semicolons, removes comments, handles multi-line queries.
+fn parse_sql_file(content: &str) -> Vec<String> {
+    let mut statements = Vec::new();
+    let mut current = String::new();
+    let mut in_single_quote = false;
+    let mut in_double_quote = false;
+    let mut chars = content.chars().peekable();
+
+    while let Some(c) = chars.next() {
+        match c {
+            '\'' if !in_double_quote => {
+                in_single_quote = !in_single_quote;
+                current.push(c);
+            }
+            '"' if !in_single_quote => {
+                in_double_quote = !in_double_quote;
+                current.push(c);
+            }
+            '-' if !in_single_quote && !in_double_quote && chars.peek() == Some(&'-') => {
+                // Line comment: skip until end of line
+                chars.next(); // consume second '-'
+                while let Some(&next) = chars.peek() {
+                    if next == '\n' {
+                        break;
+                    }
+                    chars.next();
+                }
+            }
+            ';' if !in_single_quote && !in_double_quote => {
+                // End of statement
+                let stmt = current.trim().to_string();
+                if !stmt.is_empty() {
+                    statements.push(stmt);
+                }
+                current.clear();
+            }
+            _ => {
+                current.push(c);
+            }
+        }
+    }
+
+    // Handle final statement (may not have trailing semicolon)
+    let stmt = current.trim().to_string();
+    if !stmt.is_empty() {
+        statements.push(stmt);
+    }
+
+    statements
+}
+
 async fn run_batch(args: &Args) -> Result<()> {
     // If --refresh-crds flag is set, clear the CRD schema cache
     if args.refresh_crds
@@ -143,11 +195,7 @@ async fn run_batch(args: &Args) -> Result<()> {
         vec![query.clone()]
     } else if let Some(file) = &args.file {
         let content = std::fs::read_to_string(file)?;
-        content
-            .lines()
-            .filter(|l| !l.trim().is_empty() && !l.trim().starts_with("--"))
-            .map(String::from)
-            .collect()
+        parse_sql_file(&content)
     } else {
         return Ok(());
     };

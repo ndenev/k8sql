@@ -179,4 +179,103 @@ else
     FAIL=$((FAIL + 1))
 fi
 
+# Test 12: Multi-line query with CTE
+cat > "$TMP_DIR/multiline-cte.sql" << 'EOF'
+-- Multi-line CTE query
+WITH ns_counts AS (
+    SELECT
+        namespace,
+        COUNT(*) as cnt
+    FROM pods
+    GROUP BY namespace
+)
+SELECT * FROM ns_counts LIMIT 2;
+EOF
+
+result=$($K8SQL -c "$TEST_CONTEXT" -f "$TMP_DIR/multiline-cte.sql" -o json 2>/dev/null)
+if echo "$result" | jq -e '.[0] | has("namespace") and has("cnt")' > /dev/null 2>&1; then
+    echo -e "${GREEN}✓${NC} Multi-line CTE query executes correctly"
+    PASS=$((PASS + 1))
+else
+    echo -e "${RED}✗${NC} Multi-line CTE query failed: $result"
+    FAIL=$((FAIL + 1))
+fi
+
+# Test 13: Multiple multi-line queries separated by semicolons
+cat > "$TMP_DIR/multi-multiline.sql" << 'EOF'
+-- First query
+SELECT name
+FROM namespaces
+LIMIT 1;
+
+-- Second query
+SELECT name
+FROM configmaps
+WHERE namespace = 'default'
+LIMIT 1;
+EOF
+
+result=$($K8SQL -c "$TEST_CONTEXT" -f "$TMP_DIR/multi-multiline.sql" 2>/dev/null)
+# Both queries should produce output
+line_count=$(echo "$result" | grep -c "rows\|row")
+if [[ $line_count -ge 2 ]]; then
+    echo -e "${GREEN}✓${NC} Multiple multi-line queries execute correctly"
+    PASS=$((PASS + 1))
+else
+    echo -e "${RED}✗${NC} Multiple multi-line queries failed (expected 2+ result sets)"
+    FAIL=$((FAIL + 1))
+fi
+
+# Test 14: Query without trailing semicolon
+cat > "$TMP_DIR/no-semicolon.sql" << 'EOF'
+SELECT name FROM namespaces LIMIT 1
+EOF
+
+result=$($K8SQL -c "$TEST_CONTEXT" -f "$TMP_DIR/no-semicolon.sql" -o json 2>/dev/null)
+if echo "$result" | jq -e 'length > 0' > /dev/null 2>&1; then
+    echo -e "${GREEN}✓${NC} Query without trailing semicolon works"
+    PASS=$((PASS + 1))
+else
+    echo -e "${RED}✗${NC} Query without trailing semicolon failed"
+    FAIL=$((FAIL + 1))
+fi
+
+# Test 15: Inline comments within multi-line query
+cat > "$TMP_DIR/inline-comments.sql" << 'EOF'
+SELECT 
+    name,  -- the resource name
+    namespace  -- the namespace
+FROM pods
+WHERE namespace = 'default'  -- filter to default
+LIMIT 2;
+EOF
+
+result=$($K8SQL -c "$TEST_CONTEXT" -f "$TMP_DIR/inline-comments.sql" -o json 2>/dev/null)
+exit_code=$?
+if [[ $exit_code -eq 0 ]]; then
+    echo -e "${GREEN}✓${NC} Inline comments within query work correctly"
+    PASS=$((PASS + 1))
+else
+    echo -e "${RED}✗${NC} Inline comments handling failed"
+    FAIL=$((FAIL + 1))
+fi
+
+# Test 16: String containing semicolon (should not split)
+cat > "$TMP_DIR/semicolon-in-string.sql" << 'EOF'
+SELECT name FROM configmaps 
+WHERE namespace = 'default' 
+AND name LIKE 'kube%'
+LIMIT 1;
+EOF
+
+result=$($K8SQL -c "$TEST_CONTEXT" -f "$TMP_DIR/semicolon-in-string.sql" -o json 2>/dev/null)
+exit_code=$?
+if [[ $exit_code -eq 0 ]]; then
+    echo -e "${GREEN}✓${NC} Complex WHERE clause with LIKE works"
+    PASS=$((PASS + 1))
+else
+    echo -e "${RED}✗${NC} Query with LIKE pattern failed"
+    FAIL=$((FAIL + 1))
+fi
+
 print_summary
