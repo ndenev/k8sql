@@ -125,6 +125,19 @@ async fn main() -> Result<()> {
     run_interactive(&args).await
 }
 
+/// Parse SQL file content into individual statements using sqlparser.
+/// Returns statements as strings, preserving the original SQL text.
+fn parse_sql_file(content: &str) -> Result<Vec<String>> {
+    use datafusion::sql::sqlparser::dialect::GenericDialect;
+    use datafusion::sql::sqlparser::parser::Parser;
+
+    let dialect = GenericDialect {};
+    let statements = Parser::parse_sql(&dialect, content)
+        .map_err(|e| anyhow::anyhow!("SQL parse error: {}", e))?;
+
+    Ok(statements.into_iter().map(|s| s.to_string()).collect())
+}
+
 async fn run_batch(args: &Args) -> Result<()> {
     // If --refresh-crds flag is set, clear the CRD schema cache
     if args.refresh_crds
@@ -143,11 +156,7 @@ async fn run_batch(args: &Args) -> Result<()> {
         vec![query.clone()]
     } else if let Some(file) = &args.file {
         let content = std::fs::read_to_string(file)?;
-        content
-            .lines()
-            .filter(|l| !l.trim().is_empty() && !l.trim().starts_with("--"))
-            .map(String::from)
-            .collect()
+        parse_sql_file(&content)?
     } else {
         return Ok(());
     };
