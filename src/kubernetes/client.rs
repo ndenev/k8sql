@@ -84,8 +84,9 @@ pub struct K8sClientPool {
 }
 
 /// Extract (group, version, kind) tuples from CRD list
-/// Only includes served versions (v.served == true)
-fn extract_served_crd_versions(
+/// Only includes the storage version (the canonical/preferred version)
+/// This matches kubectl's behavior of showing one version per CRD
+fn extract_storage_crd_versions(
     crd_list: &kube::api::ObjectList<
         k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::CustomResourceDefinition,
     >,
@@ -93,14 +94,14 @@ fn extract_served_crd_versions(
     crd_list
         .items
         .iter()
-        .flat_map(|crd| {
-            crd.spec.versions.iter().filter(|v| v.served).map(move |v| {
-                (
-                    crd.spec.group.clone(),
-                    v.name.clone(),
-                    crd.spec.names.kind.clone(),
-                )
-            })
+        .filter_map(|crd| {
+            // Find the storage version (there's exactly one per CRD)
+            let storage_version = crd.spec.versions.iter().find(|v| v.storage)?;
+            Some((
+                crd.spec.group.clone(),
+                storage_version.name.clone(),
+                crd.spec.names.kind.clone(),
+            ))
         })
         .collect()
 }
@@ -284,7 +285,7 @@ impl K8sClientPool {
             return Ok(0);
         }
 
-        let all_crds = extract_served_crd_versions(&crd_list);
+        let all_crds = extract_storage_crd_versions(&crd_list);
 
         let (cached_resources, missing_crds) = self.resource_cache.check_crds(&all_crds);
 
@@ -347,7 +348,7 @@ impl K8sClientPool {
         }
 
         // Extract (group, version, kind) tuples from CRD list
-        let all_crds = extract_served_crd_versions(&crd_list);
+        let all_crds = extract_storage_crd_versions(&crd_list);
 
         // Check which CRDs are cached vs missing (shared cache across clusters)
         let (cached_resources, missing_crds) = self.resource_cache.check_crds(&all_crds);
