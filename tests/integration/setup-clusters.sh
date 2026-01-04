@@ -62,11 +62,17 @@ kubectl --context "k3d-$CLUSTER2" apply -f "$SCRIPT_DIR/fixtures/test-crd.yaml"
 echo "Deploying test-crd-2.yaml to cluster 2 only (different CRDs per cluster test)..."
 kubectl --context "k3d-$CLUSTER2" apply -f "$SCRIPT_DIR/fixtures/test-crd-2.yaml"
 
+echo "Deploying multi-version CRD (test-crd-multiversion.yaml) to both clusters..."
+kubectl --context "k3d-$CLUSTER1" apply -f "$SCRIPT_DIR/fixtures/test-crd-multiversion.yaml"
+kubectl --context "k3d-$CLUSTER2" apply -f "$SCRIPT_DIR/fixtures/test-crd-multiversion.yaml"
+
 # Wait for CRDs to be established
 echo "Waiting for CRDs to be established..."
 kubectl --context "k3d-$CLUSTER1" wait --for=condition=Established crd/testresources.k8sql.io --timeout=30s
 kubectl --context "k3d-$CLUSTER2" wait --for=condition=Established crd/testresources.k8sql.io --timeout=30s
 kubectl --context "k3d-$CLUSTER2" wait --for=condition=Established crd/configs.config.k8sql.io --timeout=30s
+kubectl --context "k3d-$CLUSTER1" wait --for=condition=Established crd/widgets.multiversion.k8sql.io --timeout=30s
+kubectl --context "k3d-$CLUSTER2" wait --for=condition=Established crd/widgets.multiversion.k8sql.io --timeout=30s
 
 # Deploy test resources to cluster 1
 echo "Deploying test resources to cluster 1..."
@@ -87,6 +93,22 @@ kubectl --context "k3d-$CLUSTER2" apply -f "$SCRIPT_DIR/fixtures/test-config-res
 echo "Verifying Config resources in cluster 2..."
 kubectl --context "k3d-$CLUSTER2" get configs -A || {
     echo "Config resources not found in cluster 2"
+    exit 1
+}
+
+# Deploy Widget resources for multi-version CRD testing
+echo "Deploying Widget resources to both clusters..."
+kubectl --context "k3d-$CLUSTER1" apply -f "$SCRIPT_DIR/fixtures/test-widget-resources.yaml"
+kubectl --context "k3d-$CLUSTER2" apply -f "$SCRIPT_DIR/fixtures/test-widget-resources.yaml"
+
+# Verify Widget resources were created
+echo "Verifying Widget resources..."
+kubectl --context "k3d-$CLUSTER1" get widgets -A || {
+    echo "Widget resources not found in cluster 1"
+    exit 1
+}
+kubectl --context "k3d-$CLUSTER2" get widgets -A || {
+    echo "Widget resources not found in cluster 2"
     exit 1
 }
 

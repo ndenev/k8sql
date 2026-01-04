@@ -63,11 +63,17 @@ impl K8sSessionContext {
 
         pool.progress().registering_tables(tables.len());
 
-        for info in tables {
-            let provider = K8sTableProvider::new(info.clone(), Arc::clone(pool));
+        // Get schema provider for direct table registration
+        // This avoids DataFusion parsing dots as schema.table separators
+        let schema = ctx
+            .catalog("postgres")
+            .and_then(|c| c.schema("public"))
+            .expect("public schema should exist");
 
-            // Register with the primary table name (ignore conflicts from duplicate CRDs)
-            if let Err(e) = ctx.register_table(&info.table_name, Arc::new(provider)) {
+        for info in tables {
+            // Register primary table name
+            let provider = K8sTableProvider::new(info.clone(), Arc::clone(pool));
+            if let Err(e) = schema.register_table(info.table_name.clone(), Arc::new(provider)) {
                 tracing::debug!(
                     "Skipping duplicate table '{}' from {}/{}: {}",
                     info.table_name,
@@ -77,10 +83,10 @@ impl K8sSessionContext {
                 );
             }
 
-            // Register aliases (ignore conflicts)
+            // Register aliases
             for alias in &info.aliases {
                 let alias_provider = K8sTableProvider::new(info.clone(), Arc::clone(pool));
-                let _ = ctx.register_table(alias, Arc::new(alias_provider));
+                let _ = schema.register_table(alias.clone(), Arc::new(alias_provider));
             }
         }
 

@@ -1,0 +1,54 @@
+---
+# Multi-version CRD to test that only the storage version is registered
+# v1alpha1: served=true, storage=false (should NOT be registered)
+# v1beta1: served=true, storage=true (SHOULD be registered)
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: widgets.multiversion.k8sql.io
+spec:
+  group: multiversion.k8sql.io
+  names:
+    kind: Widget
+    listKind: WidgetList
+    plural: widgets
+    singular: widget
+    shortNames:
+      - wgt
+  scope: Namespaced
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: false
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              properties:
+                name:
+                  type: string
+            status:
+              type: object
+    - name: v1beta1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              properties:
+                name:
+                  type: string
+                enabled:
+                  type: boolean
+            status:
+              type: object
+              properties:
+                ready:
+                  type: boolean
+      subresources:
+        status: {}

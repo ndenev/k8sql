@@ -183,11 +183,23 @@ impl ResourceRegistry {
             // else: both core - shouldn't happen, but later wins if it does
         }
 
-        // Register aliases and store
-        for alias in &info.aliases {
-            self.alias_map
-                .insert(alias.clone(), info.table_name.clone());
+        // Add fully qualified name (resource.group) as alias for disambiguation
+        // e.g., "certificates.cert-manager.io" - use with quotes in SQL
+        if !info.group.is_empty() {
+            let fq_name = format!("{}.{}", info.table_name, info.group);
+            if !info.aliases.contains(&fq_name) {
+                info.aliases.push(fq_name);
+            }
         }
+
+        // Register aliases (but don't let aliases overwrite existing table names)
+        for alias in &info.aliases {
+            if !self.by_table_name.contains_key(alias) {
+                self.alias_map
+                    .insert(alias.clone(), info.table_name.clone());
+            }
+        }
+
         self.alias_map
             .insert(info.table_name.clone(), info.table_name.clone());
         self.by_table_name.insert(info.table_name.clone(), info);
