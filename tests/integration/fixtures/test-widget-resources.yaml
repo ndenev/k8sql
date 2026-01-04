@@ -1,0 +1,24 @@
+---
+# Widget instances for multi-version CRD testing
+# Note: Resources are stored at the storage version (v1beta1) regardless of which version is used to create them
+apiVersion: multiversion.k8sql.io/v1beta1
+kind: Widget
+metadata:
+  name: test-widget-1
+  namespace: default
+  labels:
+    app: widget-test
+spec:
+  name: "First Widget"
+  enabled: true
+---
+apiVersion: multiversion.k8sql.io/v1beta1
+kind: Widget
+metadata:
+  name: test-widget-2
+  namespace: test-ns
+  labels:
+    app: widget-test
+spec:
+  name: "Second Widget"
+  enabled: false
