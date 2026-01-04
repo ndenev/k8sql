@@ -260,21 +260,55 @@ else
     FAIL=$((FAIL + 1))
 fi
 
-# Test 16: String containing semicolon (should not split)
+# Test 16: Block comments /* */ are handled
+cat > "$TMP_DIR/block-comments.sql" << 'EOF'
+/* This is a block comment
+   spanning multiple lines */
+SELECT name FROM namespaces LIMIT 1;
+/* Another comment */ SELECT COUNT(*) as cnt FROM pods;
+EOF
+
+result=$($K8SQL -c "$TEST_CONTEXT" -f "$TMP_DIR/block-comments.sql" 2>/dev/null)
+if echo "$result" | grep -q "name" && echo "$result" | grep -q "cnt"; then
+    echo -e "${GREEN}✓${NC} Block comments /* */ are handled correctly"
+    PASS=$((PASS + 1))
+else
+    echo -e "${RED}✗${NC} Block comment handling failed"
+    FAIL=$((FAIL + 1))
+fi
+
+# Test 17: Doubled single quotes in strings (SQL escape mechanism)
+# 'that''s it' should be parsed as a single string containing "that's it"
+cat > "$TMP_DIR/escaped-quotes.sql" << 'EOF'
+SELECT name FROM namespaces 
+WHERE name != 'doesn''t exist'
+LIMIT 1;
+EOF
+
+result=$($K8SQL -c "$TEST_CONTEXT" -f "$TMP_DIR/escaped-quotes.sql" -o json 2>/dev/null)
+exit_code=$?
+if [[ $exit_code -eq 0 ]] && echo "$result" | jq -e 'length > 0' > /dev/null 2>&1; then
+    echo -e "${GREEN}✓${NC} Doubled single quotes (SQL escape) work correctly"
+    PASS=$((PASS + 1))
+else
+    echo -e "${RED}✗${NC} Doubled single quotes handling failed"
+    FAIL=$((FAIL + 1))
+fi
+
+# Test 18: Semicolon inside string should not split query
 cat > "$TMP_DIR/semicolon-in-string.sql" << 'EOF'
-SELECT name FROM configmaps 
-WHERE namespace = 'default' 
-AND name LIKE 'kube%'
+SELECT name FROM namespaces 
+WHERE name != 'semi;colon'
 LIMIT 1;
 EOF
 
 result=$($K8SQL -c "$TEST_CONTEXT" -f "$TMP_DIR/semicolon-in-string.sql" -o json 2>/dev/null)
 exit_code=$?
-if [[ $exit_code -eq 0 ]]; then
-    echo -e "${GREEN}✓${NC} Complex WHERE clause with LIKE works"
+if [[ $exit_code -eq 0 ]] && echo "$result" | jq -e 'length > 0' > /dev/null 2>&1; then
+    echo -e "${GREEN}✓${NC} Semicolon inside string does not split query"
     PASS=$((PASS + 1))
 else
-    echo -e "${RED}✗${NC} Query with LIKE pattern failed"
+    echo -e "${RED}✗${NC} Semicolon in string incorrectly split the query"
     FAIL=$((FAIL + 1))
 fi
 

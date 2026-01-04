@@ -145,13 +145,23 @@ fn parse_sql_file(content: &str) -> Vec<String> {
                 current.push(c);
             }
             '-' if !in_single_quote && !in_double_quote && chars.peek() == Some(&'-') => {
-                // Line comment: skip until end of line
+                // Line comment: skip until end of line (including the newline)
                 chars.next(); // consume second '-'
-                while let Some(&next) = chars.peek() {
+                for next in chars.by_ref() {
                     if next == '\n' {
                         break;
                     }
-                    chars.next();
+                }
+            }
+            '/' if !in_single_quote && !in_double_quote && chars.peek() == Some(&'*') => {
+                // Block comment: skip until */
+                chars.next(); // consume '*'
+                let mut prev = ' ';
+                for next in chars.by_ref() {
+                    if prev == '*' && next == '/' {
+                        break;
+                    }
+                    prev = next;
                 }
             }
             ';' if !in_single_quote && !in_double_quote => {
