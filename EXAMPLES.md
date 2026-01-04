@@ -723,6 +723,59 @@ ORDER BY pod_count DESC;
 
 Node balancing analysis.
 
+### 11. Cpu and Memory utilization per Namespace
+
+```sql
+WITH containers AS (
+    SELECT
+        namespace,
+        name,
+        UNNEST(json_get_array(spec, 'containers')) AS container
+    FROM pods
+),
+resources AS (
+    SELECT
+        namespace,
+        name,
+        json_get_str(json_get(json_get(container, 'resources'), 'requests'), 'cpu') AS cpu_raw,
+        json_get_str(json_get(json_get(container, 'resources'), 'requests'), 'memory') AS mem_raw
+    FROM containers
+),
+parsed AS (
+    SELECT
+        namespace,
+        name,
+        -- CPU: convert to millicores
+        CASE
+            WHEN cpu_raw LIKE '%m' THEN CAST(REPLACE(cpu_raw, 'm', '') AS DOUBLE)
+            ELSE CAST(cpu_raw AS DOUBLE) * 1000
+        END AS cpu_millicores,
+        -- Memory: convert to MiB
+        CASE
+            WHEN mem_raw LIKE '%Gi' THEN CAST(REPLACE(mem_raw, 'Gi', '') AS DOUBLE) * 1024
+            WHEN mem_raw LIKE '%Mi' THEN CAST(REPLACE(mem_raw, 'Mi', '') AS DOUBLE)
+            WHEN mem_raw LIKE '%Ki' THEN CAST(REPLACE(mem_raw, 'Ki', '') AS DOUBLE) / 1024
+            WHEN mem_raw LIKE '%G' THEN CAST(REPLACE(mem_raw, 'G', '') AS DOUBLE) * 1000 / 1.048576
+            WHEN mem_raw LIKE '%M' THEN CAST(REPLACE(mem_raw, 'M', '') AS DOUBLE) * 1000000 / 1048576
+            ELSE CAST(mem_raw AS DOUBLE) / 1048576
+        END AS memory_mib
+    FROM resources
+    WHERE cpu_raw IS NOT NULL OR mem_raw IS NOT NULL
+)
+SELECT
+    namespace,
+    COUNT(*) AS container_count,
+    ROUND(SUM(cpu_millicores)) AS total_cpu_millicores,
+    ROUND(SUM(cpu_millicores) / 1000, 2) AS total_cpu_cores,
+    ROUND(SUM(memory_mib)) AS total_memory_mib,
+    ROUND(SUM(memory_mib) / 1024, 2) AS total_memory_gib
+FROM parsed
+GROUP BY namespace
+ORDER BY total_cpu_cores DESC;
+```
+
+Per namespace pod and cpu, memory utilization.
+
 ---
 
 ## Troubleshooting & Debugging
