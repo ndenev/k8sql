@@ -1,0 +1,182 @@
+#!/usr/bin/env bash
+# File-based query execution tests for k8sql
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/../lib.sh"
+
+echo "=== File-Based Query Execution Tests ==="
+
+K8SQL="${K8SQL:-../../bin/k8sql}"
+TEST_CONTEXT="k3d-k8sql-test-1"
+TMP_DIR=$(mktemp -d)
+
+cleanup() {
+    rm -rf "$TMP_DIR"
+}
+trap cleanup EXIT
+
+# Test 1: Single query in file
+cat > "$TMP_DIR/single-query.sql" << 'EOF'
+SELECT name FROM namespaces LIMIT 3
+EOF
+
+result=$($K8SQL -c "$TEST_CONTEXT" -f "$TMP_DIR/single-query.sql" -o json 2>/dev/null)
+if echo "$result" | jq -e 'length > 0' > /dev/null 2>&1; then
+    echo -e "${GREEN}✓${NC} Single query from file executes correctly"
+    PASS=$((PASS + 1))
+else
+    echo -e "${RED}✗${NC} Single query from file failed: $result"
+    FAIL=$((FAIL + 1))
+fi
+
+# Test 2: Multiple queries in file (each line is a separate query)
+cat > "$TMP_DIR/multi-query.sql" << 'EOF'
+SELECT COUNT(*) as cnt FROM namespaces
+SELECT name FROM configmaps WHERE namespace = 'default' LIMIT 1
+EOF
+
+result=$($K8SQL -c "$TEST_CONTEXT" -f "$TMP_DIR/multi-query.sql" 2>/dev/null)
+# Should have output from both queries
+if echo "$result" | grep -q "cnt" && echo "$result" | grep -q "name"; then
+    echo -e "${GREEN}✓${NC} Multiple queries from file execute sequentially"
+    PASS=$((PASS + 1))
+else
+    echo -e "${RED}✗${NC} Multiple queries from file failed"
+    FAIL=$((FAIL + 1))
+fi
+
+# Test 3: Comments are skipped (lines starting with --)
+cat > "$TMP_DIR/with-comments.sql" << 'EOF'
+-- This is a comment that should be ignored
+SELECT name FROM namespaces LIMIT 1
+-- Another comment
+SELECT COUNT(*) as total FROM pods
+EOF
+
+result=$($K8SQL -c "$TEST_CONTEXT" -f "$TMP_DIR/with-comments.sql" 2>/dev/null)
+# Should execute the two SELECT statements, not fail on comments
+if echo "$result" | grep -q "name" && echo "$result" | grep -q "total"; then
+    echo -e "${GREEN}✓${NC} SQL comments (--) are correctly skipped"
+    PASS=$((PASS + 1))
+else
+    echo -e "${RED}✗${NC} Comment handling failed"
+    FAIL=$((FAIL + 1))
+fi
+
+# Test 4: Empty lines are skipped
+cat > "$TMP_DIR/with-empty-lines.sql" << 'EOF'
+
+SELECT name FROM namespaces LIMIT 1
+
+SELECT COUNT(*) as cnt FROM pods
+
+EOF
+
+result=$($K8SQL -c "$TEST_CONTEXT" -f "$TMP_DIR/with-empty-lines.sql" 2>/dev/null)
+exit_code=$?
+if [[ $exit_code -eq 0 ]] && echo "$result" | grep -q "name"; then
+    echo -e "${GREEN}✓${NC} Empty lines are correctly skipped"
+    PASS=$((PASS + 1))
+else
+    echo -e "${RED}✗${NC} Empty line handling failed"
+    FAIL=$((FAIL + 1))
+fi
+
+# Test 5: File with JSON output format
+cat > "$TMP_DIR/json-output.sql" << 'EOF'
+SELECT name, namespace FROM pods WHERE namespace = 'default' LIMIT 2
+EOF
+
+result=$($K8SQL -c "$TEST_CONTEXT" -f "$TMP_DIR/json-output.sql" -o json 2>/dev/null)
+if echo "$result" | jq -e 'type == "array"' > /dev/null 2>&1; then
+    echo -e "${GREEN}✓${NC} File execution with JSON output format works"
+    PASS=$((PASS + 1))
+else
+    echo -e "${RED}✗${NC} File execution with JSON output failed"
+    FAIL=$((FAIL + 1))
+fi
+
+# Test 6: File with CSV output format
+cat > "$TMP_DIR/csv-output.sql" << 'EOF'
+SELECT name FROM namespaces LIMIT 2
+EOF
+
+result=$($K8SQL -c "$TEST_CONTEXT" -f "$TMP_DIR/csv-output.sql" -o csv 2>/dev/null)
+if echo "$result" | head -1 | grep -q "name"; then
+    echo -e "${GREEN}✓${NC} File execution with CSV output format works"
+    PASS=$((PASS + 1))
+else
+    echo -e "${RED}✗${NC} File execution with CSV output failed"
+    FAIL=$((FAIL + 1))
+fi
+
+# Test 7: Non-existent file returns error
+result=$($K8SQL -c "$TEST_CONTEXT" -f "/nonexistent/path/queries.sql" 2>&1)
+exit_code=$?
+if [[ $exit_code -ne 0 ]] && echo "$result" | grep -qi "no such file\|not found\|error"; then
+    echo -e "${GREEN}✓${NC} Non-existent file returns appropriate error"
+    PASS=$((PASS + 1))
+else
+    echo -e "${RED}✗${NC} Non-existent file should return error (exit code: $exit_code)"
+    FAIL=$((FAIL + 1))
+fi
+
+# Test 8: SHOW TABLES works from file
+cat > "$TMP_DIR/show-tables.sql" << 'EOF'
+SHOW TABLES
+EOF
+
+result=$($K8SQL -c "$TEST_CONTEXT" -f "$TMP_DIR/show-tables.sql" 2>/dev/null)
+if echo "$result" | grep -qi "pods\|deployments\|configmaps"; then
+    echo -e "${GREEN}✓${NC} SHOW TABLES works from file"
+    PASS=$((PASS + 1))
+else
+    echo -e "${RED}✗${NC} SHOW TABLES from file failed"
+    FAIL=$((FAIL + 1))
+fi
+
+# Test 9: SHOW DATABASES works from file
+cat > "$TMP_DIR/show-databases.sql" << 'EOF'
+SHOW DATABASES
+EOF
+
+result=$($K8SQL -c "$TEST_CONTEXT" -f "$TMP_DIR/show-databases.sql" 2>/dev/null)
+if echo "$result" | grep -q "$TEST_CONTEXT"; then
+    echo -e "${GREEN}✓${NC} SHOW DATABASES works from file"
+    PASS=$((PASS + 1))
+else
+    echo -e "${RED}✗${NC} SHOW DATABASES from file failed"
+    FAIL=$((FAIL + 1))
+fi
+
+# Test 10: File with --no-headers flag
+cat > "$TMP_DIR/no-headers.sql" << 'EOF'
+SELECT name FROM namespaces LIMIT 1
+EOF
+
+result=$($K8SQL -c "$TEST_CONTEXT" -f "$TMP_DIR/no-headers.sql" -o csv --no-headers 2>/dev/null)
+# With --no-headers, the first line should be data, not "name"
+first_line=$(echo "$result" | head -1)
+if [[ "$first_line" != "name" ]] && [[ -n "$first_line" ]]; then
+    echo -e "${GREEN}✓${NC} File execution with --no-headers works"
+    PASS=$((PASS + 1))
+else
+    echo -e "${RED}✗${NC} --no-headers flag not working with file input"
+    FAIL=$((FAIL + 1))
+fi
+
+# Test 11: Query with error in file exits with non-zero
+cat > "$TMP_DIR/invalid-query.sql" << 'EOF'
+SELECT * FROM nonexistent_table_xyz
+EOF
+
+result=$($K8SQL -c "$TEST_CONTEXT" -f "$TMP_DIR/invalid-query.sql" 2>&1)
+exit_code=$?
+if [[ $exit_code -ne 0 ]]; then
+    echo -e "${GREEN}✓${NC} Invalid query in file exits with non-zero status"
+    PASS=$((PASS + 1))
+else
+    echo -e "${RED}✗${NC} Invalid query should exit with non-zero status"
+    FAIL=$((FAIL + 1))
+fi
+
+print_summary
