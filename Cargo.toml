@@ -1,6 +1,6 @@
 [package]
 name = "k8sql"
-version = "0.1.17"
+version = "0.1.18"
 edition = "2024"
 authors = ["Nikolay Denev <ndenev@gmail.com>"]
 license = "BSD-3-Clause"
