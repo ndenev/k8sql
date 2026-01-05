@@ -2005,6 +2005,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "go-parse-duration"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "558b88954871f5e5b2af0e62e2e176c8bde7a6c2c4ed41b13d138d96da2e2cbd"
+
+[[package]]
 name = "half"
 version = "2.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2476,6 +2482,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "k8s-metrics"
+version = "0.26.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bcd5147ecf729236adaca0ebe19ecd10265592d02541d0b4b467c78ddf1e239d"
+dependencies = [
+ "go-parse-duration",
+ "k8s-openapi",
+ "serde",
+ "thiserror 2.0.17",
+]
+
+[[package]]
 name = "k8s-openapi"
 version = "0.26.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2504,6 +2522,7 @@ dependencies = [
  "dirs",
  "futures",
  "indicatif",
+ "k8s-metrics",
  "k8s-openapi",
  "kube",
  "lazy-regex",

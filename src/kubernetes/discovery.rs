@@ -470,6 +470,62 @@ pub fn build_core_registry() -> ResourceRegistry {
         ["customresourcedefinition", "crd", "crds"]
     );
 
+    // Metrics API (metrics.k8s.io/v1beta1) - optional, requires metrics-server
+    // Note: k8s-metrics types have plural: "pods"/"nodes", but we need distinct table names
+    // to avoid conflicts with core Pod/Node resources, so we construct ResourceInfo manually.
+    {
+        use k8s_metrics::v1beta1::{NodeMetrics, PodMetrics};
+        use kube::Resource;
+
+        // PodMetrics - namespaced
+        let ar = ApiResource {
+            group: PodMetrics::group(&()).to_string(),
+            version: PodMetrics::version(&()).to_string(),
+            api_version: PodMetrics::api_version(&()).to_string(),
+            kind: PodMetrics::kind(&()).to_string(),
+            plural: PodMetrics::plural(&()).to_string(), // "pods" - used for API calls
+        };
+        let info = ResourceInfo {
+            api_resource: ar,
+            capabilities: ApiCapabilities {
+                scope: Scope::Namespaced,
+                subresources: vec![],
+                operations: vec![],
+            },
+            table_name: "podmetrics".to_string(), // Custom table name to avoid conflict
+            aliases: vec!["podmetric".to_string()],
+            is_core: true,
+            group: PodMetrics::group(&()).to_string(),
+            version: PodMetrics::version(&()).to_string(),
+            custom_fields: None,
+        };
+        registry.add(info);
+
+        // NodeMetrics - cluster-scoped
+        let ar = ApiResource {
+            group: NodeMetrics::group(&()).to_string(),
+            version: NodeMetrics::version(&()).to_string(),
+            api_version: NodeMetrics::api_version(&()).to_string(),
+            kind: NodeMetrics::kind(&()).to_string(),
+            plural: NodeMetrics::plural(&()).to_string(), // "nodes" - used for API calls
+        };
+        let info = ResourceInfo {
+            api_resource: ar,
+            capabilities: ApiCapabilities {
+                scope: Scope::Cluster,
+                subresources: vec![],
+                operations: vec![],
+            },
+            table_name: "nodemetrics".to_string(), // Custom table name to avoid conflict
+            aliases: vec!["nodemetric".to_string()],
+            is_core: true,
+            group: NodeMetrics::group(&()).to_string(),
+            version: NodeMetrics::version(&()).to_string(),
+            custom_fields: None,
+        };
+        registry.add(info);
+    }
+
     registry
 }
 
