@@ -37,7 +37,9 @@ use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::error::Result;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::{EquivalenceProperties, Partitioning};
-use datafusion::physical_plan::metrics::{ExecutionPlanMetricsSet, MetricBuilder, MetricsSet};
+use datafusion::physical_plan::metrics::{
+    Count, ExecutionPlanMetricsSet, MetricBuilder, MetricsSet, Time,
+};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
 use futures::Stream;
@@ -67,6 +69,25 @@ pub struct QueryTarget {
     pub cluster: String,
     /// Optional namespace (None = cluster-wide query)
     pub namespace: Option<String>,
+}
+
+/// Metrics for tracking streaming execution performance
+///
+/// Groups all DataFusion metrics used during K8s resource fetching into a single struct.
+/// This makes it easier to pass metrics through the execution pipeline.
+pub struct ExecutionMetrics {
+    /// Number of K8s resources returned
+    pub rows_fetched: Count,
+    /// Number of K8s API calls (LIST operations)
+    pub pages_fetched: Count,
+    /// Total K8s API fetch time
+    pub fetch_time: Time,
+    /// Arrow RecordBatch memory size in bytes
+    pub output_bytes: Count,
+    /// JSON to Arrow conversion time
+    pub conversion_time: Time,
+    /// Time to first page (TTFB)
+    pub first_page_time: Time,
 }
 
 /// Custom ExecutionPlan that lazily fetches Kubernetes resources
@@ -317,6 +338,14 @@ impl ExecutionPlan for K8sExecutionPlan {
         );
 
         // Create a streaming execution that yields RecordBatches as pages arrive
+        let metrics = ExecutionMetrics {
+            rows_fetched,
+            pages_fetched,
+            fetch_time,
+            output_bytes,
+            conversion_time,
+            first_page_time,
+        };
         let stream = create_streaming_execution(
             pool,
             table_name,
@@ -324,12 +353,7 @@ impl ExecutionPlan for K8sExecutionPlan {
             api_filters,
             fetch_limit,
             columns,
-            rows_fetched,
-            pages_fetched,
-            fetch_time,
-            output_bytes,
-            conversion_time,
-            first_page_time,
+            metrics,
         );
 
         Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
@@ -337,7 +361,6 @@ impl ExecutionPlan for K8sExecutionPlan {
 }
 
 /// Create a stream that fetches K8s pages and yields RecordBatches
-#[allow(clippy::too_many_arguments)]
 fn create_streaming_execution(
     pool: Arc<K8sClientPool>,
     table_name: String,
@@ -345,12 +368,7 @@ fn create_streaming_execution(
     api_filters: ApiFilters,
     fetch_limit: Option<usize>,
     columns: Arc<Vec<ColumnDef>>,
-    rows_fetched: datafusion::physical_plan::metrics::Count,
-    pages_fetched: datafusion::physical_plan::metrics::Count,
-    fetch_time: datafusion::physical_plan::metrics::Time,
-    output_bytes: datafusion::physical_plan::metrics::Count,
-    conversion_time: datafusion::physical_plan::metrics::Time,
-    first_page_time: datafusion::physical_plan::metrics::Time,
+    metrics: ExecutionMetrics,
 ) -> Pin<Box<dyn Stream<Item = Result<RecordBatch>> + Send>> {
     let stream = try_stream! {
         let start = Instant::now();
@@ -374,7 +392,7 @@ fn create_streaming_execution(
                 Ok(items) => {
                     // Track time to first page
                     if !first_page_received {
-                        first_page_time.add_duration(first_page_timer.elapsed());
+                        metrics.first_page_time.add_duration(first_page_timer.elapsed());
                         first_page_received = true;
                     }
 
@@ -382,8 +400,8 @@ fn create_streaming_execution(
                     total_rows += page_row_count;
 
                     // Update metrics
-                    pages_fetched.add(1);
-                    rows_fetched.add(page_row_count);
+                    metrics.pages_fetched.add(1);
+                    metrics.rows_fetched.add(page_row_count);
 
                     debug!(
                         cluster = %target.cluster,
@@ -400,9 +418,9 @@ fn create_streaming_execution(
                         let batch = json_to_record_batch(&target.cluster, &columns, items)?;
 
                         // Track conversion time and output bytes
-                        conversion_time.add_duration(convert_start.elapsed());
+                        metrics.conversion_time.add_duration(convert_start.elapsed());
                         let batch_bytes = batch.get_array_memory_size();
-                        output_bytes.add(batch_bytes);
+                        metrics.output_bytes.add(batch_bytes);
 
                         yield batch;
                     }
@@ -444,7 +462,7 @@ fn create_streaming_execution(
         }
 
         // Record total fetch time
-        fetch_time.add_duration(start.elapsed());
+        metrics.fetch_time.add_duration(start.elapsed());
 
         // Report progress
         pool.progress().cluster_complete(

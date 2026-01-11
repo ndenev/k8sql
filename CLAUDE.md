@@ -158,7 +158,8 @@ Manages connections to multiple Kubernetes clusters:
 - Force fresh discovery: restart k8sql or use `--refresh-crds` flag
 
 **Retry Logic:**
-- Connection and discovery failures retry 3 times with linear backoff (100ms, 200ms, 300ms)
+- Connection and discovery failures retry up to 5 times with exponential backoff (100ms, 200ms, 400ms, 800ms, 1600ms base delays)
+- ±25% jitter added to prevent thundering herd when multiple clients retry simultaneously
 - Handles intermittent network issues and proxy problems
 - All requested contexts must succeed - no partial failures (ensures predictability for scripting)
 
@@ -171,6 +172,7 @@ Manages connections to multiple Kubernetes clusters:
 - **k8s-openapi**: Kubernetes API type definitions (v1.32)
 - **rustyline**: REPL with readline support
 - **clap**: CLI argument parsing
+- **fastrand**: Fast random number generation (for retry jitter)
 
 ## Table Schema
 

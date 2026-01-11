@@ -25,12 +25,55 @@ use crate::output::{
     truncate_value,
 };
 use crate::progress::{ProgressUpdate, run_with_progress};
+use indicatif::ProgressBar;
 
 // SQL keywords from sqlparser (for completion)
 use datafusion::sql::sqlparser::keywords::ALL_KEYWORDS;
 
 /// Marker for cancelled queries (Ctrl+C during execution)
 struct QueryCancelled;
+
+/// Handle a progress update by updating the spinner message
+///
+/// This extracts the progress handling logic from the main REPL loop
+/// to reduce nesting and improve readability.
+fn handle_progress_update(
+    progress: Result<ProgressUpdate, broadcast::error::RecvError>,
+    pool: &K8sClientPool,
+    spinner: &ProgressBar,
+) {
+    match progress {
+        Ok(ProgressUpdate::StartingQuery {
+            table,
+            cluster_count,
+        }) => {
+            if cluster_count > 1 {
+                spinner.set_message(format!(
+                    "Querying {} across {} clusters...",
+                    table, cluster_count
+                ));
+            } else {
+                spinner.set_message(format!("Querying {}...", table));
+            }
+        }
+        Ok(ProgressUpdate::ClusterComplete {
+            cluster,
+            rows,
+            elapsed_ms: _,
+        }) => {
+            let (done, total) = pool.progress().progress();
+            spinner.set_message(format!("[{}/{}] {} ({} rows)", done, total, cluster, rows));
+        }
+        // Connection/discovery events - shouldn't happen during query
+        Ok(ProgressUpdate::Connecting { .. })
+        | Ok(ProgressUpdate::Connected { .. })
+        | Ok(ProgressUpdate::Discovering { .. })
+        | Ok(ProgressUpdate::DiscoveryComplete { .. })
+        | Ok(ProgressUpdate::RegisteringTables { .. }) => {}
+        // Channel errors - just continue
+        Err(broadcast::error::RecvError::Closed) | Err(broadcast::error::RecvError::Lagged(_)) => {}
+    }
+}
 
 // For extracting function signatures
 use datafusion::logical_expr::{Signature, TypeSignature};
@@ -1349,37 +1392,7 @@ pub async fn run_repl(mut session: K8sSessionContext, pool: Arc<K8sClientPool>) 
                         }
                         // Check for progress updates
                         progress = progress_rx.recv() => {
-                            match progress {
-                                Ok(ProgressUpdate::StartingQuery { table, cluster_count }) => {
-                                    if cluster_count > 1 {
-                                        spinner.set_message(format!(
-                                            "Querying {} across {} clusters...",
-                                            table, cluster_count
-                                        ));
-                                    } else {
-                                        spinner.set_message(format!("Querying {}...", table));
-                                    }
-                                }
-                                Ok(ProgressUpdate::ClusterComplete { cluster, rows, elapsed_ms: _ }) => {
-                                    let (done, total) = pool.progress().progress();
-                                    spinner.set_message(format!(
-                                        "[{}/{}] {} ({} rows)",
-                                        done, total, cluster, rows
-                                    ));
-                                }
-                                // Connection/discovery events - shouldn't happen during query
-                                Ok(ProgressUpdate::Connecting { .. })
-                                | Ok(ProgressUpdate::Connected { .. })
-                                | Ok(ProgressUpdate::Discovering { .. })
-                                | Ok(ProgressUpdate::DiscoveryComplete { .. })
-                                | Ok(ProgressUpdate::RegisteringTables { .. }) => {}
-                                Err(broadcast::error::RecvError::Closed) => {
-                                    // Channel closed, wait for query
-                                }
-                                Err(broadcast::error::RecvError::Lagged(_)) => {
-                                    // Missed some updates, continue
-                                }
-                            }
+                            handle_progress_update(progress, &pool, &spinner);
                         }
                         // Query completed
                         query_result = &mut query_handle => {
