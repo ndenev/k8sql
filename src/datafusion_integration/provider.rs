@@ -900,52 +900,36 @@ mod tests {
         K8sTableProvider::new(resource_info, pool)
     }
 
-    /// Helper to create equality filter (column = value)
-    fn eq_filter(column: &str, value: impl Into<String>) -> Expr {
+    /// Helper to create a binary filter expression (column op value)
+    fn binary_filter(column: &str, op: Operator, value: impl Into<String>) -> Expr {
         Expr::BinaryExpr(BinaryExpr {
             left: Box::new(Expr::Column(Column::new_unqualified(column))),
-            op: Operator::Eq,
+            op,
             right: Box::new(Expr::Literal(
                 datafusion::common::ScalarValue::Utf8(Some(value.into())),
                 None,
             )),
         })
+    }
+
+    /// Helper to create equality filter (column = value)
+    fn eq_filter(column: &str, value: impl Into<String>) -> Expr {
+        binary_filter(column, Operator::Eq, value)
     }
 
     /// Helper to create not-equals filter (column != value)
     fn ne_filter(column: &str, value: impl Into<String>) -> Expr {
-        Expr::BinaryExpr(BinaryExpr {
-            left: Box::new(Expr::Column(Column::new_unqualified(column))),
-            op: Operator::NotEq,
-            right: Box::new(Expr::Literal(
-                datafusion::common::ScalarValue::Utf8(Some(value.into())),
-                None,
-            )),
-        })
+        binary_filter(column, Operator::NotEq, value)
     }
 
     /// Helper to create greater-than filter (column > value)
     fn gt_filter(column: &str, value: impl Into<String>) -> Expr {
-        Expr::BinaryExpr(BinaryExpr {
-            left: Box::new(Expr::Column(Column::new_unqualified(column))),
-            op: Operator::Gt,
-            right: Box::new(Expr::Literal(
-                datafusion::common::ScalarValue::Utf8(Some(value.into())),
-                None,
-            )),
-        })
+        binary_filter(column, Operator::Gt, value)
     }
 
     /// Helper to create LIKE filter (column LIKE pattern)
     fn like_filter(column: &str, pattern: impl Into<String>) -> Expr {
-        Expr::BinaryExpr(BinaryExpr {
-            left: Box::new(Expr::Column(Column::new_unqualified(column))),
-            op: Operator::LikeMatch,
-            right: Box::new(Expr::Literal(
-                datafusion::common::ScalarValue::Utf8(Some(pattern.into())),
-                None,
-            )),
-        })
+        binary_filter(column, Operator::LikeMatch, pattern)
     }
 
     /// Helper to create IN filter (column IN (values))
@@ -962,15 +946,6 @@ mod tests {
                 })
                 .collect(),
             negated: false,
-        })
-    }
-
-    /// Helper to create AND filter (left AND right)
-    fn and_filter(left: Expr, right: Expr) -> Expr {
-        Expr::BinaryExpr(BinaryExpr {
-            left: Box::new(left),
-            op: Operator::And,
-            right: Box::new(right),
         })
     }
 

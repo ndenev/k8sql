@@ -44,6 +44,9 @@ dirs = "6"
 # Async runtime
 tokio = { version = "1", features = ["full"] }
 
+# Random number generation (for retry jitter)
+fastrand = "2"
+
 # CLI argument parsing
 clap = { version = "4", features = ["derive"] }
 

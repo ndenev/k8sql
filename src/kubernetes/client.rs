@@ -30,6 +30,77 @@ const READ_TIMEOUT: Duration = Duration::from_secs(30);
 /// Smaller pages reduce memory pressure and allow faster initial response
 const PAGE_SIZE: u32 = 500;
 
+/// Maximum retry attempts for transient failures
+const MAX_RETRY_ATTEMPTS: u32 = 5;
+
+/// Base delay for exponential backoff (100ms base: 100ms, 200ms, 400ms, 800ms, 1600ms)
+const RETRY_BASE_DELAY_MS: u64 = 100;
+
+/// Jitter factor (±25% of delay to prevent thundering herd)
+const RETRY_JITTER_FACTOR: f64 = 0.25;
+
+/// Calculate delay with exponential backoff and jitter
+///
+/// Returns a delay with ±25% random jitter to prevent synchronized retries
+fn calculate_retry_delay(attempt: u32) -> Duration {
+    let base_delay_ms = RETRY_BASE_DELAY_MS * 2u64.pow(attempt);
+    // Add jitter: ±25% of base delay
+    let jitter_range = (base_delay_ms as f64 * RETRY_JITTER_FACTOR) as u64;
+    let jitter = if jitter_range > 0 {
+        fastrand::u64(0..jitter_range * 2) as i64 - jitter_range as i64
+    } else {
+        0
+    };
+    let delay_ms = (base_delay_ms as i64 + jitter).max(10) as u64; // minimum 10ms
+    Duration::from_millis(delay_ms)
+}
+
+/// Execute an async operation with exponential backoff retry and jitter
+///
+/// # Arguments
+/// * `operation` - The async operation to retry
+/// * `should_retry` - Predicate to determine if an error is retryable
+/// * `context` - Description for logging
+///
+/// # Returns
+/// The result of the operation, or the last error if all retries failed
+async fn retry_with_backoff<T, E, F, Fut>(
+    mut operation: F,
+    should_retry: impl Fn(&E) -> bool,
+    context: &str,
+) -> std::result::Result<T, E>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = std::result::Result<T, E>>,
+    E: std::fmt::Display,
+{
+    let mut last_error = None;
+
+    for attempt in 0..MAX_RETRY_ATTEMPTS {
+        match operation().await {
+            Ok(result) => return Ok(result),
+            Err(e) => {
+                if should_retry(&e) && attempt + 1 < MAX_RETRY_ATTEMPTS {
+                    let delay = calculate_retry_delay(attempt);
+                    warn!(
+                        context = %context,
+                        attempt = attempt + 1,
+                        max_attempts = MAX_RETRY_ATTEMPTS,
+                        delay_ms = delay.as_millis() as u64,
+                        "Retrying after error: {}", e
+                    );
+                    tokio::time::sleep(delay).await;
+                    last_error = Some(e);
+                } else {
+                    return Err(e);
+                }
+            }
+        }
+    }
+
+    Err(last_error.expect("retry loop should set last_error after failed attempts"))
+}
+
 /// Check if a context spec contains patterns (*, ?) or multiple contexts (comma-separated)
 pub fn is_multi_or_pattern_spec(spec: Option<&str>) -> bool {
     spec.map(|s| s.contains(',') || s.contains('*') || s.contains('?'))
@@ -500,19 +571,24 @@ impl K8sClientPool {
         Ok(count)
     }
 
-    /// Get the resource registry for the current context
-    /// Automatically refreshes if TTL expired
-    pub async fn get_registry(&self, context: Option<&str>) -> Result<ResourceRegistry> {
-        let ctx = match context {
-            Some(c) => c.to_string(),
+    /// Resolve context to a string, using first current context if None
+    async fn resolve_context(&self, context: Option<&str>) -> Result<String> {
+        match context {
+            Some(c) => Ok(c.to_string()),
             None => self
                 .current_contexts
                 .read()
                 .await
                 .first()
                 .cloned()
-                .ok_or_else(|| anyhow!("No current context set"))?,
-        };
+                .ok_or_else(|| anyhow!("No current context set")),
+        }
+    }
+
+    /// Get the resource registry for the current context
+    /// Automatically refreshes if TTL expired
+    pub async fn get_registry(&self, context: Option<&str>) -> Result<ResourceRegistry> {
+        let ctx = self.resolve_context(context).await?;
 
         // Ensure we have discovered resources for this context (respects TTL)
         self.discover_resources_for_context(&ctx, false).await?;
@@ -589,16 +665,7 @@ impl K8sClientPool {
 
     /// Get client for a specific context, or current context if None
     pub async fn get_client(&self, context: Option<&str>) -> Result<Client> {
-        let ctx = match context {
-            Some(c) => c.to_string(),
-            None => self
-                .current_contexts
-                .read()
-                .await
-                .first()
-                .cloned()
-                .ok_or_else(|| anyhow!("No current context set"))?,
-        };
+        let ctx = self.resolve_context(context).await?;
         self.get_or_create_client(&ctx).await
     }
 
@@ -685,59 +752,24 @@ impl K8sClientPool {
             super::context_matcher::ContextMatcher::new(&all_contexts).resolve(context_spec)?;
 
         // Ensure we have clients and discovered resources for all contexts IN PARALLEL
-        // Retry up to 3 times for intermittent failures
+        // Retry up to 3 times with exponential backoff for intermittent failures
         let discovery_futures: Vec<_> = matched_contexts
             .iter()
             .map(|ctx| {
                 let ctx = ctx.clone();
                 async move {
-                    let mut last_error = None;
-                    for attempt in 1..=3 {
-                        match self.get_or_create_client(&ctx).await {
-                            Ok(_) => {
-                                // Client connected, now discover resources
-                                match self
-                                    .discover_resources_for_context(&ctx, force_refresh)
-                                    .await
-                                {
-                                    Ok(_) => return Ok::<_, anyhow::Error>(()),
-                                    Err(e) => {
-                                        warn!(
-                                            context = %ctx,
-                                            attempt = attempt,
-                                            error = %e,
-                                            "Discovery failed, retrying..."
-                                        );
-                                        last_error = Some(e);
-                                        if attempt < 3 {
-                                            tokio::time::sleep(std::time::Duration::from_millis(
-                                                100 * attempt as u64,
-                                            ))
-                                            .await;
-                                        }
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                warn!(
-                                    context = %ctx,
-                                    attempt = attempt,
-                                    error = %e,
-                                    "Connection failed, retrying..."
-                                );
-                                last_error = Some(e);
-                                if attempt < 3 {
-                                    tokio::time::sleep(std::time::Duration::from_millis(
-                                        100 * attempt as u64,
-                                    ))
-                                    .await;
-                                }
-                            }
-                        }
-                    }
-                    Err(last_error
-                        .expect("retry loop should always set last_error after 3 failed attempts")
-                        .context(format!("Failed after 3 attempts for cluster '{}'", ctx)))
+                    retry_with_backoff(
+                        || async {
+                            // Connect and discover in a single retriable operation
+                            self.get_or_create_client(&ctx).await?;
+                            self.discover_resources_for_context(&ctx, force_refresh)
+                                .await
+                        },
+                        |_: &anyhow::Error| true, // Always retry on any error
+                        &ctx,
+                    )
+                    .await
+                    .context(format!("Failed for cluster '{}'", ctx))
                 }
             })
             .collect();
@@ -781,9 +813,6 @@ impl K8sClientPool {
         table: &str,
         ctx_name: &str,
     ) -> Result<kube::api::ObjectList<DynamicObject>> {
-        const MAX_RETRIES: u32 = 3;
-        const RETRY_BASE_DELAY_MS: u64 = 100;
-
         // Check if a kube error is retryable (transient failures)
         let is_retryable = |err: &kube::Error| -> bool {
             match err {
@@ -795,43 +824,10 @@ impl K8sClientPool {
             }
         };
 
-        let mut last_error = None;
-
-        for attempt in 0..MAX_RETRIES {
-            match api.list(params).await {
-                Ok(list) => return Ok(list),
-                Err(e) => {
-                    if is_retryable(&e) {
-                        let delay = Duration::from_millis(RETRY_BASE_DELAY_MS * 2u64.pow(attempt));
-                        warn!(
-                            table = %table,
-                            context = %ctx_name,
-                            attempt = attempt + 1,
-                            max_attempts = MAX_RETRIES,
-                            delay_ms = delay.as_millis(),
-                            error = %e,
-                            "Retryable error, backing off"
-                        );
-                        tokio::time::sleep(delay).await;
-                        last_error = Some(e);
-                    } else {
-                        debug!(
-                            table = %table,
-                            context = %ctx_name,
-                            error = %e,
-                            "Non-retryable error"
-                        );
-                        return Err(anyhow!("K8s API error: {}", e));
-                    }
-                }
-            }
-        }
-
-        Err(anyhow!(
-            "Failed after {} retries: {}",
-            MAX_RETRIES,
-            last_error.map(|e| e.to_string()).unwrap_or_default()
-        ))
+        let context = format!("list {} in {}", table, ctx_name);
+        retry_with_backoff(|| api.list(params), is_retryable, &context)
+            .await
+            .map_err(|e| anyhow!("K8s API error: {}", e))
     }
 
     /// Build ListParams from API filters (label selectors, field selectors)
@@ -1050,8 +1046,6 @@ impl K8sClientPool {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     /// Helper function to test alias building logic in isolation
     /// This replicates the logic from process_discovered_crds
     fn build_aliases(
