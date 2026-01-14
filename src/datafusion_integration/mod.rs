@@ -13,6 +13,7 @@ mod filter_extraction;
 mod hooks;
 mod preprocess;
 mod provider;
+mod prql;
 
 pub use context::{K8sSessionContext, TableInfo};
 pub use hooks::{SetConfigHook, ShowDatabasesHook, ShowTablesHook};

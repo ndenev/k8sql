@@ -39,6 +39,8 @@ Performance is our second priority - still very important.
 
 k8sql exposes the Kubernetes API as a SQL-compatible database using Apache DataFusion as the query engine. kubectl contexts are treated as databases (switchable with `USE cluster1;`) and Kubernetes resources are exposed as tables. The `_cluster` column is part of every table's primary key, enabling cross-cluster queries.
 
+k8sql supports both SQL and [PRQL](https://prql-lang.org) (Pipelined Relational Query Language) with automatic detection - just write either language and it works.
+
 ## Build Commands
 
 ```bash
@@ -53,9 +55,13 @@ cargo test               # Run all tests
 # Interactive REPL (default)
 k8sql
 
-# Batch mode - single query
+# Batch mode - SQL queries
 k8sql -q "SELECT * FROM pods"
 k8sql -q "SELECT name, status->>'phase' as phase FROM pods WHERE namespace = 'kube-system'"
+
+# Batch mode - PRQL queries (auto-detected)
+k8sql -q "from pods | take 5"
+k8sql -q "from pods | filter namespace == 'kube-system' | select {name, namespace} | take 10"
 
 # Multi-cluster queries
 k8sql -q "SELECT * FROM pods WHERE _cluster = 'prod'"
@@ -82,7 +88,8 @@ src/
 │   ├── context.rs             # K8sSessionContext - DataFusion session setup
 │   ├── provider.rs            # K8sTableProvider - TableProvider implementation
 │   ├── convert.rs             # JSON to Arrow RecordBatch conversion
-│   ├── preprocess.rs          # SQL preprocessing (fixes ->> operator precedence)
+│   ├── preprocess.rs          # Query preprocessing (PRQL compilation, ->> precedence fix)
+│   ├── prql.rs                # PRQL detection and compilation to SQL
 │   └── hooks.rs               # Query hooks for filter extraction
 ├── kubernetes/
 │   ├── mod.rs                 # ApiFilters type for filter pushdown
@@ -113,7 +120,9 @@ k8sql uses Apache DataFusion as its SQL query engine:
 
 - **JSON to Arrow conversion** (`convert.rs`): Converts K8s JSON resources to Arrow RecordBatches. Metadata fields use native Arrow types (Timestamp for dates, Int64 for integers); labels/annotations/spec/status are stored as JSON strings.
 
-- **SQL Preprocessing** (`preprocess.rs`): Fixes `->>` operator precedence before DataFusion parsing. Wraps `col->>'key' = 'value'` as `(col->>'key') = 'value'` to work around parser quirks.
+- **Query Preprocessing** (`preprocess.rs`): Handles PRQL-to-SQL compilation (via `prql.rs`) and fixes `->>` operator precedence before DataFusion parsing. Wraps `col->>'key' = 'value'` as `(col->>'key') = 'value'` to work around parser quirks.
+
+- **PRQL Support** (`prql.rs`): Detects PRQL queries (starting with `from`, `let`, or `prql`) and compiles them to SQL using the prqlc compiler. Auto-detection means users can write either language without mode switching.
 
 ### Resource Discovery (`src/kubernetes/discovery.rs`)
 
@@ -168,6 +177,7 @@ Manages connections to multiple Kubernetes clusters:
 - **datafusion**: SQL query engine (Apache Arrow-based)
 - **datafusion-functions-json**: JSON querying functions (`json_get_str`, `json_get_int`, etc.)
 - **datafusion-postgres**: PostgreSQL wire protocol for daemon mode
+- **prqlc**: PRQL compiler (compiles PRQL to SQL)
 - **kube**: Kubernetes client (kube-rs)
 - **k8s-openapi**: Kubernetes API type definitions (v1.32)
 - **rustyline**: REPL with readline support
@@ -278,3 +288,58 @@ SELECT json_get_str(UNNEST(json_get_array(spec, 'containers')), 'image') FROM po
 - **\d table**: DESCRIBE table
 - **\x**: Toggle expanded display
 - **\q**: Quit
+
+## PRQL Support
+
+[PRQL](https://prql-lang.org) (Pipelined Relational Query Language) is supported as an alternative to SQL. Queries are auto-detected based on syntax - no mode switching required.
+
+### Detection Logic
+
+- **PRQL**: Queries starting with `from`, `let`, or `prql`
+- **SQL**: Queries starting with `SELECT`, `WITH`, `SHOW`, `DESCRIBE`, `EXPLAIN`, `USE`, etc.
+
+### PRQL Examples
+
+```prql
+# Basic query
+from pods | take 5
+
+# Filter and select
+from pods
+filter namespace == "kube-system"
+select {name, namespace, created}
+take 10
+
+# Sort and limit
+from deployments
+filter namespace == "default"
+sort name
+take 20
+
+# Aggregation
+from pods
+group namespace (aggregate {count = count this})
+sort {-count}
+```
+
+### PRQL vs SQL Comparison
+
+| PRQL | SQL |
+|------|-----|
+| `from pods \| take 5` | `SELECT * FROM pods LIMIT 5` |
+| `from pods \| filter namespace == "x"` | `SELECT * FROM pods WHERE namespace = 'x'` |
+| `from pods \| select {name, namespace}` | `SELECT name, namespace FROM pods` |
+| `from pods \| sort created` | `SELECT * FROM pods ORDER BY created` |
+| `from pods \| sort {-created}` | `SELECT * FROM pods ORDER BY created DESC` |
+
+### JSON Field Access in PRQL
+
+For JSON columns (`spec`, `status`, `labels`, `annotations`), use PRQL's s-strings to embed raw SQL:
+
+```prql
+from pods
+filter s"status->>'phase'" == "Running"
+select {name, phase = s"status->>'phase'"}
+```
+
+Or use the full SQL syntax when complex JSON access is needed.

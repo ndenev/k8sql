@@ -3,9 +3,23 @@
 
 //! SQL preprocessing for k8sql
 //!
-//! Fixes DataFusion parser quirks before query execution.
+//! Handles query preprocessing before execution, including:
+//! - PRQL to SQL compilation (when PRQL queries are detected)
+//! - DataFusion parser quirks fixes
 //!
-//! ## Transformations
+//! ## PRQL Support
+//!
+//! Queries starting with `from`, `let`, or `prql` are automatically detected
+//! as PRQL and compiled to SQL:
+//!
+//! ```prql
+//! from pods
+//! filter namespace == "kube-system"
+//! select {name, namespace}
+//! take 10
+//! ```
+//!
+//! ## SQL Transformations
 //!
 //! - **JSON arrow precedence fix**: `col->>'key' = 'val'` becomes
 //!   `(col->>'key') = 'val'` to work around DataFusion parser precedence bug
@@ -23,6 +37,8 @@
 //! SELECT metadata->'labels'->'env'->>'name' FROM pods
 //! ```
 
+use super::prql;
+use anyhow::Result;
 use datafusion::sql::sqlparser::ast::Statement;
 use datafusion::sql::sqlparser::dialect::GenericDialect;
 use datafusion::sql::sqlparser::parser::Parser;
@@ -87,14 +103,37 @@ fn fix_arrow_precedence(sql: &str) -> String {
         .into_owned()
 }
 
-/// Preprocess SQL to fix parser quirks
+/// Preprocess a query for execution.
 ///
-/// Currently only fixes the JSON arrow operator precedence bug.
-/// Wraps arrow expressions in parentheses when used with comparison operators:
-/// - `col->>'key' = 'value'` → `(col->>'key') = 'value'`
-/// - `p1.col->>'k' = p2.col->>'k'` → `(p1.col->>'k') = (p2.col->>'k')`
-pub fn preprocess_sql(sql: &str) -> String {
-    fix_arrow_precedence(sql)
+/// This function handles:
+/// 1. **PRQL detection and compilation**: Queries starting with `from`, `let`, or `prql`
+///    are automatically compiled to SQL using the prqlc compiler.
+/// 2. **JSON arrow precedence fix**: Wraps arrow expressions in parentheses when used
+///    with comparison operators to work around DataFusion parser precedence.
+///
+/// # Examples
+///
+/// ```ignore
+/// // PRQL is automatically detected and compiled
+/// preprocess_sql("from pods | take 5")?;  // Returns SQL: SELECT * FROM pods LIMIT 5
+///
+/// // SQL is processed normally
+/// preprocess_sql("SELECT * FROM pods")?;  // Returns: SELECT * FROM pods
+///
+/// // Arrow precedence is fixed
+/// preprocess_sql("SELECT * FROM pods WHERE labels->>'app' = 'nginx'")?;
+/// // Returns: SELECT * FROM pods WHERE (labels->>'app') = 'nginx'
+/// ```
+pub fn preprocess_sql(sql: &str) -> Result<String> {
+    // Step 1: Compile PRQL to SQL if detected
+    let sql = if prql::is_prql(sql) {
+        prql::compile_prql(sql)?
+    } else {
+        sql.to_string()
+    };
+
+    // Step 2: Fix JSON arrow operator precedence
+    Ok(fix_arrow_precedence(&sql))
 }
 
 /// Validate that the SQL statement is read-only
@@ -183,7 +222,7 @@ mod tests {
     #[test]
     fn test_json_arrow_precedence_equals() {
         let sql = "SELECT * FROM pods WHERE status->>'phase' = 'Running'";
-        let result = preprocess_sql(sql);
+        let result = preprocess_sql(sql).unwrap();
         assert_eq!(
             result,
             "SELECT * FROM pods WHERE (status->>'phase') = 'Running'"
@@ -193,7 +232,7 @@ mod tests {
     #[test]
     fn test_json_arrow_precedence_not_equals() {
         let sql = "SELECT * FROM pods WHERE status->>'phase' != 'Running'";
-        let result = preprocess_sql(sql);
+        let result = preprocess_sql(sql).unwrap();
         assert_eq!(
             result,
             "SELECT * FROM pods WHERE (status->>'phase') != 'Running'"
@@ -203,7 +242,7 @@ mod tests {
     #[test]
     fn test_json_arrow_precedence_greater_than() {
         let sql = "SELECT * FROM pods WHERE spec->>'replicas' > 1";
-        let result = preprocess_sql(sql);
+        let result = preprocess_sql(sql).unwrap();
         assert!(result.contains("(spec->>'replicas') >"));
     }
 
@@ -211,14 +250,14 @@ mod tests {
     fn test_json_arrow_in_select_not_modified() {
         // ->> in SELECT without comparison should not be modified
         let sql = "SELECT status->>'phase' FROM pods";
-        let result = preprocess_sql(sql);
+        let result = preprocess_sql(sql).unwrap();
         assert_eq!(result, "SELECT status->>'phase' FROM pods");
     }
 
     #[test]
     fn test_json_arrow_like() {
         let sql = "SELECT * FROM pods WHERE labels->>'app' LIKE 'nginx%'";
-        let result = preprocess_sql(sql);
+        let result = preprocess_sql(sql).unwrap();
         assert_eq!(
             result,
             "SELECT * FROM pods WHERE (labels->>'app') LIKE 'nginx%'"
@@ -228,14 +267,14 @@ mod tests {
     #[test]
     fn test_no_arrow_unchanged() {
         let sql = "SELECT * FROM pods WHERE namespace = 'default'";
-        let result = preprocess_sql(sql);
+        let result = preprocess_sql(sql).unwrap();
         assert_eq!(result, sql);
     }
 
     #[test]
     fn test_multiple_arrows() {
         let sql = "SELECT * FROM pods WHERE labels->>'app' = 'nginx' AND labels->>'env' = 'prod'";
-        let result = preprocess_sql(sql);
+        let result = preprocess_sql(sql).unwrap();
         assert!(result.contains("(labels->>'app') = 'nginx'"));
         assert!(result.contains("(labels->>'env') = 'prod'"));
     }
@@ -243,7 +282,7 @@ mod tests {
     #[test]
     fn test_json_arrow_precedence_in() {
         let sql = "SELECT name FROM pods WHERE status->>'phase' IN ('Running', 'Succeeded')";
-        let result = preprocess_sql(sql);
+        let result = preprocess_sql(sql).unwrap();
         assert_eq!(
             result,
             "SELECT name FROM pods WHERE (status->>'phase') IN ('Running', 'Succeeded')"
@@ -253,7 +292,7 @@ mod tests {
     #[test]
     fn test_json_arrow_precedence_not_in() {
         let sql = "SELECT name FROM pods WHERE status->>'phase' NOT IN ('Failed', 'Unknown')";
-        let result = preprocess_sql(sql);
+        let result = preprocess_sql(sql).unwrap();
         assert_eq!(
             result,
             "SELECT name FROM pods WHERE (status->>'phase') NOT IN ('Failed', 'Unknown')"
@@ -263,7 +302,7 @@ mod tests {
     #[test]
     fn test_json_arrow_precedence_in_labels() {
         let sql = "SELECT name FROM pods WHERE labels->>'app' IN ('nginx', 'apache')";
-        let result = preprocess_sql(sql);
+        let result = preprocess_sql(sql).unwrap();
         assert_eq!(
             result,
             "SELECT name FROM pods WHERE (labels->>'app') IN ('nginx', 'apache')"
@@ -273,7 +312,7 @@ mod tests {
     #[test]
     fn test_json_arrow_precedence_is_null() {
         let sql = "SELECT name FROM pods WHERE status->>'phase' IS NULL";
-        let result = preprocess_sql(sql);
+        let result = preprocess_sql(sql).unwrap();
         assert_eq!(
             result,
             "SELECT name FROM pods WHERE (status->>'phase') IS NULL"
@@ -283,7 +322,7 @@ mod tests {
     #[test]
     fn test_json_arrow_precedence_is_not_null() {
         let sql = "SELECT name FROM pods WHERE labels->>'app' IS NOT NULL";
-        let result = preprocess_sql(sql);
+        let result = preprocess_sql(sql).unwrap();
         assert_eq!(
             result,
             "SELECT name FROM pods WHERE (labels->>'app') IS NOT NULL"
@@ -293,14 +332,14 @@ mod tests {
     #[test]
     fn test_chained_json_arrows_two_levels_unchanged() {
         let sql = "SELECT spec->'selector'->>'app' FROM services";
-        let result = preprocess_sql(sql);
+        let result = preprocess_sql(sql).unwrap();
         assert_eq!(result, sql);
     }
 
     #[test]
     fn test_chained_json_arrows_three_levels_unchanged() {
         let sql = "SELECT metadata->'labels'->'app'->>'version' FROM pods";
-        let result = preprocess_sql(sql);
+        let result = preprocess_sql(sql).unwrap();
         assert_eq!(result, sql);
     }
 
@@ -308,7 +347,7 @@ mod tests {
     fn test_chained_json_arrows_in_where_with_comparison() {
         // Chained arrow with comparison gets wrapped for precedence
         let sql = "SELECT * FROM pods WHERE spec->'selector'->>'app' = 'nginx'";
-        let result = preprocess_sql(sql);
+        let result = preprocess_sql(sql).unwrap();
         assert_eq!(
             result,
             "SELECT * FROM pods WHERE (spec->'selector'->>'app') = 'nginx'"
@@ -318,7 +357,7 @@ mod tests {
     #[test]
     fn test_chained_json_arrows_with_table_prefix_unchanged() {
         let sql = "SELECT p.spec->'containers'->>'name' FROM pods p";
-        let result = preprocess_sql(sql);
+        let result = preprocess_sql(sql).unwrap();
         assert_eq!(result, sql);
     }
 
@@ -406,7 +445,7 @@ mod tests {
     fn test_json_arrow_both_sides_of_comparison() {
         // Test that arrows on BOTH sides of comparison get wrapped
         let sql = "SELECT * FROM pods p1 JOIN pods p2 ON p1.labels->>'app' = p2.labels->>'app'";
-        let result = preprocess_sql(sql);
+        let result = preprocess_sql(sql).unwrap();
         assert_eq!(
             result,
             "SELECT * FROM pods p1 JOIN pods p2 ON (p1.labels->>'app') = (p2.labels->>'app')"
@@ -417,7 +456,7 @@ mod tests {
     fn test_json_arrow_in_clause_right_side() {
         // Test arrow on right side of IN clause
         let sql = "SELECT * FROM pods WHERE 'nginx' = labels->>'app'";
-        let result = preprocess_sql(sql);
+        let result = preprocess_sql(sql).unwrap();
         assert_eq!(
             result,
             "SELECT * FROM pods WHERE 'nginx' = (labels->>'app')"
