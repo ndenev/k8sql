@@ -590,4 +590,114 @@ mod tests {
             "Chained arrows should work end-to-end without conversion"
         );
     }
+
+    // =========================================================================
+    // Edge Case Tests - Arrow Precedence and Idempotency
+    // =========================================================================
+
+    #[test]
+    fn test_already_wrapped_unchanged() {
+        // Already-wrapped expressions should not be double-wrapped
+        let sql = "SELECT * FROM pods WHERE (labels->>'app') = 'nginx'";
+        let result = preprocess_sql(sql).unwrap();
+        // Should NOT contain "((" - no double wrapping
+        assert!(!result.contains("((labels"), "Should not double-wrap");
+        assert_eq!(result, sql);
+    }
+
+    #[test]
+    fn test_preprocess_idempotent() {
+        // Running preprocess twice should produce same result
+        let sql = "SELECT * FROM pods WHERE labels->>'app' = 'nginx'";
+        let once = preprocess_sql(sql).unwrap();
+        let twice = preprocess_sql(&once).unwrap();
+        assert_eq!(once, twice, "Preprocessing should be idempotent");
+    }
+
+    #[test]
+    fn test_preprocess_idempotent_multiple_arrows() {
+        // Multiple arrows, run twice
+        let sql = "SELECT * FROM pods WHERE labels->>'app' = 'nginx' AND labels->>'env' = 'prod'";
+        let once = preprocess_sql(sql).unwrap();
+        let twice = preprocess_sql(&once).unwrap();
+        assert_eq!(
+            once, twice,
+            "Preprocessing should be idempotent with multiple arrows"
+        );
+    }
+
+    #[test]
+    fn test_arrow_comparison_both_sides_idempotent() {
+        // Arrows on both sides of comparison
+        let sql = "SELECT * FROM pods p1 JOIN pods p2 ON p1.labels->>'app' = p2.labels->>'app'";
+        let once = preprocess_sql(sql).unwrap();
+        let twice = preprocess_sql(&once).unwrap();
+        assert_eq!(
+            once, twice,
+            "Both-side arrow preprocessing should be idempotent"
+        );
+    }
+
+    #[test]
+    fn test_chained_arrow_with_comparison_idempotent() {
+        let sql = "SELECT * FROM pods WHERE spec->'selector'->>'app' = 'nginx'";
+        let once = preprocess_sql(sql).unwrap();
+        let twice = preprocess_sql(&once).unwrap();
+        assert_eq!(
+            once, twice,
+            "Chained arrow preprocessing should be idempotent"
+        );
+    }
+
+    #[test]
+    fn test_arrow_with_is_null_no_double_wrap() {
+        let sql = "SELECT * FROM pods WHERE (labels->>'app') IS NULL";
+        let result = preprocess_sql(sql).unwrap();
+        // Should remain the same, not double-wrapped
+        assert!(
+            !result.contains("((labels"),
+            "Should not double-wrap IS NULL"
+        );
+    }
+
+    #[test]
+    fn test_arrow_without_comparison_not_wrapped() {
+        // Arrows not in comparison context should not be wrapped
+        let sql = "SELECT labels->>'app', status->>'phase' FROM pods";
+        let result = preprocess_sql(sql).unwrap();
+        // No parentheses should be added for SELECT list
+        assert!(
+            !result.contains("(labels->>'app')"),
+            "SELECT list arrows should not be wrapped"
+        );
+        assert!(
+            !result.contains("(status->>'phase')"),
+            "SELECT list arrows should not be wrapped"
+        );
+    }
+
+    #[test]
+    fn test_arrow_in_subquery() {
+        let sql = "SELECT * FROM pods WHERE namespace IN (SELECT namespace FROM pods WHERE labels->>'env' = 'prod')";
+        let result = preprocess_sql(sql).unwrap();
+        // The inner query's arrow should be wrapped
+        assert!(
+            result.contains("(labels->>'env') = 'prod'"),
+            "Subquery arrow should be wrapped"
+        );
+    }
+
+    #[test]
+    fn test_empty_sql_unchanged() {
+        let sql = "";
+        let result = preprocess_sql(sql).unwrap();
+        assert_eq!(result, sql);
+    }
+
+    #[test]
+    fn test_sql_with_no_arrows_unchanged() {
+        let sql = "SELECT name, namespace FROM pods WHERE namespace = 'default' LIMIT 10";
+        let result = preprocess_sql(sql).unwrap();
+        assert_eq!(result, sql);
+    }
 }

@@ -376,3 +376,105 @@ impl QueryHook for ShowDatabasesHook {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use datafusion::sql::sqlparser::dialect::GenericDialect;
+    use datafusion::sql::sqlparser::parser::Parser;
+
+    fn parse_statement(sql: &str) -> Statement {
+        let dialect = GenericDialect {};
+        Parser::parse_sql(&dialect, sql).unwrap().pop().unwrap()
+    }
+
+    #[test]
+    fn test_extract_set_application_name() {
+        let stmt = parse_statement("SET application_name = 'DBeaver'");
+        let result = SetConfigHook::extract_set_params(&stmt);
+        assert!(result.is_some());
+        let (name, value) = result.unwrap();
+        assert_eq!(name, "application_name");
+        assert!(value.contains("DBeaver"));
+    }
+
+    #[test]
+    fn test_extract_set_timezone() {
+        let stmt = parse_statement("SET TIME ZONE 'UTC'");
+        let result = SetConfigHook::extract_set_params(&stmt);
+        assert!(result.is_some());
+        let (name, _value) = result.unwrap();
+        assert_eq!(name, "timezone");
+    }
+
+    #[test]
+    fn test_extract_set_extra_float_digits() {
+        let stmt = parse_statement("SET extra_float_digits = 3");
+        let result = SetConfigHook::extract_set_params(&stmt);
+        assert!(result.is_some());
+        let (name, value) = result.unwrap();
+        assert_eq!(name, "extra_float_digits");
+        assert!(value.contains('3'));
+    }
+
+    #[test]
+    fn test_extract_set_client_encoding_utf8() {
+        let stmt = parse_statement("SET client_encoding TO 'UTF8'");
+        let result = SetConfigHook::extract_set_params(&stmt);
+        assert!(result.is_some());
+        let (name, _) = result.unwrap();
+        assert_eq!(name, "client_encoding");
+    }
+
+    #[test]
+    fn test_extract_set_names() {
+        let stmt = parse_statement("SET NAMES 'UTF8'");
+        let result = SetConfigHook::extract_set_params(&stmt);
+        assert!(result.is_some());
+        let (name, value) = result.unwrap();
+        assert_eq!(name, "client_encoding");
+        assert!(value.contains("UTF8"));
+    }
+
+    #[test]
+    fn test_extract_set_statement_timeout() {
+        let stmt = parse_statement("SET statement_timeout = 30000");
+        let result = SetConfigHook::extract_set_params(&stmt);
+        assert!(result.is_some());
+        let (name, _) = result.unwrap();
+        assert_eq!(name, "statement_timeout");
+    }
+
+    #[test]
+    fn test_extract_non_set_returns_none() {
+        let stmt = parse_statement("SELECT 1");
+        let result = SetConfigHook::extract_set_params(&stmt);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_extract_insert_returns_none() {
+        let stmt = parse_statement("INSERT INTO test VALUES (1)");
+        let result = SetConfigHook::extract_set_params(&stmt);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_extract_show_returns_none() {
+        let stmt = parse_statement("SHOW TABLES");
+        let result = SetConfigHook::extract_set_params(&stmt);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_set_config_hook_default() {
+        // Verify SetConfigHook can be created via Default trait
+        let _hook = SetConfigHook::default();
+    }
+
+    #[test]
+    fn test_show_tables_hook_default() {
+        // Verify ShowTablesHook can be created via Default trait
+        let _hook = ShowTablesHook::default();
+    }
+}
