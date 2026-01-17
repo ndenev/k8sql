@@ -254,12 +254,30 @@ pub fn preprocess_json_paths(sql: &str, json_columns: Option<&HashSet<String>>) 
             }
         }
 
-        // Not a JSON path, add token as-is
-        result.push_str(&token.to_string());
+        // Not a JSON path, add token as-is (with proper escaping)
+        result.push_str(&token_to_sql(token));
         i += 1;
     }
 
     result
+}
+
+/// Convert a token back to SQL, properly escaping strings.
+///
+/// The tokenizer unescapes string content (e.g., `'don''t'` becomes `don't`),
+/// so we need to re-escape when converting back to SQL.
+fn token_to_sql(token: &Token) -> String {
+    match token {
+        Token::SingleQuotedString(s) => {
+            // Re-escape single quotes by doubling them
+            format!("'{}'", s.replace('\'', "''"))
+        }
+        Token::DoubleQuotedString(s) => {
+            // Re-escape double quotes
+            format!("\"{}\"", s.replace('"', "\"\""))
+        }
+        _ => token.to_string(),
+    }
 }
 
 /// Result of parsing a JSON path from tokens
@@ -507,6 +525,18 @@ mod tests {
         assert_eq!(
             preprocess_json_paths("SELECT * FROM pods WHERE name = 'status.phase'", None),
             "SELECT * FROM pods WHERE name = 'status.phase'"
+        );
+    }
+
+    #[test]
+    fn test_doubled_single_quotes_preserved() {
+        // SQL escaped single quotes ('' -> ') should be preserved correctly
+        assert_eq!(
+            preprocess_json_paths(
+                "SELECT * FROM namespaces WHERE name != 'doesn''t exist'",
+                None
+            ),
+            "SELECT * FROM namespaces WHERE name <> 'doesn''t exist'"
         );
     }
 
