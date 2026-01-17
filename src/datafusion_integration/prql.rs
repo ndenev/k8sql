@@ -191,8 +191,10 @@ pub fn is_prql(input: &str) -> bool {
 
 /// Compile PRQL source to SQL.
 ///
-/// Uses the `prqlc` compiler with the generic SQL dialect, which should
-/// be compatible with DataFusion.
+/// Uses the `prqlc` compiler with the PostgreSQL dialect, which is most
+/// compatible with DataFusion's SQL parser. Key differences from generic:
+/// - Regex: `~=` compiles to `~` operator (not `REGEXP()` function)
+/// - String functions and operators match DataFusion's PostgreSQL-style syntax
 ///
 /// # Errors
 ///
@@ -202,7 +204,7 @@ pub fn compile_prql(prql: &str) -> Result<String> {
     use prqlc::{Options, Target};
 
     let opts = Options::default()
-        .with_target(Target::Sql(Some(prqlc::sql::Dialect::Generic)))
+        .with_target(Target::Sql(Some(prqlc::sql::Dialect::Postgres)))
         .no_format();
 
     prqlc::compile(prql, &opts).map_err(|e| {
