@@ -32,7 +32,7 @@ k8s-metrics = "0.26"
 rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", "std", "tls12"] }
 
 # PostgreSQL wire protocol (for daemon mode)
-datafusion-postgres = "0.13"
+datafusion-postgres = "0.14"
 
 # REPL / CLI
 rustyline = { version = "17", features = ["derive"] }
