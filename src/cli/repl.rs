@@ -19,6 +19,7 @@ use tokio::sync::broadcast;
 
 use crate::config::{self, Config};
 use crate::datafusion_integration::K8sSessionContext;
+use crate::datafusion_integration::prql;
 use crate::kubernetes::K8sClientPool;
 use crate::output::{
     MAX_JSON_COLUMN_WIDTH, QueryResult, WIDE_COLUMNS, show_databases_result, show_tables_result,
@@ -711,6 +712,12 @@ impl Completer for SqlHelper {
 
 impl Highlighter for SqlHelper {
     fn highlight<'l>(&self, line: &'l str, _pos: usize) -> Cow<'l, str> {
+        // Detect PRQL vs SQL and use appropriate highlighter
+        if prql::is_prql(line) {
+            return Self::highlight_prql(line);
+        }
+
+        // SQL highlighting
         use datafusion::sql::sqlparser::tokenizer::Tokenizer;
 
         let dialect = datafusion::sql::sqlparser::dialect::GenericDialect {};
@@ -741,6 +748,198 @@ impl Highlighter for SqlHelper {
 }
 
 impl SqlHelper {
+    // ========== PRQL Highlighting ==========
+
+    /// Highlight PRQL input using prqlc's tokenizer
+    fn highlight_prql(line: &str) -> Cow<'_, str> {
+        match prqlc::prql_to_tokens(line) {
+            Ok(tokens) => Cow::Owned(Self::highlight_prql_tokens(line, &tokens.0)),
+            Err(_) => {
+                // Tokenization failed - try partial highlighting
+                Self::partial_highlight_prql(line)
+            }
+        }
+    }
+
+    /// Known PRQL keywords for syntax highlighting.
+    ///
+    /// NOTE: prqlc's lexer treats these as `Ident`, not `Keyword` (they're "soft keywords"
+    /// that are only keywords in specific contexts). The tokenizer doesn't expose a public
+    /// keyword list, so we maintain this list manually.
+    ///
+    /// Derived from prqlc 0.13.x source (ir/rq/transform.rs, codegen/ast.rs).
+    /// May need updating when prqlc is upgraded.
+    const PRQL_KEYWORDS: &'static [&'static str] = &[
+        // Core pipeline keywords
+        "from",
+        "select",
+        "filter",
+        "derive",
+        "aggregate",
+        "sort",
+        "take",
+        "join",
+        "group",
+        "window",
+        "loop",
+        // Modifiers
+        "side",
+        "inner",
+        "left",
+        "right",
+        "full",
+        "cross",
+        // Declarations
+        "let",
+        "into",
+        "case",
+        "prql",
+        "module",
+        "import",
+        "func",
+        "type",
+        // Operators as keywords
+        "and",
+        "or",
+        "not",
+        "in",
+        "this",
+        // Aggregate functions (commonly used)
+        "count",
+        "sum",
+        "avg",
+        "min",
+        "max",
+        "stddev",
+        "average",
+        // Other
+        "append",
+        "remove",
+        "intersect",
+        "rolling",
+        "rows",
+        "range",
+        "expanding",
+    ];
+
+    /// Check if an identifier is a PRQL keyword
+    fn is_prql_keyword(ident: &str) -> bool {
+        Self::PRQL_KEYWORDS
+            .iter()
+            .any(|&kw| kw.eq_ignore_ascii_case(ident))
+    }
+
+    /// Highlight PRQL tokens with colors
+    fn highlight_prql_tokens(line: &str, tokens: &[prqlc::lr::Token]) -> String {
+        use prqlc::lr::{Literal, TokenKind};
+
+        let mut result = String::new();
+        let mut last_end = 0;
+
+        for token in tokens {
+            // Add unhighlighted text between tokens (whitespace, etc.)
+            if token.span.start > last_end {
+                result.push_str(&line[last_end..token.span.start]);
+            }
+
+            // Get the original text from the source
+            let text = &line[token.span.clone()];
+
+            // Apply color based on token kind
+            let colored = match &token.kind {
+                // Keywords (explicit) - blue (bold)
+                TokenKind::Keyword(_) => format!("\x1b[1;34m{}\x1b[0m", text),
+
+                // Identifiers that are PRQL keywords - blue (bold)
+                TokenKind::Ident(ident) if Self::is_prql_keyword(ident) => {
+                    format!("\x1b[1;34m{}\x1b[0m", text)
+                }
+
+                // String literals - green
+                TokenKind::Literal(Literal::String(_) | Literal::RawString(_)) => {
+                    format!("\x1b[32m{}\x1b[0m", text)
+                }
+
+                // Numbers - cyan
+                TokenKind::Literal(Literal::Integer(_) | Literal::Float(_)) => {
+                    format!("\x1b[36m{}\x1b[0m", text)
+                }
+
+                // Boolean and null - cyan
+                TokenKind::Literal(Literal::Boolean(_) | Literal::Null) => {
+                    format!("\x1b[36m{}\x1b[0m", text)
+                }
+
+                // Date/time literals - magenta
+                TokenKind::Literal(Literal::Date(_) | Literal::Time(_) | Literal::Timestamp(_)) => {
+                    format!("\x1b[35m{}\x1b[0m", text)
+                }
+
+                // Comments - gray
+                TokenKind::Comment(_) | TokenKind::DocComment(_) => {
+                    format!("\x1b[90m{}\x1b[0m", text)
+                }
+
+                // Interpolation (s-strings, f-strings) - magenta
+                TokenKind::Interpolation(_, _) => format!("\x1b[35m{}\x1b[0m", text),
+
+                // Parameters ($1, $2) - yellow
+                TokenKind::Param(_) => format!("\x1b[33m{}\x1b[0m", text),
+
+                // Everything else - default (no color)
+                _ => text.to_string(),
+            };
+
+            result.push_str(&colored);
+            last_end = token.span.end;
+        }
+
+        // Add remaining text after last token
+        if last_end < line.len() {
+            result.push_str(&line[last_end..]);
+        }
+
+        result
+    }
+
+    /// Partial PRQL highlighting when full tokenization fails
+    /// Backtracks to last whitespace, tokenizes complete part, appends incomplete part
+    fn partial_highlight_prql(line: &str) -> Cow<'_, str> {
+        // Find last whitespace position
+        if let Some(last_ws_pos) = line.rfind(char::is_whitespace) {
+            let complete_part = &line[..=last_ws_pos];
+            let incomplete_part = &line[last_ws_pos + 1..];
+
+            // Try to tokenize the complete part
+            if let Ok(tokens) = prqlc::prql_to_tokens(complete_part) {
+                let mut result = Self::highlight_prql_tokens(complete_part, &tokens.0);
+
+                // Append incomplete part with minimal highlighting
+                if incomplete_part.starts_with('\'')
+                    || incomplete_part.starts_with('"')
+                    || incomplete_part.starts_with("f\"")
+                    || incomplete_part.starts_with("s\"")
+                {
+                    // Incomplete string - highlight in yellow (work in progress)
+                    result.push_str(&format!("\x1b[33m{}\x1b[0m", incomplete_part));
+                } else if incomplete_part.starts_with('#') {
+                    // Incomplete comment - highlight in gray
+                    result.push_str(&format!("\x1b[90m{}\x1b[0m", incomplete_part));
+                } else {
+                    // Just append as-is
+                    result.push_str(incomplete_part);
+                }
+
+                return Cow::Owned(result);
+            }
+        }
+
+        // Can't tokenize anything - return as-is
+        Cow::Borrowed(line)
+    }
+
+    // ========== SQL Highlighting ==========
+
     /// Highlight a vector of tokens using context-aware keyword detection
     fn highlight_tokens(tokens: &[datafusion::sql::sqlparser::tokenizer::Token]) -> String {
         use datafusion::sql::sqlparser::keywords::Keyword;
@@ -1496,4 +1695,256 @@ pub async fn run_repl(mut session: K8sSessionContext, pool: Arc<K8sClientPool>) 
     let _ = rl.save_history(&history_path);
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ========== PRQL Highlighting Tests ==========
+
+    #[test]
+    fn test_highlight_prql_keywords_are_blue() {
+        // Keywords should be highlighted in bold blue (\x1b[1;34m)
+        let input = "from pods";
+        let result = SqlHelper::highlight_prql(input);
+
+        // "from" should be blue (we check for known PRQL keywords in Ident tokens)
+        assert!(
+            result.contains("\x1b[1;34mfrom\x1b[0m"),
+            "Expected 'from' to be highlighted blue, got: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_highlight_prql_multiple_keywords() {
+        let input = "from pods | filter namespace == \"default\" | select {name}";
+        let result = SqlHelper::highlight_prql(input);
+
+        // Multiple keywords should be blue
+        assert!(
+            result.contains("\x1b[1;34mfrom\x1b[0m"),
+            "Expected 'from' to be blue"
+        );
+        assert!(
+            result.contains("\x1b[1;34mfilter\x1b[0m"),
+            "Expected 'filter' to be blue"
+        );
+        assert!(
+            result.contains("\x1b[1;34mselect\x1b[0m"),
+            "Expected 'select' to be blue"
+        );
+    }
+
+    #[test]
+    fn test_highlight_prql_strings_are_green() {
+        let input = "from pods | filter namespace == \"kube-system\"";
+        let result = SqlHelper::highlight_prql(input);
+
+        // String literals should be green (\x1b[32m)
+        assert!(
+            result.contains("\x1b[32m"),
+            "Expected string to be highlighted green, got: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_highlight_prql_numbers_are_cyan() {
+        let input = "from pods | take 10";
+        let result = SqlHelper::highlight_prql(input);
+
+        // Numbers should be cyan (\x1b[36m)
+        assert!(
+            result.contains("\x1b[36m10\x1b[0m"),
+            "Expected '10' to be highlighted cyan, got: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_highlight_prql_comments_are_gray() {
+        let input = "# This is a comment\nfrom pods";
+        let result = SqlHelper::highlight_prql(input);
+
+        // Comments should be gray (\x1b[90m)
+        assert!(
+            result.contains("\x1b[90m"),
+            "Expected comment to be highlighted gray, got: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_highlight_prql_boolean_literals() {
+        let input = "from pods | filter active == true";
+        let result = SqlHelper::highlight_prql(input);
+
+        // Boolean literals should be cyan (\x1b[36m)
+        assert!(
+            result.contains("\x1b[36mtrue\x1b[0m"),
+            "Expected 'true' to be highlighted cyan, got: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_highlight_prql_null_literal() {
+        let input = "from pods | filter value == null";
+        let result = SqlHelper::highlight_prql(input);
+
+        // null should be cyan (\x1b[36m)
+        assert!(
+            result.contains("\x1b[36mnull\x1b[0m"),
+            "Expected 'null' to be highlighted cyan, got: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_highlight_prql_s_string_is_magenta() {
+        let input = "from pods | filter s\"status->>'phase'\" == \"Running\"";
+        let result = SqlHelper::highlight_prql(input);
+
+        // S-strings (interpolation) should be magenta (\x1b[35m)
+        assert!(
+            result.contains("\x1b[35m"),
+            "Expected s-string to be highlighted magenta, got: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_highlight_prql_preserves_whitespace() {
+        let input = "from   pods  |  take  5";
+        let result = SqlHelper::highlight_prql(input);
+
+        // Result should preserve the multiple spaces
+        // After stripping ANSI codes, original structure should be preserved
+        let stripped = strip_ansi_codes(&result);
+        assert_eq!(
+            stripped, input,
+            "Whitespace should be preserved after highlighting"
+        );
+    }
+
+    #[test]
+    fn test_highlight_prql_empty_input() {
+        let input = "";
+        let result = SqlHelper::highlight_prql(input);
+
+        assert_eq!(
+            result.as_ref(),
+            "",
+            "Empty input should return empty string"
+        );
+    }
+
+    #[test]
+    fn test_highlight_prql_whitespace_only() {
+        let input = "   ";
+        let result = SqlHelper::highlight_prql(input);
+
+        // Should handle whitespace-only input gracefully
+        assert!(!result.is_empty() || result.as_ref() == input);
+    }
+
+    #[test]
+    fn test_partial_highlight_prql_incomplete_string() {
+        // Incomplete string at end - should use partial highlighting
+        let input = "from pods | filter name == \"incomp";
+        let result = SqlHelper::highlight_prql(input);
+
+        // Should not panic and should return something reasonable
+        assert!(!result.is_empty(), "Should handle incomplete strings");
+        // The incomplete part should be highlighted in yellow (\x1b[33m) or left as-is
+    }
+
+    #[test]
+    fn test_partial_highlight_prql_incomplete_comment() {
+        // Line starting with comment marker but incomplete
+        let input = "from pods #";
+        let result = SqlHelper::highlight_prql(input);
+
+        // Should handle gracefully
+        assert!(!result.is_empty(), "Should handle incomplete comments");
+    }
+
+    #[test]
+    fn test_highlight_prql_complex_query() {
+        let input = r#"from pods
+filter namespace == "default"
+filter status.phase == "Running"
+select {name, namespace, created}
+sort {-created}
+take 10"#;
+
+        let result = SqlHelper::highlight_prql(input);
+
+        // Should contain multiple highlighted keywords
+        assert!(result.contains("\x1b[1;34mfrom\x1b[0m"));
+        assert!(result.contains("\x1b[1;34mfilter\x1b[0m"));
+        assert!(result.contains("\x1b[1;34mselect\x1b[0m"));
+        assert!(result.contains("\x1b[1;34msort\x1b[0m"));
+        assert!(result.contains("\x1b[1;34mtake\x1b[0m"));
+
+        // Should contain highlighted number
+        assert!(result.contains("\x1b[36m10\x1b[0m"));
+    }
+
+    #[test]
+    fn test_highlight_prql_with_aggregations() {
+        let input = "from pods | group namespace (aggregate {count = count this})";
+        let result = SqlHelper::highlight_prql(input);
+
+        // Should highlight PRQL keywords
+        assert!(result.contains("\x1b[1;34mfrom\x1b[0m"));
+        assert!(result.contains("\x1b[1;34mgroup\x1b[0m"));
+        assert!(result.contains("\x1b[1;34maggregate\x1b[0m"));
+    }
+
+    #[test]
+    fn test_is_prql_detection_used_for_highlighting() {
+        // SQL should NOT be highlighted as PRQL
+        let sql_input = "SELECT * FROM pods";
+        let sql_result = SqlHelper::highlight_prql(sql_input);
+
+        // PRQL tokenizer might fail on SQL, so it should fallback
+        // The key is it doesn't crash
+        assert!(!sql_result.is_empty());
+    }
+
+    #[test]
+    fn test_highlight_integration_sql_vs_prql() {
+        // This tests that the highlighter correctly routes to SQL or PRQL
+
+        // Create a minimal helper for testing
+        let cache = Arc::new(RwLock::new(CompletionCache::default()));
+        let helper = SqlHelper::new(cache);
+
+        // PRQL input
+        let prql_input = "from pods | take 5";
+        let prql_result = helper.highlight(prql_input, 0);
+        assert!(
+            prql_result.contains("\x1b[1;34mfrom\x1b[0m"),
+            "PRQL 'from' should be highlighted"
+        );
+
+        // SQL input
+        let sql_input = "SELECT * FROM pods";
+        let sql_result = helper.highlight(sql_input, 0);
+        assert!(
+            sql_result.contains("\x1b[1;34mSELECT\x1b[0m"),
+            "SQL 'SELECT' should be highlighted"
+        );
+    }
+
+    // ========== Helper Functions ==========
+
+    /// Strip ANSI escape codes from a string for comparison
+    fn strip_ansi_codes(s: &str) -> String {
+        let re = regex::Regex::new(r"\x1b\[[0-9;]*m").unwrap();
+        re.replace_all(s, "").to_string()
+    }
 }

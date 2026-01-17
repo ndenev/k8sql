@@ -11,9 +11,10 @@ mod convert;
 mod execution;
 mod filter_extraction;
 mod hooks;
+mod json_path;
 mod preprocess;
 mod provider;
-mod prql;
+pub mod prql;
 
 pub use context::{K8sSessionContext, TableInfo};
 pub use hooks::{SetConfigHook, ShowDatabasesHook, ShowTablesHook};

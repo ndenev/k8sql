@@ -1,10 +1,11 @@
 # k8sql
 
-Query Kubernetes clusters using SQL. Powered by [Apache DataFusion](https://datafusion.apache.org/).
+Query Kubernetes clusters using SQL or [PRQL](https://prql-lang.org). Powered by [Apache DataFusion](https://datafusion.apache.org/).
 
 ## Features
 
-- **SQL queries on Kubernetes resources** - SELECT, WHERE, ORDER BY, LIMIT, GROUP BY
+- **SQL and PRQL support** - Write queries in either language (auto-detected)
+- **Intuitive JSON paths** - Use `status.phase` instead of `status->>'phase'`
 - **Multi-cluster support** - Query across clusters with `_cluster` column
 - **Query optimizer** - Pushes filters to K8s API (namespaces, labels)
 - **Multiple interfaces** - Interactive REPL, batch mode, PostgreSQL wire protocol
@@ -36,11 +37,14 @@ Download pre-built binaries for Linux, macOS, and Windows from [GitHub Releases]
 # Interactive REPL
 k8sql
 
-# Single query
-k8sql -q "SELECT name, namespace, status->>'phase' FROM pods"
+# SQL query
+k8sql -q "SELECT name, namespace, status.phase FROM pods"
+
+# PRQL query (auto-detected)
+k8sql -q "from pods | filter status.phase == 'Running' | select {name, namespace}"
 
 # Multi-cluster query
-k8sql -c "prod-*" -q "SELECT _cluster, name FROM pods WHERE status->>'phase' = 'Failed'"
+k8sql -c "prod-*" -q "SELECT _cluster, name FROM pods WHERE status.phase = 'Failed'"
 
 # Output as JSON
 k8sql -q "SELECT * FROM deployments" -o json
@@ -79,31 +83,44 @@ SELECT * FROM pods WHERE _cluster = '*'              -- All clusters (parallel)
 
 ### JSON Field Access
 
-Access nested fields in `spec`, `status`, `labels`, `annotations` using PostgreSQL-style operators:
+k8sql provides intuitive dot notation for accessing nested JSON fields:
+
+```sql
+-- Intuitive syntax (auto-converted)
+SELECT name, status.phase FROM pods
+SELECT name, spec.containers[0].image FROM pods
+SELECT * FROM pods WHERE labels.app = 'nginx'
+
+-- Array expansion (one row per container)
+SELECT name, spec.containers[].image FROM pods
+```
+
+This works in both SQL and PRQL - no special syntax needed.
+
+**Supported patterns:**
+
+| Syntax | Meaning | Converted To |
+|--------|---------|--------------|
+| `status.phase` | Field access | `status->>'phase'` |
+| `spec.selector.app` | Nested fields | `spec->'selector'->>'app'` |
+| `spec.containers[0]` | Array index | `spec->'containers'->0` |
+| `spec.containers[]` | Array expansion | `UNNEST(json_get_array(...))` |
+
+**Advanced: PostgreSQL arrow operators** (also supported):
 
 ```sql
 SELECT name, status->>'phase' FROM pods
 SELECT name, status->'nodeInfo'->>'kubeletVersion' FROM nodes
-SELECT * FROM pods WHERE labels->>'app' = 'nginx'
 ```
 
-Or function syntax for deeper nesting:
+**JSON functions** for complex access:
 
 ```sql
 SELECT json_get_str(spec, 'containers', 0, 'image') FROM pods
 SELECT json_get_int(spec, 'replicas') FROM deployments
 ```
 
-Available functions: `json_get_str`, `json_get_int`, `json_get_float`, `json_get_bool`, `json_get_json`, `json_get_array`, `json_length`, `json_keys`.
-
-### Working with Arrays
-
-Use `json_get_array()` with `UNNEST` to expand arrays:
-
-```sql
-SELECT name, json_get_str(UNNEST(json_get_array(spec, 'containers')), 'image') as image
-FROM pods
-```
+Available: `json_get_str`, `json_get_int`, `json_get_float`, `json_get_bool`, `json_get_json`, `json_get_array`, `json_length`, `json_keys`.
 
 ## Query Optimization
 
@@ -169,21 +186,56 @@ k8sql caches CRD schemas for fast startup:
 
 ## Example Queries
 
+### SQL
+
 ```sql
--- Pods with status
-SELECT name, namespace, status->>'phase' as phase FROM pods
+-- Pods with status (using intuitive dot notation)
+SELECT name, namespace, status.phase FROM pods
+
+-- Container images from pods
+SELECT name, spec.containers[0].image FROM pods WHERE namespace = 'default'
 
 -- Unhealthy deployments
-SELECT name, json_get_int(spec, 'replicas') as desired,
-       json_get_int(status, 'readyReplicas') as ready
+SELECT name, spec.replicas as desired, status.readyReplicas as ready
 FROM deployments
-WHERE json_get_int(status, 'readyReplicas') < json_get_int(spec, 'replicas')
+WHERE status.readyReplicas < spec.replicas
 
 -- Cross-cluster pod count
 SELECT _cluster, COUNT(*) FROM pods WHERE _cluster = '*' GROUP BY _cluster
 
 -- Find pods by label (server-side filtering)
-SELECT name FROM pods WHERE labels->>'app' = 'nginx' AND namespace = 'default'
+SELECT name FROM pods WHERE labels.app = 'nginx' AND namespace = 'default'
+
+-- All container images (array expansion)
+SELECT name, spec.containers[].image as container_image FROM pods
+```
+
+### PRQL
+
+```prql
+# Pods with status
+from pods | select {name, namespace, phase = status.phase}
+
+# Filter by phase
+from pods
+filter status.phase == "Running"
+select {name, namespace}
+take 10
+
+# Unhealthy deployments
+from deployments
+filter status.readyReplicas < spec.replicas
+select {name, desired = spec.replicas, ready = status.readyReplicas}
+
+# Pods by label
+from pods
+filter labels.app == "nginx" && namespace == "default"
+select {name, namespace}
+
+# Aggregation - pod count by namespace
+from pods
+group namespace (aggregate {count = count this})
+sort {-count}
 ```
 
 ## Built With

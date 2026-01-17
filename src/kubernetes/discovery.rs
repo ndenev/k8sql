@@ -57,15 +57,32 @@ pub struct ColumnDef {
     pub data_type: ColumnDataType,
     /// JSON Pointer (RFC 6901) to extract value (e.g., "/metadata/name")
     pub json_path: Option<String>,
+    /// Whether this column contains a JSON object/array that supports dot-notation access
+    pub is_json_object: bool,
 }
+
+/// Default JSON object columns that support dot-notation access.
+/// These are columns containing JSON objects/arrays from K8s resources.
+/// Used by the JSON path preprocessor for syntax like `spec.containers[0].image`.
+pub const DEFAULT_JSON_OBJECT_COLUMNS: &[&str] = &[
+    "labels",           // metadata.labels - key-value map
+    "annotations",      // metadata.annotations - key-value map
+    "spec",             // resource specification - nested object
+    "status",           // resource status - nested object
+    "data",             // ConfigMap/Secret data - key-value map
+    "owner_references", // metadata.ownerReferences - array of objects
+];
 
 impl ColumnDef {
     /// Create a text column with a JSON path
     fn text(name: &str, json_path: &str) -> Self {
+        // Auto-detect if this is a JSON object column
+        let is_json_object = DEFAULT_JSON_OBJECT_COLUMNS.contains(&name);
         Self {
             name: name.into(),
             data_type: ColumnDataType::Text,
             json_path: Some(json_path.into()),
+            is_json_object,
         }
     }
 
@@ -75,6 +92,7 @@ impl ColumnDef {
             name: name.into(),
             data_type: ColumnDataType::Text,
             json_path: None,
+            is_json_object: false,
         }
     }
 
@@ -84,6 +102,7 @@ impl ColumnDef {
             name: name.into(),
             data_type: ColumnDataType::Timestamp,
             json_path: Some(json_path.into()),
+            is_json_object: false,
         }
     }
 
@@ -93,6 +112,7 @@ impl ColumnDef {
             name: name.into(),
             data_type: ColumnDataType::Integer,
             json_path: Some(json_path.into()),
+            is_json_object: false,
         }
     }
 }
@@ -219,26 +239,60 @@ impl ResourceRegistry {
     }
 }
 
-/// Map OpenAPI schema type to column data type
-fn openapi_type_to_column_type(schema: &JSONSchemaProps) -> ColumnDataType {
+/// Result of analyzing an OpenAPI schema type
+struct OpenApiTypeInfo {
+    /// The Arrow column data type
+    data_type: ColumnDataType,
+    /// Whether this is a JSON object/array that supports dot-notation access
+    is_json_object: bool,
+}
+
+/// Map OpenAPI schema type to column data type and JSON object flag
+fn analyze_openapi_type(schema: &JSONSchemaProps) -> OpenApiTypeInfo {
     // Check format first for more specific types
     if let Some(format) = &schema.format {
         match format.as_str() {
-            "date-time" => return ColumnDataType::Timestamp,
-            "int64" | "int32" => return ColumnDataType::Integer,
+            "date-time" => {
+                return OpenApiTypeInfo {
+                    data_type: ColumnDataType::Timestamp,
+                    is_json_object: false,
+                };
+            }
+            "int64" | "int32" => {
+                return OpenApiTypeInfo {
+                    data_type: ColumnDataType::Integer,
+                    is_json_object: false,
+                };
+            }
             _ => {}
         }
     }
 
-    // Fall back to type
-    if let Some(type_str) = &schema.type_
-        && type_str.as_str() == "integer"
-    {
-        return ColumnDataType::Integer;
+    // Check the type field
+    if let Some(type_str) = &schema.type_ {
+        match type_str.as_str() {
+            "integer" => {
+                return OpenApiTypeInfo {
+                    data_type: ColumnDataType::Integer,
+                    is_json_object: false,
+                };
+            }
+            "object" | "array" => {
+                // Objects and arrays are JSON and support dot-notation
+                return OpenApiTypeInfo {
+                    data_type: ColumnDataType::Text,
+                    is_json_object: true,
+                };
+            }
+            _ => {}
+        }
     }
 
-    // Default to text (handles strings, objects, arrays as JSON)
-    ColumnDataType::Text
+    // Default to text (simple strings)
+    OpenApiTypeInfo {
+        data_type: ColumnDataType::Text,
+        is_json_object: false,
+    }
 }
 
 /// Extract column definitions from a CRD's OpenAPI v3 schema
@@ -257,15 +311,16 @@ fn extract_schema_fields(crd: &CustomResourceDefinition) -> Option<Vec<ColumnDef
             continue;
         }
 
-        let col_type = openapi_type_to_column_type(prop);
+        let type_info = analyze_openapi_type(prop);
 
         // Convert camelCase to snake_case for SQL column names
         let col_name = camel_to_snake(name);
 
         fields.push(ColumnDef {
             name: col_name,
-            data_type: col_type,
+            data_type: type_info.data_type,
             json_path: Some(format!("/{}", name)),
+            is_json_object: type_info.is_json_object,
         });
     }
 

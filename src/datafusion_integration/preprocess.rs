@@ -5,6 +5,7 @@
 //!
 //! Handles query preprocessing before execution, including:
 //! - PRQL to SQL compilation (when PRQL queries are detected)
+//! - JSON path syntax conversion (dot notation to arrow operators)
 //! - DataFusion parser quirks fixes
 //!
 //! ## PRQL Support
@@ -19,8 +20,24 @@
 //! take 10
 //! ```
 //!
+//! ## JSON Path Syntax
+//!
+//! Intuitive dot notation for JSON fields is automatically converted:
+//!
+//! ```sql
+//! -- Dot notation (converted automatically)
+//! SELECT status.phase FROM pods WHERE labels.app = 'nginx'
+//!
+//! -- Array indexing
+//! SELECT spec.containers[0].image FROM pods
+//!
+//! -- Array expansion (one row per element)
+//! SELECT spec.containers[].image FROM pods
+//! ```
+//!
 //! ## SQL Transformations
 //!
+//! - **JSON path conversion**: `status.phase` becomes `status->>'phase'`
 //! - **JSON arrow precedence fix**: `col->>'key' = 'val'` becomes
 //!   `(col->>'key') = 'val'` to work around DataFusion parser precedence bug
 //!
@@ -37,7 +54,7 @@
 //! SELECT metadata->'labels'->'env'->>'name' FROM pods
 //! ```
 
-use super::prql;
+use super::{json_path, prql};
 use anyhow::Result;
 use datafusion::sql::sqlparser::ast::Statement;
 use datafusion::sql::sqlparser::dialect::GenericDialect;
@@ -108,7 +125,9 @@ fn fix_arrow_precedence(sql: &str) -> String {
 /// This function handles:
 /// 1. **PRQL detection and compilation**: Queries starting with `from`, `let`, or `prql`
 ///    are automatically compiled to SQL using the prqlc compiler.
-/// 2. **JSON arrow precedence fix**: Wraps arrow expressions in parentheses when used
+/// 2. **JSON path syntax conversion**: Converts intuitive dot notation like `spec.containers[0].image`
+///    to PostgreSQL arrow operators like `spec->'containers'->0->>'image'`.
+/// 3. **JSON arrow precedence fix**: Wraps arrow expressions in parentheses when used
 ///    with comparison operators to work around DataFusion parser precedence.
 ///
 /// # Examples
@@ -119,6 +138,10 @@ fn fix_arrow_precedence(sql: &str) -> String {
 ///
 /// // SQL is processed normally
 /// preprocess_sql("SELECT * FROM pods")?;  // Returns: SELECT * FROM pods
+///
+/// // JSON path syntax is converted
+/// preprocess_sql("SELECT spec.containers[0].image FROM pods")?;
+/// // Returns: SELECT spec->'containers'->0->>'image' FROM pods
 ///
 /// // Arrow precedence is fixed
 /// preprocess_sql("SELECT * FROM pods WHERE labels->>'app' = 'nginx'")?;
@@ -132,7 +155,12 @@ pub fn preprocess_sql(sql: &str) -> Result<String> {
         sql.to_string()
     };
 
-    // Step 2: Fix JSON arrow operator precedence
+    // Step 2: Convert JSON path syntax to arrow operators
+    // Uses default JSON columns (spec, status, labels, etc.)
+    // TODO: Accept custom JSON columns from CRD discovery
+    let sql = json_path::preprocess_json_paths(&sql, None);
+
+    // Step 3: Fix JSON arrow operator precedence
     Ok(fix_arrow_precedence(&sql))
 }
 
@@ -233,9 +261,11 @@ mod tests {
     fn test_json_arrow_precedence_not_equals() {
         let sql = "SELECT * FROM pods WHERE status->>'phase' != 'Running'";
         let result = preprocess_sql(sql).unwrap();
-        assert_eq!(
-            result,
-            "SELECT * FROM pods WHERE (status->>'phase') != 'Running'"
+        // Tokenizer may normalize != to <> (both are valid SQL not-equals)
+        assert!(
+            result.contains("(status->>'phase') !=") || result.contains("(status->>'phase') <>"),
+            "Expected parenthesized arrow expression, got: {}",
+            result
         );
     }
 

@@ -67,6 +67,8 @@ pub struct CachedColumnDef {
     pub name: String,
     pub data_type: String, // "Text", "Timestamp", or "Integer"
     pub json_path: Option<String>,
+    #[serde(default)]
+    pub is_json_object: bool,
 }
 
 impl From<&ColumnDef> for CachedColumnDef {
@@ -79,6 +81,7 @@ impl From<&ColumnDef> for CachedColumnDef {
                 ColumnDataType::Integer => "Integer".to_string(),
             },
             json_path: col.json_path.clone(),
+            is_json_object: col.is_json_object,
         }
     }
 }
@@ -86,13 +89,14 @@ impl From<&ColumnDef> for CachedColumnDef {
 impl From<CachedColumnDef> for ColumnDef {
     fn from(cached: CachedColumnDef) -> Self {
         Self {
-            name: cached.name,
+            name: cached.name.clone(),
             data_type: match cached.data_type.as_str() {
                 "Timestamp" => ColumnDataType::Timestamp,
                 "Integer" => ColumnDataType::Integer,
                 _ => ColumnDataType::Text,
             },
             json_path: cached.json_path,
+            is_json_object: cached.is_json_object,
         }
     }
 }

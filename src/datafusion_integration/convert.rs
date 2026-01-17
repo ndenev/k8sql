@@ -314,16 +314,19 @@ mod tests {
                 name: "_cluster".to_string(),
                 data_type: ColumnDataType::Text,
                 json_path: None,
+                is_json_object: false,
             },
             ColumnDef {
                 name: "name".to_string(),
                 data_type: ColumnDataType::Text,
                 json_path: Some("/metadata/name".to_string()),
+                is_json_object: false,
             },
             ColumnDef {
                 name: "namespace".to_string(),
                 data_type: ColumnDataType::Text,
                 json_path: Some("/metadata/namespace".to_string()),
+                is_json_object: false,
             },
         ];
 
@@ -391,6 +394,7 @@ mod tests {
             name: "name".to_string(),
             data_type: ColumnDataType::Text,
             json_path: Some("/metadata/name".to_string()),
+            is_json_object: false,
         };
 
         let resources = vec![
