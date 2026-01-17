@@ -328,4 +328,121 @@ mod tests {
         let result = extractor.extract(&[expr]);
         assert_eq!(result, TestFilter::Special);
     }
+
+    // === Edge case tests for contradictory conditions ===
+
+    #[test]
+    fn test_contradictory_and_uses_first_match() {
+        // Current behavior: test_col = 'a' AND test_col = 'b' returns first match ('a')
+        // Note: This is semantically a contradiction that should return no results,
+        // but the filter extractor returns the first match found.
+        // DataFusion will handle this at execution time (the query returns 0 rows).
+        let extractor = FilterExtractor::<TestFilter>::new("test_col");
+        let expr = Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(col("test_col").eq(lit("a"))),
+            op: Operator::And,
+            right: Box::new(col("test_col").eq(lit("b"))),
+        });
+
+        let result = extractor.extract(&[expr]);
+        // Documents current behavior: returns first match
+        assert_eq!(result, TestFilter::Single("a".to_string()));
+    }
+
+    #[test]
+    fn test_and_with_different_columns() {
+        // test_col = 'a' AND other_col = 'b' should return 'a'
+        // (only extracts from the target column)
+        let extractor = FilterExtractor::<TestFilter>::new("test_col");
+        let expr = Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(col("test_col").eq(lit("a"))),
+            op: Operator::And,
+            right: Box::new(col("other_col").eq(lit("b"))),
+        });
+
+        let result = extractor.extract(&[expr]);
+        assert_eq!(result, TestFilter::Single("a".to_string()));
+    }
+
+    #[test]
+    fn test_and_target_column_on_right() {
+        // other_col = 'b' AND test_col = 'a' should still find 'a'
+        let extractor = FilterExtractor::<TestFilter>::new("test_col");
+        let expr = Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(col("other_col").eq(lit("b"))),
+            op: Operator::And,
+            right: Box::new(col("test_col").eq(lit("a"))),
+        });
+
+        let result = extractor.extract(&[expr]);
+        assert_eq!(result, TestFilter::Single("a".to_string()));
+    }
+
+    #[test]
+    fn test_nested_and_with_multiple_values() {
+        // (test_col = 'a' AND other = 'x') AND (test_col = 'b' AND other = 'y')
+        // Should return first match from left subtree
+        let extractor = FilterExtractor::<TestFilter>::new("test_col");
+        let left_and = Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(col("test_col").eq(lit("a"))),
+            op: Operator::And,
+            right: Box::new(col("other").eq(lit("x"))),
+        });
+        let right_and = Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(col("test_col").eq(lit("b"))),
+            op: Operator::And,
+            right: Box::new(col("other").eq(lit("y"))),
+        });
+        let expr = Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(left_and),
+            op: Operator::And,
+            right: Box::new(right_and),
+        });
+
+        let result = extractor.extract(&[expr]);
+        assert_eq!(result, TestFilter::Single("a".to_string()));
+    }
+
+    #[test]
+    fn test_or_inside_and() {
+        // (test_col = 'a' OR test_col = 'b') AND other = 'x'
+        // Should extract the OR values
+        let extractor = FilterExtractor::<TestFilter>::new("test_col");
+        let or_expr = Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(col("test_col").eq(lit("a"))),
+            op: Operator::Or,
+            right: Box::new(col("test_col").eq(lit("b"))),
+        });
+        let expr = Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(or_expr),
+            op: Operator::And,
+            right: Box::new(col("other").eq(lit("x"))),
+        });
+
+        let result = extractor.extract(&[expr]);
+        assert_eq!(
+            result,
+            TestFilter::Multiple(vec!["a".to_string(), "b".to_string()])
+        );
+    }
+
+    #[test]
+    fn test_empty_filter_list() {
+        let extractor = FilterExtractor::<TestFilter>::new("test_col");
+        let result = extractor.extract(&[]);
+        assert_eq!(result, TestFilter::Default);
+    }
+
+    #[test]
+    fn test_multiple_filters_returns_first_match() {
+        // When given multiple separate filters, returns first match
+        let extractor = FilterExtractor::<TestFilter>::new("test_col");
+        let filters = vec![
+            col("test_col").eq(lit("first")),
+            col("test_col").eq(lit("second")),
+        ];
+
+        let result = extractor.extract(&filters);
+        assert_eq!(result, TestFilter::Single("first".to_string()));
+    }
 }

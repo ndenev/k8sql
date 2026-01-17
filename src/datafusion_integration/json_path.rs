@@ -62,6 +62,149 @@ fn is_json_column(word: &str, json_columns: &HashSet<String>) -> bool {
     json_columns.contains(&word.to_lowercase())
 }
 
+/// Convert a dot-notation path string to PostgreSQL arrow syntax.
+///
+/// This function parses paths like `status.phase` or `spec.containers[0].image`
+/// and converts them to arrow operators like `status->>'phase'` or
+/// `spec->'containers'->0->>'image'`.
+///
+/// # Arguments
+///
+/// * `path` - A dot-notation path starting with a JSON column (e.g., "status.phase")
+/// * `json_columns` - Optional set of JSON column names. If None, uses DEFAULT_JSON_COLUMNS.
+///
+/// # Returns
+///
+/// * `Some(arrow_syntax)` if the path starts with a known JSON column and has segments
+/// * `None` if the path doesn't start with a JSON column or has no segments
+///
+/// # Examples
+///
+/// ```ignore
+/// assert_eq!(
+///     convert_path_to_arrows("status.phase", None),
+///     Some("status->>'phase'".to_string())
+/// );
+/// assert_eq!(
+///     convert_path_to_arrows("spec.containers[0].image", None),
+///     Some("spec->'containers'->0->>'image'".to_string())
+/// );
+/// assert_eq!(
+///     convert_path_to_arrows("name", None),  // Not a JSON column
+///     None
+/// );
+/// ```
+pub fn convert_path_to_arrows(
+    path: &str,
+    json_columns: Option<&HashSet<String>>,
+) -> Option<String> {
+    let default_columns = build_json_columns_set(&[]);
+    let json_columns = json_columns.unwrap_or(&default_columns);
+
+    let mut chars = path.chars().peekable();
+
+    // Extract the JSON column name (first identifier)
+    let column = consume_identifier(&mut chars)?;
+    if !is_json_column(&column, json_columns) {
+        return None;
+    }
+
+    // Parse path segments: .field, [n], or []
+    let segments = parse_path_segments(&mut chars);
+    if segments.is_empty() {
+        return None;
+    }
+
+    let json_path = JsonPath {
+        alias: None,
+        column,
+        segments,
+    };
+
+    Some(json_path.to_sql())
+}
+
+/// Consume an identifier (alphanumeric + underscore) from the character iterator.
+fn consume_identifier(chars: &mut std::iter::Peekable<std::str::Chars>) -> Option<String> {
+    let mut ident = String::new();
+    while let Some(&c) = chars.peek() {
+        if c.is_alphanumeric() || c == '_' {
+            ident.push(c);
+            chars.next();
+        } else {
+            break;
+        }
+    }
+    if ident.is_empty() { None } else { Some(ident) }
+}
+
+/// Consume a field name (alphanumeric + underscore + hyphen) from the character iterator.
+fn consume_field_name(chars: &mut std::iter::Peekable<std::str::Chars>) -> String {
+    let mut field = String::new();
+    while let Some(&c) = chars.peek() {
+        if c.is_alphanumeric() || c == '_' || c == '-' {
+            field.push(c);
+            chars.next();
+        } else {
+            break;
+        }
+    }
+    field
+}
+
+/// Parse path segments (.field, [n], []) from the character iterator.
+fn parse_path_segments(chars: &mut std::iter::Peekable<std::str::Chars>) -> Vec<PathSegment> {
+    let mut segments = Vec::new();
+
+    while let Some(&c) = chars.peek() {
+        match c {
+            '.' => {
+                chars.next();
+                let field = consume_field_name(chars);
+                if !field.is_empty() {
+                    segments.push(PathSegment::Field(field));
+                }
+            }
+            '[' => {
+                chars.next();
+                if let Some(segment) = parse_bracket_segment(chars) {
+                    segments.push(segment);
+                } else {
+                    break;
+                }
+            }
+            _ => break,
+        }
+    }
+
+    segments
+}
+
+/// Parse a bracket segment ([n] or []) and consume the closing bracket.
+fn parse_bracket_segment(chars: &mut std::iter::Peekable<std::str::Chars>) -> Option<PathSegment> {
+    let mut index_str = String::new();
+    while let Some(&c) = chars.peek() {
+        if c.is_ascii_digit() {
+            index_str.push(c);
+            chars.next();
+        } else {
+            break;
+        }
+    }
+
+    // Must have closing bracket
+    if chars.peek() != Some(&']') {
+        return None;
+    }
+    chars.next();
+
+    if index_str.is_empty() {
+        Some(PathSegment::Expand)
+    } else {
+        index_str.parse::<usize>().ok().map(PathSegment::Index)
+    }
+}
+
 /// Parsed segment of a JSON path
 #[derive(Debug, Clone, PartialEq)]
 enum PathSegment {
@@ -958,6 +1101,209 @@ mod tests {
         assert_eq!(
             preprocess_json_paths("SELECT \"status.phase\" FROM pods", None),
             "SELECT \"status.phase\" FROM pods"
+        );
+    }
+
+    // =========================================================================
+    // Edge Case Tests - Array Expansion and Indices
+    // =========================================================================
+
+    #[test]
+    fn test_nested_array_expansion_produces_warning() {
+        // Nested array expansion spec.containers[].ports[] is not fully supported.
+        // It should produce output (possibly with a warning) but not crash.
+        // The second [] should be preserved as literal "[]" in the output.
+        let result = preprocess_json_paths(
+            "SELECT spec.containers[].ports[].containerPort FROM pods",
+            None,
+        );
+
+        // Should contain UNNEST for first expansion
+        assert!(result.contains("UNNEST"));
+        assert!(result.contains("json_get_array"));
+
+        // The second [] should be preserved as literal (current behavior)
+        // This documents the current limitation
+        assert!(result.contains("[]"));
+    }
+
+    #[test]
+    fn test_array_expansion_after_index() {
+        // spec.containers[0].ports[] - index followed by expansion
+        // This is supported: get first container, then expand its ports
+        let result = preprocess_json_paths(
+            "SELECT spec.containers[0].ports[].containerPort FROM pods",
+            None,
+        );
+
+        // Should contain UNNEST for the expansion
+        assert!(result.contains("UNNEST"));
+        assert!(result.contains("json_get_array"));
+        // Should access containers with index 0 first
+        assert!(
+            result.contains("'containers', 0, 'ports'")
+                || result.contains("'containers', '0', 'ports'")
+        );
+    }
+
+    #[test]
+    fn test_negative_array_index_not_parsed() {
+        // Negative indices like [-1] are not valid - should not be parsed as array access.
+        // The tokenizer treats "-1" as a minus operator followed by number,
+        // so "[" "-" "1" "]" won't match our array index pattern.
+        let result = preprocess_json_paths("SELECT spec.containers[-1].image FROM pods", None);
+
+        // Should not produce arrow syntax for containers (the path is broken)
+        // The exact behavior depends on tokenization, but it shouldn't crash
+        // and shouldn't produce valid array access
+        assert!(!result.contains("->-1"));
+    }
+
+    #[test]
+    fn test_very_large_array_index() {
+        // Very large indices should still work (they'll return null at runtime)
+        assert_eq!(
+            preprocess_json_paths("SELECT spec.containers[999999].image FROM pods", None),
+            "SELECT spec->'containers'->999999->>'image' FROM pods"
+        );
+
+        // Even larger
+        assert_eq!(
+            preprocess_json_paths("SELECT spec.containers[2147483647].name FROM pods", None),
+            "SELECT spec->'containers'->2147483647->>'name' FROM pods"
+        );
+    }
+
+    #[test]
+    fn test_array_index_zero() {
+        // Zero index is the most common case
+        assert_eq!(
+            preprocess_json_paths("SELECT spec.containers[0].image FROM pods", None),
+            "SELECT spec->'containers'->0->>'image' FROM pods"
+        );
+    }
+
+    #[test]
+    fn test_multiple_expansions_at_same_level() {
+        // Two separate array expansions in same query (different columns)
+        let result = preprocess_json_paths(
+            "SELECT spec.containers[].image, spec.volumes[].name FROM pods",
+            None,
+        );
+
+        // Both should produce UNNEST
+        // Count occurrences of UNNEST
+        let unnest_count = result.matches("UNNEST").count();
+        assert_eq!(unnest_count, 2);
+    }
+
+    #[test]
+    fn test_array_expansion_in_where_clause() {
+        // Array expansion in WHERE clause (complex but valid use case)
+        let result = preprocess_json_paths(
+            "SELECT name FROM pods WHERE spec.containers[].image = 'nginx'",
+            None,
+        );
+
+        assert!(result.contains("UNNEST"));
+        assert!(result.contains("json_get_array"));
+    }
+
+    #[test]
+    fn test_decimal_in_brackets_not_parsed() {
+        // Decimals like [0.5] are not valid array indices
+        // The tokenizer produces different tokens for "0.5"
+        let result = preprocess_json_paths("SELECT spec.containers[0.5].image FROM pods", None);
+
+        // Should not produce a valid array index access
+        // (behavior may vary, but it shouldn't crash)
+        assert!(!result.contains("->0.5"));
+    }
+
+    #[test]
+    fn test_empty_brackets_only() {
+        // Just empty brackets on a JSON column
+        let result = preprocess_json_paths("SELECT spec.containers[] FROM pods", None);
+
+        assert!(result.contains("UNNEST"));
+        assert!(result.contains("json_get_array"));
+        // No field access after the expansion
+        assert!(!result.contains("->>"));
+    }
+
+    // =========================================================================
+    // Tests for convert_path_to_arrows (used by PRQL preprocessor)
+    // =========================================================================
+
+    #[test]
+    fn test_convert_path_simple_field() {
+        assert_eq!(
+            convert_path_to_arrows("status.phase", None),
+            Some("status->>'phase'".to_string())
+        );
+    }
+
+    #[test]
+    fn test_convert_path_nested_fields() {
+        assert_eq!(
+            convert_path_to_arrows("spec.selector.app", None),
+            Some("spec->'selector'->>'app'".to_string())
+        );
+    }
+
+    #[test]
+    fn test_convert_path_array_index() {
+        assert_eq!(
+            convert_path_to_arrows("spec.containers[0].image", None),
+            Some("spec->'containers'->0->>'image'".to_string())
+        );
+    }
+
+    #[test]
+    fn test_convert_path_array_expansion() {
+        let result = convert_path_to_arrows("spec.containers[].image", None);
+        assert!(result.is_some());
+        let sql = result.unwrap();
+        assert!(sql.contains("UNNEST"));
+        assert!(sql.contains("json_get_array"));
+    }
+
+    #[test]
+    fn test_convert_path_not_json_column() {
+        // "name" is not a JSON column
+        assert_eq!(convert_path_to_arrows("name.something", None), None);
+    }
+
+    #[test]
+    fn test_convert_path_json_column_alone() {
+        // Just "status" with no path segments
+        assert_eq!(convert_path_to_arrows("status", None), None);
+    }
+
+    #[test]
+    fn test_convert_path_all_json_columns() {
+        assert!(convert_path_to_arrows("labels.app", None).is_some());
+        assert!(convert_path_to_arrows("annotations.key", None).is_some());
+        assert!(convert_path_to_arrows("spec.field", None).is_some());
+        assert!(convert_path_to_arrows("status.field", None).is_some());
+        assert!(convert_path_to_arrows("data.key", None).is_some());
+        assert!(convert_path_to_arrows("owner_references.name", None).is_some());
+    }
+
+    #[test]
+    fn test_convert_path_deep_nesting() {
+        assert_eq!(
+            convert_path_to_arrows("spec.template.spec.containers[0].image", None),
+            Some("spec->'template'->'spec'->'containers'->0->>'image'".to_string())
+        );
+    }
+
+    #[test]
+    fn test_convert_path_field_with_hyphen() {
+        // Kubernetes often has hyphenated field names
+        assert_eq!(
+            convert_path_to_arrows("labels.app-name", None),
+            Some("labels->>'app-name'".to_string())
         );
     }
 }

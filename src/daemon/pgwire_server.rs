@@ -3,7 +3,6 @@
 
 use std::sync::Arc;
 
-use datafusion_postgres::auth::AuthManager;
 use datafusion_postgres::datafusion_pg_catalog::pg_catalog::context::EmptyContextProvider;
 use datafusion_postgres::datafusion_pg_catalog::setup_pg_catalog;
 use datafusion_postgres::{QueryHook, ServerOptions, serve_with_hooks};
@@ -46,9 +45,6 @@ impl PgWireServer {
 
         let ctx = Arc::new(ctx);
 
-        // Create default auth manager (accepts "postgres" user with empty password)
-        let auth_manager = Arc::new(AuthManager::new());
-
         // Create custom hooks for k8sql-specific commands
         let hooks: Vec<Arc<dyn QueryHook>> = vec![
             Arc::new(SetConfigHook::new()), // Handle SET commands from PostgreSQL clients
@@ -75,7 +71,7 @@ impl PgWireServer {
         );
 
         // Use datafusion-postgres to serve queries with our custom hooks
-        serve_with_hooks(ctx, &server_options, auth_manager, hooks)
+        serve_with_hooks(ctx, &server_options, hooks)
             .await
             .map_err(|e| anyhow::anyhow!("{}", e))
     }

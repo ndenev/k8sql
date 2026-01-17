@@ -178,5 +178,27 @@ print_summary() {
     return 0
 }
 
+# Compare SQL and PRQL query results for parity
+compare_sql_prql() {
+    local desc="$1"
+    local context="$2"
+    local sql_query="$3"
+    local prql_query="$4"
+
+    local sql_result
+    local prql_result
+
+    sql_result=$(run_query "$context" "$sql_query" | jq -S '.' 2>/dev/null)
+    prql_result=$(run_query "$context" "$prql_query" | jq -S '.' 2>/dev/null)
+
+    if [[ "$sql_result" == "$prql_result" ]]; then
+        echo -e "${GREEN}✓${NC} $desc"
+        PASS=$((PASS + 1))
+    else
+        echo -e "${RED}✗${NC} $desc (SQL/PRQL results differ)"
+        FAIL=$((FAIL + 1))
+    fi
+}
+
 # Export counters for use in subshells
 export PASS FAIL
