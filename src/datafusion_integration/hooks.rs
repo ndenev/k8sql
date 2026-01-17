@@ -380,11 +380,11 @@ impl QueryHook for ShowDatabasesHook {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use datafusion::sql::sqlparser::dialect::GenericDialect;
+    use datafusion::sql::sqlparser::dialect::PostgreSqlDialect;
     use datafusion::sql::sqlparser::parser::Parser;
 
     fn parse_statement(sql: &str) -> Statement {
-        let dialect = GenericDialect {};
+        let dialect = PostgreSqlDialect {};
         Parser::parse_sql(&dialect, sql).unwrap().pop().unwrap()
     }
 

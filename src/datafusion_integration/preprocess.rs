@@ -57,7 +57,7 @@
 use super::{json_path, prql};
 use anyhow::Result;
 use datafusion::sql::sqlparser::ast::Statement;
-use datafusion::sql::sqlparser::dialect::GenericDialect;
+use datafusion::sql::sqlparser::dialect::PostgreSqlDialect;
 use datafusion::sql::sqlparser::parser::Parser;
 use regex::Regex;
 use std::sync::LazyLock;
@@ -179,7 +179,7 @@ pub fn preprocess_sql(sql: &str) -> Result<String> {
 /// This function rejects any DDL (CREATE, DROP, ALTER) or DML (INSERT, UPDATE, DELETE)
 /// statements with a clear error message.
 pub fn validate_read_only(sql: &str) -> anyhow::Result<()> {
-    let dialect = GenericDialect {};
+    let dialect = PostgreSqlDialect {};
     let statements =
         Parser::parse_sql(&dialect, sql).map_err(|e| anyhow::anyhow!("SQL parse error: {}", e))?;
 
@@ -505,10 +505,10 @@ mod tests {
     #[test]
     fn test_parser_supports_chained_arrows() {
         // Test if DataFusion's SQL parser natively supports chained arrow operators
-        use datafusion::sql::sqlparser::dialect::GenericDialect;
+        use datafusion::sql::sqlparser::dialect::PostgreSqlDialect;
         use datafusion::sql::sqlparser::parser::Parser;
 
-        let dialect = GenericDialect {};
+        let dialect = PostgreSqlDialect {};
 
         // Test chained arrows WITHOUT preprocessing
         let sql = "SELECT spec->'selector'->>'app' FROM pods";
