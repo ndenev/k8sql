@@ -53,12 +53,20 @@ compare_sql_prql "ORDER BY DESC" "k3d-k8sql-test-1" \
 echo ""
 echo "--- JSON Path in PRQL ---"
 
-# Test that PRQL can use JSON path syntax (converted before compilation)
+# PRQL now supports the same JSON path syntax as SQL!
+# status.phase is automatically converted to s"status->>'phase'" before compilation
 assert_success "PRQL with JSON path syntax" "k3d-k8sql-test-1" \
     "from pods | select {name, phase = status.phase} | take 5"
 
 assert_success "PRQL filter with JSON path" "k3d-k8sql-test-1" \
     "from pods | filter status.phase == \"Running\" | select {name} | take 5"
+
+# Also test nested paths and array indexing
+assert_success "PRQL nested JSON path" "k3d-k8sql-test-1" \
+    "from deployments | select {name, replicas = spec.replicas} | take 5"
+
+assert_success "PRQL array index in JSON path" "k3d-k8sql-test-1" \
+    "from pods | select {name, image = spec.containers[0].image} | take 5"
 
 echo ""
 echo "--- Complex PRQL Queries ---"

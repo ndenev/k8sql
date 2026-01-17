@@ -62,6 +62,121 @@ fn is_json_column(word: &str, json_columns: &HashSet<String>) -> bool {
     json_columns.contains(&word.to_lowercase())
 }
 
+/// Convert a dot-notation path string to PostgreSQL arrow syntax.
+///
+/// This function parses paths like `status.phase` or `spec.containers[0].image`
+/// and converts them to arrow operators like `status->>'phase'` or
+/// `spec->'containers'->0->>'image'`.
+///
+/// # Arguments
+///
+/// * `path` - A dot-notation path starting with a JSON column (e.g., "status.phase")
+/// * `json_columns` - Optional set of JSON column names. If None, uses DEFAULT_JSON_COLUMNS.
+///
+/// # Returns
+///
+/// * `Some(arrow_syntax)` if the path starts with a known JSON column and has segments
+/// * `None` if the path doesn't start with a JSON column or has no segments
+///
+/// # Examples
+///
+/// ```ignore
+/// assert_eq!(
+///     convert_path_to_arrows("status.phase", None),
+///     Some("status->>'phase'".to_string())
+/// );
+/// assert_eq!(
+///     convert_path_to_arrows("spec.containers[0].image", None),
+///     Some("spec->'containers'->0->>'image'".to_string())
+/// );
+/// assert_eq!(
+///     convert_path_to_arrows("name", None),  // Not a JSON column
+///     None
+/// );
+/// ```
+pub fn convert_path_to_arrows(
+    path: &str,
+    json_columns: Option<&HashSet<String>>,
+) -> Option<String> {
+    let default_columns = build_json_columns_set(&[]);
+    let json_columns = json_columns.unwrap_or(&default_columns);
+
+    // Parse the path string into components
+    let mut chars = path.chars().peekable();
+    let mut segments: Vec<PathSegment> = Vec::new();
+
+    // Extract the first identifier (should be a JSON column)
+    let mut column = String::new();
+    while let Some(&c) = chars.peek() {
+        if c.is_alphanumeric() || c == '_' {
+            column.push(c);
+            chars.next();
+        } else {
+            break;
+        }
+    }
+
+    if column.is_empty() || !is_json_column(&column, json_columns) {
+        return None;
+    }
+
+    // Parse remaining segments: .field, [n], or []
+    while let Some(&c) = chars.peek() {
+        match c {
+            '.' => {
+                chars.next(); // consume '.'
+                let mut field = String::new();
+                while let Some(&c) = chars.peek() {
+                    if c.is_alphanumeric() || c == '_' || c == '-' {
+                        field.push(c);
+                        chars.next();
+                    } else {
+                        break;
+                    }
+                }
+                if !field.is_empty() {
+                    segments.push(PathSegment::Field(field));
+                }
+            }
+            '[' => {
+                chars.next(); // consume '['
+                let mut index_str = String::new();
+                while let Some(&c) = chars.peek() {
+                    if c.is_ascii_digit() {
+                        index_str.push(c);
+                        chars.next();
+                    } else {
+                        break;
+                    }
+                }
+                // Expect closing bracket
+                if chars.peek() == Some(&']') {
+                    chars.next(); // consume ']'
+                    if index_str.is_empty() {
+                        segments.push(PathSegment::Expand);
+                    } else if let Ok(idx) = index_str.parse::<usize>() {
+                        segments.push(PathSegment::Index(idx));
+                    }
+                }
+            }
+            _ => break,
+        }
+    }
+
+    // Must have at least one segment to convert
+    if segments.is_empty() {
+        return None;
+    }
+
+    let json_path = JsonPath {
+        alias: None,
+        column,
+        segments,
+    };
+
+    Some(json_path.to_sql())
+}
+
 /// Parsed segment of a JSON path
 #[derive(Debug, Clone, PartialEq)]
 enum PathSegment {
@@ -1086,5 +1201,81 @@ mod tests {
         assert!(result.contains("json_get_array"));
         // No field access after the expansion
         assert!(!result.contains("->>"));
+    }
+
+    // =========================================================================
+    // Tests for convert_path_to_arrows (used by PRQL preprocessor)
+    // =========================================================================
+
+    #[test]
+    fn test_convert_path_simple_field() {
+        assert_eq!(
+            convert_path_to_arrows("status.phase", None),
+            Some("status->>'phase'".to_string())
+        );
+    }
+
+    #[test]
+    fn test_convert_path_nested_fields() {
+        assert_eq!(
+            convert_path_to_arrows("spec.selector.app", None),
+            Some("spec->'selector'->>'app'".to_string())
+        );
+    }
+
+    #[test]
+    fn test_convert_path_array_index() {
+        assert_eq!(
+            convert_path_to_arrows("spec.containers[0].image", None),
+            Some("spec->'containers'->0->>'image'".to_string())
+        );
+    }
+
+    #[test]
+    fn test_convert_path_array_expansion() {
+        let result = convert_path_to_arrows("spec.containers[].image", None);
+        assert!(result.is_some());
+        let sql = result.unwrap();
+        assert!(sql.contains("UNNEST"));
+        assert!(sql.contains("json_get_array"));
+    }
+
+    #[test]
+    fn test_convert_path_not_json_column() {
+        // "name" is not a JSON column
+        assert_eq!(convert_path_to_arrows("name.something", None), None);
+    }
+
+    #[test]
+    fn test_convert_path_json_column_alone() {
+        // Just "status" with no path segments
+        assert_eq!(convert_path_to_arrows("status", None), None);
+    }
+
+    #[test]
+    fn test_convert_path_all_json_columns() {
+        assert!(convert_path_to_arrows("labels.app", None).is_some());
+        assert!(convert_path_to_arrows("annotations.key", None).is_some());
+        assert!(convert_path_to_arrows("spec.field", None).is_some());
+        assert!(convert_path_to_arrows("status.field", None).is_some());
+        assert!(convert_path_to_arrows("data.key", None).is_some());
+        assert!(convert_path_to_arrows("owner_references.name", None).is_some());
+    }
+
+    #[test]
+    fn test_convert_path_deep_nesting() {
+        assert_eq!(
+            convert_path_to_arrows("spec.template.spec.containers[0].image", None),
+            Some("spec->'template'->'spec'->'containers'->0->>'image'".to_string())
+        );
+    }
+
+    #[test]
+    fn test_convert_path_field_with_hyphen() {
+        // Kubernetes often has hyphenated field names
+        assert_eq!(
+            convert_path_to_arrows("labels.app-name", None),
+            Some("labels->>'app-name'".to_string())
+        );
     }
 }

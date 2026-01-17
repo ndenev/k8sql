@@ -13,8 +13,145 @@
 //! sort created
 //! take 10
 //! ```
+//!
+//! # JSON Path Syntax
+//!
+//! JSON paths like `status.phase` are automatically converted to s-strings
+//! with SQL arrow operators before PRQL compilation:
+//!
+//! ```prql
+//! from pods
+//! filter status.phase == "Running"
+//! select {name, phase = status.phase}
+//! ```
+//!
+//! Becomes:
+//!
+//! ```prql
+//! from pods
+//! filter s"status->>'phase'" == "Running"
+//! select {name, phase = s"status->>'phase'"}
+//! ```
 
+use super::json_path::convert_path_to_arrows;
 use anyhow::Result;
+use regex::Regex;
+use std::sync::LazyLock;
+
+/// Regex pattern to match potential JSON paths in PRQL.
+///
+/// Matches patterns like:
+/// - `status.phase`
+/// - `spec.containers[0].image`
+/// - `labels.app`
+///
+/// The pattern starts with a word character sequence (the JSON column name)
+/// followed by either:
+/// - A dot and more word characters/hyphens
+/// - A bracket with optional number
+///
+/// We're conservative here - we only match at word boundaries and avoid
+/// matching inside strings.
+static JSON_PATH_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
+    // Match: word boundary + json_column + (dot + field or bracket + index)+
+    // The JSON column names are: status, spec, labels, annotations, data, owner_references
+    Regex::new(
+        r#"(?x)
+        \b                                      # word boundary
+        (status|spec|labels|annotations|data|owner_references)  # JSON column
+        (                                       # followed by:
+            (?:\.[a-zA-Z_][a-zA-Z0-9_\-]*)      #   .field (with optional hyphen)
+            |(?:\[\d*\])                         #   [index] or []
+        )+                                      # one or more times
+        "#,
+    )
+    .unwrap()
+});
+
+/// Preprocess PRQL source to convert JSON path syntax to s-strings.
+///
+/// This function finds JSON paths like `status.phase` or `spec.containers[0].image`
+/// in PRQL source and converts them to s-strings with SQL arrow operators:
+/// `s"status->>'phase'"` or `s"spec->'containers'->0->>'image'"`.
+///
+/// This allows PRQL users to use the same intuitive dot notation as SQL users,
+/// without having to manually write s-strings.
+///
+/// # Arguments
+///
+/// * `prql` - The PRQL source string to preprocess
+///
+/// # Returns
+///
+/// The PRQL source with JSON paths converted to s-strings.
+///
+/// # Example
+///
+/// ```ignore
+/// let prql = "from pods | filter status.phase == \"Running\"";
+/// let result = preprocess_prql_json_paths(prql);
+/// assert_eq!(result, "from pods | filter s\"status->>'phase'\" == \"Running\"");
+/// ```
+pub fn preprocess_prql_json_paths(prql: &str) -> String {
+    // Simple state machine to track whether we're inside a PRQL string
+    // PRQL uses double quotes for strings: "string"
+    // We also need to avoid converting inside s-strings: s"already raw sql"
+    let mut result = String::with_capacity(prql.len());
+    let mut chars = prql.chars().peekable();
+    let mut in_string = false;
+    let mut buffer = String::new();
+
+    while let Some(c) = chars.next() {
+        if in_string {
+            // Inside a string, just copy characters until we hit closing quote
+            result.push(c);
+            if c == '"' {
+                in_string = false;
+            } else if c == '\\' {
+                // Handle escape sequences
+                if let Some(next) = chars.next() {
+                    result.push(next);
+                }
+            }
+        } else if c == '"' {
+            // Entering a string - first flush buffer with conversion
+            result.push_str(&convert_json_paths_in_text(&buffer));
+            buffer.clear();
+            result.push(c);
+            in_string = true;
+        } else if c == 's' && chars.peek() == Some(&'"') {
+            // s-string start - flush buffer and copy s"..." verbatim
+            result.push_str(&convert_json_paths_in_text(&buffer));
+            buffer.clear();
+            result.push(c);
+            result.push(chars.next().unwrap()); // consume the "
+            in_string = true;
+        } else {
+            buffer.push(c);
+        }
+    }
+
+    // Flush remaining buffer
+    result.push_str(&convert_json_paths_in_text(&buffer));
+    result
+}
+
+/// Convert JSON paths in a text fragment (outside of strings).
+fn convert_json_paths_in_text(text: &str) -> String {
+    JSON_PATH_PATTERN
+        .replace_all(text, |caps: &regex::Captures| {
+            let full_match = &caps[0];
+            // Try to convert the path to arrow syntax
+            if let Some(arrow_sql) = convert_path_to_arrows(full_match, None) {
+                // Wrap in PRQL s-string
+                format!("s\"{}\"", arrow_sql)
+            } else {
+                // Couldn't convert, keep original
+                full_match.to_string()
+            }
+        })
+        .into_owned()
+}
 
 /// Detect if input looks like PRQL (vs SQL).
 ///
@@ -277,5 +414,148 @@ mod tests {
 
         let sql = result.unwrap();
         assert!(sql.to_lowercase().contains("join"));
+    }
+
+    // =========================================================================
+    // PRQL JSON Path Preprocessing Tests
+    // =========================================================================
+
+    #[test]
+    fn test_prql_json_path_simple() {
+        let prql = "from pods | filter status.phase == \"Running\"";
+        let result = preprocess_prql_json_paths(prql);
+        assert!(
+            result.contains("s\"status->>'phase'\""),
+            "Expected s-string, got: {}",
+            result
+        );
+        assert!(result.contains("== \"Running\""));
+    }
+
+    #[test]
+    fn test_prql_json_path_in_select() {
+        let prql = "from pods | select {name, phase = status.phase}";
+        let result = preprocess_prql_json_paths(prql);
+        assert!(
+            result.contains("s\"status->>'phase'\""),
+            "Expected s-string, got: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_prql_json_path_nested() {
+        let prql = "from deployments | select {spec.selector.app}";
+        let result = preprocess_prql_json_paths(prql);
+        assert!(
+            result.contains("s\"spec->'selector'->>'app'\""),
+            "Expected nested arrow syntax, got: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_prql_json_path_array_index() {
+        let prql = "from pods | select {image = spec.containers[0].image}";
+        let result = preprocess_prql_json_paths(prql);
+        assert!(
+            result.contains("s\"spec->'containers'->0->>'image'\""),
+            "Expected array index syntax, got: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_prql_json_path_preserves_strings() {
+        // JSON paths inside strings should NOT be converted
+        let prql = "from pods | filter name == \"status.phase\"";
+        let result = preprocess_prql_json_paths(prql);
+        // The string "status.phase" should be preserved
+        assert!(
+            result.contains("\"status.phase\""),
+            "String should be preserved, got: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_prql_json_path_preserves_existing_sstrings() {
+        // Existing s-strings should not be double-converted
+        let prql = "from pods | filter s\"status->>'phase'\" == \"Running\"";
+        let result = preprocess_prql_json_paths(prql);
+        // Should not have nested s-strings
+        assert!(!result.contains("s\"s\""));
+        assert!(result.contains("s\"status->>'phase'\""));
+    }
+
+    #[test]
+    fn test_prql_json_path_multiple_paths() {
+        let prql = "from pods | filter status.phase == \"Running\" | select {name, labels.app}";
+        let result = preprocess_prql_json_paths(prql);
+        assert!(result.contains("s\"status->>'phase'\""));
+        assert!(result.contains("s\"labels->>'app'\""));
+    }
+
+    #[test]
+    fn test_prql_json_path_non_json_column_unchanged() {
+        // "name" is not a JSON column, so "name.something" shouldn't be converted
+        let prql = "from pods | filter name == \"test\"";
+        let result = preprocess_prql_json_paths(prql);
+        // Should be unchanged (no s-string wrapping)
+        assert_eq!(prql, result);
+    }
+
+    #[test]
+    fn test_prql_json_path_all_json_columns() {
+        // Test all JSON columns are recognized
+        let test_cases = vec![
+            ("status.phase", "status->>'phase'"),
+            ("spec.replicas", "spec->>'replicas'"),
+            ("labels.app", "labels->>'app'"),
+            ("annotations.key", "annotations->>'key'"),
+            ("data.config", "data->>'config'"),
+        ];
+
+        for (path, expected_arrow) in test_cases {
+            let prql = format!("from pods | select {{{}}}", path);
+            let result = preprocess_prql_json_paths(&prql);
+            assert!(
+                result.contains(&format!("s\"{}\"", expected_arrow)),
+                "For path '{}', expected '{}' in: {}",
+                path,
+                expected_arrow,
+                result
+            );
+        }
+    }
+
+    #[test]
+    fn test_prql_json_path_end_to_end() {
+        // Full end-to-end test: PRQL with JSON path -> SQL
+        use super::super::preprocess::preprocess_sql;
+
+        let prql = "from pods | filter status.phase == \"Running\" | select {name} | take 5";
+        let result = preprocess_sql(prql);
+        assert!(result.is_ok(), "Failed: {:?}", result);
+
+        let sql = result.unwrap();
+        // Should contain the arrow operator
+        assert!(
+            sql.contains("status") && sql.contains("phase"),
+            "SQL should reference status and phase: {}",
+            sql
+        );
+        // Should be valid SQL with WHERE and LIMIT
+        assert!(sql.to_lowercase().contains("where"));
+        assert!(sql.to_lowercase().contains("limit"));
+    }
+
+    #[test]
+    fn test_prql_json_path_complex_filter() {
+        let prql =
+            "from pods | filter status.phase == \"Running\" && labels.app == \"nginx\" | take 10";
+        let result = preprocess_prql_json_paths(prql);
+        assert!(result.contains("s\"status->>'phase'\""));
+        assert!(result.contains("s\"labels->>'app'\""));
     }
 }

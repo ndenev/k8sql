@@ -125,6 +125,8 @@ fn fix_arrow_precedence(sql: &str) -> String {
 /// This function handles:
 /// 1. **PRQL detection and compilation**: Queries starting with `from`, `let`, or `prql`
 ///    are automatically compiled to SQL using the prqlc compiler.
+///    - For PRQL, JSON paths (e.g., `status.phase`) are first converted to s-strings
+///      (e.g., `s"status->>'phase'"`) before compilation.
 /// 2. **JSON path syntax conversion**: Converts intuitive dot notation like `spec.containers[0].image`
 ///    to PostgreSQL arrow operators like `spec->'containers'->0->>'image'`.
 /// 3. **JSON arrow precedence fix**: Wraps arrow expressions in parentheses when used
@@ -135,6 +137,10 @@ fn fix_arrow_precedence(sql: &str) -> String {
 /// ```ignore
 /// // PRQL is automatically detected and compiled
 /// preprocess_sql("from pods | take 5")?;  // Returns SQL: SELECT * FROM pods LIMIT 5
+///
+/// // PRQL with JSON path syntax works too
+/// preprocess_sql("from pods | filter status.phase == \"Running\"")?;
+/// // Returns SQL with: WHERE status->>'phase' = 'Running'
 ///
 /// // SQL is processed normally
 /// preprocess_sql("SELECT * FROM pods")?;  // Returns: SELECT * FROM pods
@@ -150,12 +156,15 @@ fn fix_arrow_precedence(sql: &str) -> String {
 pub fn preprocess_sql(sql: &str) -> Result<String> {
     // Step 1: Compile PRQL to SQL if detected
     let sql = if prql::is_prql(sql) {
-        prql::compile_prql(sql)?
+        // Step 1a: Preprocess JSON paths in PRQL before compilation
+        // This converts status.phase to s"status->>'phase'" etc.
+        let prql_preprocessed = prql::preprocess_prql_json_paths(sql);
+        prql::compile_prql(&prql_preprocessed)?
     } else {
         sql.to_string()
     };
 
-    // Step 2: Convert JSON path syntax to arrow operators
+    // Step 2: Convert JSON path syntax to arrow operators (for SQL)
     // Uses default JSON columns (spec, status, labels, etc.)
     // TODO: Accept custom JSON columns from CRD discovery
     let sql = json_path::preprocess_json_paths(&sql, None);
