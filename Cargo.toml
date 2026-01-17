@@ -21,7 +21,7 @@ datafusion = { version = "51", default-features = false, features = [
     "sql",
     "recursive_protection",
 ] }
-datafusion-functions-json = "0.51"
+datafusion-functions-json = "0.52"
 
 # PRQL compiler (alternative query language)
 prqlc = "0.13"
