@@ -101,69 +101,16 @@ pub fn convert_path_to_arrows(
     let default_columns = build_json_columns_set(&[]);
     let json_columns = json_columns.unwrap_or(&default_columns);
 
-    // Parse the path string into components
     let mut chars = path.chars().peekable();
-    let mut segments: Vec<PathSegment> = Vec::new();
 
-    // Extract the first identifier (should be a JSON column)
-    let mut column = String::new();
-    while let Some(&c) = chars.peek() {
-        if c.is_alphanumeric() || c == '_' {
-            column.push(c);
-            chars.next();
-        } else {
-            break;
-        }
-    }
-
-    if column.is_empty() || !is_json_column(&column, json_columns) {
+    // Extract the JSON column name (first identifier)
+    let column = consume_identifier(&mut chars)?;
+    if !is_json_column(&column, json_columns) {
         return None;
     }
 
-    // Parse remaining segments: .field, [n], or []
-    while let Some(&c) = chars.peek() {
-        match c {
-            '.' => {
-                chars.next(); // consume '.'
-                let mut field = String::new();
-                while let Some(&c) = chars.peek() {
-                    if c.is_alphanumeric() || c == '_' || c == '-' {
-                        field.push(c);
-                        chars.next();
-                    } else {
-                        break;
-                    }
-                }
-                if !field.is_empty() {
-                    segments.push(PathSegment::Field(field));
-                }
-            }
-            '[' => {
-                chars.next(); // consume '['
-                let mut index_str = String::new();
-                while let Some(&c) = chars.peek() {
-                    if c.is_ascii_digit() {
-                        index_str.push(c);
-                        chars.next();
-                    } else {
-                        break;
-                    }
-                }
-                // Expect closing bracket
-                if chars.peek() == Some(&']') {
-                    chars.next(); // consume ']'
-                    if index_str.is_empty() {
-                        segments.push(PathSegment::Expand);
-                    } else if let Ok(idx) = index_str.parse::<usize>() {
-                        segments.push(PathSegment::Index(idx));
-                    }
-                }
-            }
-            _ => break,
-        }
-    }
-
-    // Must have at least one segment to convert
+    // Parse path segments: .field, [n], or []
+    let segments = parse_path_segments(&mut chars);
     if segments.is_empty() {
         return None;
     }
@@ -175,6 +122,87 @@ pub fn convert_path_to_arrows(
     };
 
     Some(json_path.to_sql())
+}
+
+/// Consume an identifier (alphanumeric + underscore) from the character iterator.
+fn consume_identifier(chars: &mut std::iter::Peekable<std::str::Chars>) -> Option<String> {
+    let mut ident = String::new();
+    while let Some(&c) = chars.peek() {
+        if c.is_alphanumeric() || c == '_' {
+            ident.push(c);
+            chars.next();
+        } else {
+            break;
+        }
+    }
+    if ident.is_empty() { None } else { Some(ident) }
+}
+
+/// Consume a field name (alphanumeric + underscore + hyphen) from the character iterator.
+fn consume_field_name(chars: &mut std::iter::Peekable<std::str::Chars>) -> String {
+    let mut field = String::new();
+    while let Some(&c) = chars.peek() {
+        if c.is_alphanumeric() || c == '_' || c == '-' {
+            field.push(c);
+            chars.next();
+        } else {
+            break;
+        }
+    }
+    field
+}
+
+/// Parse path segments (.field, [n], []) from the character iterator.
+fn parse_path_segments(chars: &mut std::iter::Peekable<std::str::Chars>) -> Vec<PathSegment> {
+    let mut segments = Vec::new();
+
+    while let Some(&c) = chars.peek() {
+        match c {
+            '.' => {
+                chars.next();
+                let field = consume_field_name(chars);
+                if !field.is_empty() {
+                    segments.push(PathSegment::Field(field));
+                }
+            }
+            '[' => {
+                chars.next();
+                if let Some(segment) = parse_bracket_segment(chars) {
+                    segments.push(segment);
+                } else {
+                    break;
+                }
+            }
+            _ => break,
+        }
+    }
+
+    segments
+}
+
+/// Parse a bracket segment ([n] or []) and consume the closing bracket.
+fn parse_bracket_segment(chars: &mut std::iter::Peekable<std::str::Chars>) -> Option<PathSegment> {
+    let mut index_str = String::new();
+    while let Some(&c) = chars.peek() {
+        if c.is_ascii_digit() {
+            index_str.push(c);
+            chars.next();
+        } else {
+            break;
+        }
+    }
+
+    // Must have closing bracket
+    if chars.peek() != Some(&']') {
+        return None;
+    }
+    chars.next();
+
+    if index_str.is_empty() {
+        Some(PathSegment::Expand)
+    } else {
+        index_str.parse::<usize>().ok().map(PathSegment::Index)
+    }
 }
 
 /// Parsed segment of a JSON path

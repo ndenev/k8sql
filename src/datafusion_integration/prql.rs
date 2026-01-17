@@ -93,61 +93,69 @@ static JSON_PATH_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
 /// assert_eq!(result, "from pods | filter s\"status->>'phase'\" == \"Running\"");
 /// ```
 pub fn preprocess_prql_json_paths(prql: &str) -> String {
-    // Simple state machine to track whether we're inside a PRQL string
-    // PRQL uses double quotes for strings: "string"
-    // We also need to avoid converting inside s-strings: s"already raw sql"
+    // State machine to avoid converting JSON paths inside strings.
+    // PRQL uses double quotes for strings ("string") and s-strings (s"raw sql").
     let mut result = String::with_capacity(prql.len());
     let mut chars = prql.chars().peekable();
-    let mut in_string = false;
-    let mut buffer = String::new();
+    let mut code_buffer = String::new();
 
     while let Some(c) = chars.next() {
-        if in_string {
-            // Inside a string, just copy characters until we hit closing quote
-            result.push(c);
-            if c == '"' {
-                in_string = false;
-            } else if c == '\\' {
-                // Handle escape sequences
-                if let Some(next) = chars.next() {
-                    result.push(next);
-                }
+        match c {
+            '"' => {
+                // Entering a string - flush and convert buffered code first
+                flush_code_buffer(&mut result, &mut code_buffer);
+                copy_string_literal(c, &mut chars, &mut result);
             }
-        } else if c == '"' {
-            // Entering a string - first flush buffer with conversion
-            result.push_str(&convert_json_paths_in_text(&buffer));
-            buffer.clear();
-            result.push(c);
-            in_string = true;
-        } else if c == 's' && chars.peek() == Some(&'"') {
-            // s-string start - flush buffer and copy s"..." verbatim
-            result.push_str(&convert_json_paths_in_text(&buffer));
-            buffer.clear();
-            result.push(c);
-            result.push(chars.next().unwrap()); // consume the "
-            in_string = true;
-        } else {
-            buffer.push(c);
+            's' if chars.peek() == Some(&'"') => {
+                // s-string: flush code buffer, then copy s"..." verbatim
+                flush_code_buffer(&mut result, &mut code_buffer);
+                result.push('s');
+                copy_string_literal(chars.next().unwrap(), &mut chars, &mut result);
+            }
+            _ => code_buffer.push(c),
         }
     }
 
-    // Flush remaining buffer
-    result.push_str(&convert_json_paths_in_text(&buffer));
+    flush_code_buffer(&mut result, &mut code_buffer);
     result
 }
 
-/// Convert JSON paths in a text fragment (outside of strings).
+/// Flush the code buffer, converting JSON paths, and clear it.
+fn flush_code_buffer(result: &mut String, buffer: &mut String) {
+    if !buffer.is_empty() {
+        result.push_str(&convert_json_paths_in_text(buffer));
+        buffer.clear();
+    }
+}
+
+/// Copy a string literal (starting quote already consumed) to result, handling escapes.
+fn copy_string_literal(
+    opening_quote: char,
+    chars: &mut std::iter::Peekable<std::str::Chars>,
+    result: &mut String,
+) {
+    result.push(opening_quote);
+    while let Some(c) = chars.next() {
+        result.push(c);
+        if c == '"' {
+            break; // End of string
+        } else if c == '\\' {
+            // Copy escaped character
+            if let Some(escaped) = chars.next() {
+                result.push(escaped);
+            }
+        }
+    }
+}
+
+/// Convert JSON paths in a code fragment (outside of strings) to s-strings.
 fn convert_json_paths_in_text(text: &str) -> String {
     JSON_PATH_PATTERN
         .replace_all(text, |caps: &regex::Captures| {
-            let full_match = &caps[0];
-            // Try to convert the path to arrow syntax
-            if let Some(arrow_sql) = convert_path_to_arrows(full_match, None) {
-                // Wrap in PRQL s-string
-                format!("s\"{}\"", arrow_sql)
-            } else {
-                // Couldn't convert, keep original
-                full_match.to_string()
+            let path = &caps[0];
+            match convert_path_to_arrows(path, None) {
+                Some(arrow_sql) => format!("s\"{}\"", arrow_sql),
+                None => path.to_string(),
             }
         })
         .into_owned()
