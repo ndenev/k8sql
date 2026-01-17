@@ -512,12 +512,11 @@ mod tests {
 
     #[test]
     fn test_is_not_found_error_with_404() {
-        let api_err = kube::Error::Api(kube::error::ErrorResponse {
-            status: "Failure".to_string(),
-            message: "namespaces \"missing\" not found".to_string(),
-            reason: "NotFound".to_string(),
-            code: 404,
-        });
+        let api_err = kube::Error::Api(
+            kube::core::Status::failure("namespaces \"missing\" not found", "NotFound")
+                .with_code(404)
+                .boxed(),
+        );
         let err = anyhow::Error::new(api_err);
 
         assert!(is_not_found_error(&err));
@@ -525,12 +524,11 @@ mod tests {
 
     #[test]
     fn test_is_not_found_error_with_other_code() {
-        let api_err = kube::Error::Api(kube::error::ErrorResponse {
-            status: "Failure".to_string(),
-            message: "Forbidden".to_string(),
-            reason: "Forbidden".to_string(),
-            code: 403,
-        });
+        let api_err = kube::Error::Api(
+            kube::core::Status::failure("Forbidden", "Forbidden")
+                .with_code(403)
+                .boxed(),
+        );
         let err = anyhow::Error::new(api_err);
 
         assert!(!is_not_found_error(&err));

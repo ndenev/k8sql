@@ -192,7 +192,7 @@ impl ShowTablesHook {
         for table in &tables {
             let mut encoder = DataRowEncoder::new(Arc::clone(&fields));
             encoder.encode_field(&Some(table.as_str()))?;
-            encoded_rows.push(encoder.finish());
+            encoded_rows.push(Ok(encoder.take_row()));
         }
 
         let row_stream = futures::stream::iter(encoded_rows);
@@ -309,7 +309,7 @@ impl ShowDatabasesHook {
             let mut encoder = DataRowEncoder::new(Arc::clone(&fields));
             encoder.encode_field(&Some(ctx.as_str()))?;
             encoder.encode_field(&Some(current_marker))?;
-            encoded_rows.push(encoder.finish());
+            encoded_rows.push(Ok(encoder.take_row()));
         }
 
         let row_stream = futures::stream::iter(encoded_rows);
