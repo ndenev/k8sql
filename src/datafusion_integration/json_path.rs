@@ -42,7 +42,7 @@
 //! ensuring JSON paths inside string literals are not converted.
 
 use crate::kubernetes::discovery::DEFAULT_JSON_OBJECT_COLUMNS;
-use datafusion::sql::sqlparser::dialect::GenericDialect;
+use datafusion::sql::sqlparser::dialect::PostgreSqlDialect;
 use datafusion::sql::sqlparser::tokenizer::{Token, Tokenizer};
 use std::collections::HashSet;
 
@@ -371,7 +371,7 @@ pub fn preprocess_json_paths(sql: &str, json_columns: Option<&HashSet<String>>) 
     let default_columns = build_json_columns_set(&[]);
     let json_columns = json_columns.unwrap_or(&default_columns);
 
-    let dialect = GenericDialect {};
+    let dialect = PostgreSqlDialect {};
     let mut tokenizer = Tokenizer::new(&dialect, sql);
 
     let tokens = match tokenizer.tokenize() {
