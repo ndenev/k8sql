@@ -125,9 +125,24 @@ async fn main() -> Result<()> {
     run_interactive(&args).await
 }
 
-/// Parse SQL file content into individual statements using sqlparser.
-/// Returns statements as strings, preserving the original SQL text.
-fn parse_sql_file(content: &str) -> Result<Vec<String>> {
+/// Parse query file content into individual statements.
+/// Handles both SQL (semicolon-separated) and PRQL (single query) files.
+fn parse_query_file(content: &str) -> Result<Vec<String>> {
+    use datafusion_integration::prql::is_prql;
+
+    // Check if content looks like PRQL
+    if is_prql(content) {
+        // PRQL: treat entire file as single query
+        // (PRQL doesn't use semicolons as statement separators)
+        Ok(vec![content.to_string()])
+    } else {
+        // SQL: parse with sqlparser to split on semicolons
+        parse_sql_statements(content)
+    }
+}
+
+/// Parse SQL content into individual statements using sqlparser.
+fn parse_sql_statements(content: &str) -> Result<Vec<String>> {
     use datafusion::sql::sqlparser::dialect::GenericDialect;
     use datafusion::sql::sqlparser::parser::Parser;
 
@@ -156,7 +171,7 @@ async fn run_batch(args: &Args) -> Result<()> {
         vec![query.clone()]
     } else if let Some(file) = &args.file {
         let content = std::fs::read_to_string(file)?;
-        parse_sql_file(&content)?
+        parse_query_file(&content)?
     } else {
         return Ok(());
     };
