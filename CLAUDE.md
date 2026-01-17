@@ -39,6 +39,8 @@ Performance is our second priority - still very important.
 
 k8sql exposes the Kubernetes API as a SQL-compatible database using Apache DataFusion as the query engine. kubectl contexts are treated as databases (switchable with `USE cluster1;`) and Kubernetes resources are exposed as tables. The `_cluster` column is part of every table's primary key, enabling cross-cluster queries.
 
+k8sql supports both SQL and [PRQL](https://prql-lang.org) (Pipelined Relational Query Language) with automatic detection - just write either language and it works.
+
 ## Build Commands
 
 ```bash
@@ -53,9 +55,13 @@ cargo test               # Run all tests
 # Interactive REPL (default)
 k8sql
 
-# Batch mode - single query
+# Batch mode - SQL queries
 k8sql -q "SELECT * FROM pods"
 k8sql -q "SELECT name, status->>'phase' as phase FROM pods WHERE namespace = 'kube-system'"
+
+# Batch mode - PRQL queries (auto-detected)
+k8sql -q "from pods | take 5"
+k8sql -q "from pods | filter namespace == 'kube-system' | select {name, namespace} | take 10"
 
 # Multi-cluster queries
 k8sql -q "SELECT * FROM pods WHERE _cluster = 'prod'"
@@ -82,7 +88,9 @@ src/
 │   ├── context.rs             # K8sSessionContext - DataFusion session setup
 │   ├── provider.rs            # K8sTableProvider - TableProvider implementation
 │   ├── convert.rs             # JSON to Arrow RecordBatch conversion
-│   ├── preprocess.rs          # SQL preprocessing (fixes ->> operator precedence)
+│   ├── preprocess.rs          # Query preprocessing (PRQL compilation, JSON paths, ->> precedence)
+│   ├── prql.rs                # PRQL detection and compilation to SQL
+│   ├── json_path.rs           # JSON path syntax preprocessor (.field, [n], [])
 │   └── hooks.rs               # Query hooks for filter extraction
 ├── kubernetes/
 │   ├── mod.rs                 # ApiFilters type for filter pushdown
@@ -113,7 +121,11 @@ k8sql uses Apache DataFusion as its SQL query engine:
 
 - **JSON to Arrow conversion** (`convert.rs`): Converts K8s JSON resources to Arrow RecordBatches. Metadata fields use native Arrow types (Timestamp for dates, Int64 for integers); labels/annotations/spec/status are stored as JSON strings.
 
-- **SQL Preprocessing** (`preprocess.rs`): Fixes `->>` operator precedence before DataFusion parsing. Wraps `col->>'key' = 'value'` as `(col->>'key') = 'value'` to work around parser quirks.
+- **Query Preprocessing** (`preprocess.rs`): Three-stage pipeline: (1) PRQL-to-SQL compilation if needed, (2) JSON path syntax conversion, (3) arrow operator precedence fix. Ensures both SQL and PRQL users get intuitive JSON access.
+
+- **JSON Path Preprocessor** (`json_path.rs`): Converts intuitive dot notation (`status.phase`, `spec.containers[0].image`) to PostgreSQL arrow operators. Uses DataFusion's SQL tokenizer to avoid matching inside strings. Supports array indexing `[n]` and array expansion `[]` via UNNEST.
+
+- **PRQL Support** (`prql.rs`): Detects PRQL queries (starting with `from`, `let`, or `prql`) and compiles them to SQL using the prqlc compiler. Auto-detection means users can write either language without mode switching.
 
 ### Resource Discovery (`src/kubernetes/discovery.rs`)
 
@@ -168,6 +180,7 @@ Manages connections to multiple Kubernetes clusters:
 - **datafusion**: SQL query engine (Apache Arrow-based)
 - **datafusion-functions-json**: JSON querying functions (`json_get_str`, `json_get_int`, etc.)
 - **datafusion-postgres**: PostgreSQL wire protocol for daemon mode
+- **prqlc**: PRQL compiler (compiles PRQL to SQL)
 - **kube**: Kubernetes client (kube-rs)
 - **k8s-openapi**: Kubernetes API type definitions (v1.32)
 - **rustyline**: REPL with readline support
@@ -278,3 +291,126 @@ SELECT json_get_str(UNNEST(json_get_array(spec, 'containers')), 'image') FROM po
 - **\d table**: DESCRIBE table
 - **\x**: Toggle expanded display
 - **\q**: Quit
+
+## PRQL Support
+
+[PRQL](https://prql-lang.org) (Pipelined Relational Query Language) is supported as an alternative to SQL. Queries are auto-detected based on syntax - no mode switching required.
+
+### Detection Logic
+
+- **PRQL**: Queries starting with `from`, `let`, or `prql`
+- **SQL**: Queries starting with `SELECT`, `WITH`, `SHOW`, `DESCRIBE`, `EXPLAIN`, `USE`, etc.
+
+### PRQL Examples
+
+```prql
+# Basic query
+from pods | take 5
+
+# Filter and select
+from pods
+filter namespace == "kube-system"
+select {name, namespace, created}
+take 10
+
+# Sort and limit
+from deployments
+filter namespace == "default"
+sort name
+take 20
+
+# Aggregation
+from pods
+group namespace (aggregate {count = count this})
+sort {-count}
+```
+
+### PRQL vs SQL Comparison
+
+| PRQL | SQL |
+|------|-----|
+| `from pods \| take 5` | `SELECT * FROM pods LIMIT 5` |
+| `from pods \| filter namespace == "x"` | `SELECT * FROM pods WHERE namespace = 'x'` |
+| `from pods \| select {name, namespace}` | `SELECT name, namespace FROM pods` |
+| `from pods \| sort created` | `SELECT * FROM pods ORDER BY created` |
+| `from pods \| sort {-created}` | `SELECT * FROM pods ORDER BY created DESC` |
+
+### JSON Path Syntax
+
+k8sql provides intuitive dot notation for accessing nested JSON fields. This works in both SQL and PRQL:
+
+| Syntax | Meaning | Example |
+|--------|---------|---------|
+| `.field` | Object field access | `status.phase` |
+| `[n]` | Array index (0-based) | `spec.containers[0]` |
+| `[]` | Array expansion (UNNEST) | `spec.containers[]` |
+
+**Conversion Examples:**
+
+| Input | Converted To |
+|-------|--------------|
+| `status.phase` | `status->>'phase'` |
+| `spec.selector.app` | `spec->'selector'->>'app'` |
+| `p.status.phase` | `p.status->>'phase'` |
+| `spec.containers[0].image` | `spec->'containers'->0->>'image'` |
+| `spec.containers[].image` | `(UNNEST(json_get_array(spec->'containers', NULL)))->>'image'` |
+
+**SQL Examples:**
+
+```sql
+-- Simple field access
+SELECT name, status.phase FROM pods WHERE status.phase = 'Running'
+
+-- Array indexing
+SELECT name, spec.containers[0].image FROM pods
+
+-- Array expansion (one row per container)
+SELECT name, spec.containers[].image AS container_image FROM pods
+
+-- With table alias
+SELECT p.name, p.spec.containers[0].image FROM pods p
+```
+
+**PRQL Examples:**
+
+```prql
+# Simple field access (no s-strings needed!)
+from pods
+filter status.phase == "Running"
+select {name, phase = status.phase}
+
+# Array indexing
+from pods
+select {name, image = spec.containers[0].image}
+
+# Array expansion
+from pods
+select {name, container_image = spec.containers[].image}
+```
+
+**Known JSON Columns** (auto-detected):
+- `labels`, `annotations`, `spec`, `status`, `data`, `owner_references`
+- CRD fields detected from OpenAPI schema (object/array types)
+
+**Non-JSON columns** (preserved as-is):
+- `pods.name` → stays `pods.name` (table.column reference)
+- `public.pods` → stays `public.pods` (schema.table reference)
+
+**Advanced: Raw Arrow Operators**
+
+For complex cases, use PostgreSQL arrow operators directly:
+
+```sql
+-- Already-converted syntax is not double-processed
+SELECT spec->>'replicas' FROM deployments
+
+-- Complex JSON functions
+SELECT json_get_str(UNNEST(json_get_array(spec, 'containers')), 'image') FROM pods
+```
+
+In PRQL, use s-strings for raw SQL when needed:
+
+```prql
+from pods
+select {name, containers_json = s"spec->'containers'"}
+```

@@ -95,10 +95,14 @@ impl K8sSessionContext {
 
     /// Execute a SQL query and return the results as Arrow RecordBatches
     pub async fn execute_sql(&self, sql: &str) -> DFResult<Vec<RecordBatch>> {
-        validate_read_only(sql)
+        // Preprocess first (compiles PRQL to SQL if detected, fixes arrow precedence)
+        let processed_sql = preprocess_sql(sql)
             .map_err(|e| datafusion::error::DataFusionError::Plan(e.to_string()))?;
 
-        let processed_sql = preprocess_sql(sql);
+        // Validate the resulting SQL is read-only
+        validate_read_only(&processed_sql)
+            .map_err(|e| datafusion::error::DataFusionError::Plan(e.to_string()))?;
+
         let df = self.ctx.sql(&processed_sql).await?;
         df.collect().await
     }
