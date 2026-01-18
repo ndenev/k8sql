@@ -4,12 +4,12 @@ Query Kubernetes clusters using SQL or [PRQL](https://prql-lang.org). Powered by
 
 ## Features
 
-- **SQL and PRQL support** - Write queries in either language (auto-detected)
-- **Intuitive JSON paths** - Use `status.phase` instead of `status->>'phase'`
-- **Multi-cluster support** - Query across clusters with `_cluster` column
-- **Query optimizer** - Pushes filters to K8s API (namespaces, labels)
-- **Multiple interfaces** - Interactive REPL, batch mode, PostgreSQL wire protocol
-- **CRD support** - Automatically discovers and caches Custom Resource Definitions
+- **Dual query languages** — Write SQL or [PRQL](https://prql-lang.org), auto-detected
+- **Intuitive JSON paths** — Use `status.phase` instead of `status->>'phase'`
+- **Multi-cluster queries** — Query across clusters with `_cluster = '*'`
+- **Smart optimization** — Filters pushed to K8s API (namespaces, labels, field selectors)
+- **Multiple interfaces** — Interactive REPL, batch mode, PostgreSQL wire protocol
+- **Full CRD support** — Automatically discovers Custom Resource Definitions
 
 ## Installation
 
@@ -46,9 +46,23 @@ k8sql -q "from pods | filter status.phase == 'Running' | select {name, namespace
 # Multi-cluster query
 k8sql -c "prod-*" -q "SELECT _cluster, name FROM pods WHERE status.phase = 'Failed'"
 
-# Output as JSON
+# Output as JSON (or YAML or CSV)
 k8sql -q "SELECT * FROM deployments" -o json
 ```
+
+## SQL vs PRQL
+
+k8sql supports both SQL and [PRQL](https://prql-lang.org) — just write your query and it's auto-detected:
+
+| Task | SQL | PRQL |
+|------|-----|------|
+| Basic query | `SELECT name FROM pods LIMIT 5` | `from pods \| select {name} \| take 5` |
+| Filter | `WHERE namespace = 'default'` | `filter namespace == "default"` |
+| Sort descending | `ORDER BY created DESC` | `sort {-created}` |
+| Aggregate | `COUNT(*) ... GROUP BY namespace` | `group namespace (aggregate {count this})` |
+| JSON field | `status.phase` or `status->>'phase'` | `status.phase` |
+| Regex match | `WHERE name ~ 'nginx.*'` | `filter name ~= "nginx.*"` |
+| Null coalesce | `COALESCE(namespace, 'default')` | `namespace ?? "default"` |
 
 ## CLI Options
 
@@ -81,9 +95,10 @@ SELECT * FROM pods WHERE _cluster IN ('prod', 'dev') -- Multiple clusters
 SELECT * FROM pods WHERE _cluster = '*'              -- All clusters (parallel)
 ```
 
-### JSON Field Access
+### Intuitive JSON Access
 
-k8sql provides intuitive dot notation for accessing nested JSON fields:
+Intuitive JSON path access vs the more verbose `->` operators.
+
 
 ```sql
 -- Intuitive syntax (auto-converted)
@@ -120,7 +135,27 @@ SELECT json_get_str(spec, 'containers', 0, 'image') FROM pods
 SELECT json_get_int(spec, 'replicas') FROM deployments
 ```
 
-Available: `json_get_str`, `json_get_int`, `json_get_float`, `json_get_bool`, `json_get_json`, `json_get_array`, `json_length`, `json_keys`.
+Available JSON functions: `json_get_str`, `json_get_int`, `json_get_float`, `json_get_bool`, `json_get_json`, `json_get_array`, `json_length`, `json_keys`.
+
+## Why PRQL?
+
+[PRQL](https://prql-lang.org) (Pipelined Relational Query Language) offers a more readable alternative to SQL:
+
+- **Readable pipelines** — Data flows left-to-right: `from pods | filter ... | select ...`
+- **Less repetition** — No need to repeat columns in GROUP BY
+- **Composable** — Build complex queries incrementally
+- **Same JSON paths** — Use `status.phase` just like in SQL
+
+**PRQL-specific operators:**
+
+| Operator | Meaning | Example |
+|----------|---------|---------|
+| `~=` | Regex match | `filter name ~= "nginx.*"` |
+| `??` | Null coalesce | `derive ns = namespace ?? "default"` |
+| `f"..."` | String interpolation | `derive full = f"{namespace}/{name}"` |
+| `-col` | Sort descending | `sort {-created}` |
+
+PRQL is auto-detected when queries start with `from`, `let`, or `prql`.
 
 ## Query Optimization
 
@@ -153,7 +188,8 @@ All resources share a consistent schema:
 | `spec` | json | Resource specification |
 | `status` | json | Resource status |
 
-Special cases: ConfigMaps/Secrets have `data` instead of spec/status. Events have dedicated columns.
+Special cases: ConfigMaps/Secrets have `data` instead of spec/status. Events have dedicated columns, etc.
+CRDs have their top level fields discovered.
 
 ## REPL Commands
 
