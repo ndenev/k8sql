@@ -16,7 +16,7 @@ use datafusion::prelude::SessionConfig;
 use crate::kubernetes::K8sClientPool;
 use crate::output::QueryResult;
 
-use super::preprocess::{preprocess_sql, validate_read_only};
+use super::preprocess::{preprocess_sql_with_registry, validate_read_only};
 use super::provider::K8sTableProvider;
 
 /// Table information with native types (for data layer)
@@ -95,8 +95,15 @@ impl K8sSessionContext {
 
     /// Execute a SQL query and return the results as Arrow RecordBatches
     pub async fn execute_sql(&self, sql: &str) -> DFResult<Vec<RecordBatch>> {
-        // Preprocess first (compiles PRQL to SQL if detected, fixes arrow precedence)
-        let processed_sql = preprocess_sql(sql)
+        // Get registry for table-aware JSON column detection
+        let registry = self
+            .pool
+            .get_registry(None)
+            .await
+            .map_err(|e| datafusion::error::DataFusionError::Plan(e.to_string()))?;
+
+        // Preprocess with table-aware JSON columns (compiles PRQL, converts JSON paths)
+        let processed_sql = preprocess_sql_with_registry(sql, &registry)
             .map_err(|e| datafusion::error::DataFusionError::Plan(e.to_string()))?;
 
         // Validate the resulting SQL is read-only
