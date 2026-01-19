@@ -12,7 +12,7 @@ use k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::{
 };
 use kube::api::ObjectList;
 use kube::discovery::{ApiCapabilities, ApiResource, Scope};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Arrow data type for column schema
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -83,6 +83,18 @@ impl ColumnDef {
             data_type: ColumnDataType::Text,
             json_path: Some(json_path.into()),
             is_json_object,
+        }
+    }
+
+    /// Create a JSON array/object column with a JSON path.
+    /// Always sets is_json_object=true, enabling dot-notation and bracket syntax.
+    /// Use this for columns that contain JSON arrays or objects (e.g., containers, rules, subjects).
+    fn json(name: &str, json_path: &str) -> Self {
+        Self {
+            name: name.into(),
+            data_type: ColumnDataType::Text,
+            json_path: Some(json_path.into()),
+            is_json_object: true,
         }
     }
 
@@ -236,6 +248,32 @@ impl ResourceRegistry {
         let mut resources: Vec<_> = self.by_table_name.values().collect();
         resources.sort_by(|a, b| a.table_name.cmp(&b.table_name));
         resources
+    }
+
+    /// Get JSON column names for a specific table.
+    /// Returns column names where is_json_object is true (arrays and objects that support dot-notation).
+    /// Returns None if the table is not found.
+    pub fn get_json_columns(&self, table_name: &str) -> Option<HashSet<String>> {
+        let info = self.get(table_name)?;
+        let schema = generate_schema(info);
+        let json_cols: HashSet<String> = schema
+            .into_iter()
+            .filter(|col| col.is_json_object)
+            .map(|col| col.name)
+            .collect();
+        Some(json_cols)
+    }
+
+    /// Get JSON column names for multiple tables, merged into a single set.
+    /// Useful when a query involves multiple tables (JOINs).
+    pub fn get_json_columns_for_tables(&self, table_names: &[String]) -> HashSet<String> {
+        let mut result = HashSet::new();
+        for name in table_names {
+            if let Some(cols) = self.get_json_columns(name) {
+                result.extend(cols);
+            }
+        }
+        result
     }
 }
 
@@ -622,78 +660,78 @@ fn get_core_resource_fields(table_name: &str) -> Option<Vec<ColumnDef>> {
         // ==================== RBAC: rules pattern ====================
         // Role and ClusterRole have rules array, not spec/status
         "roles" | "clusterroles" => Some(vec![
-            ColumnDef::text("rules", "/rules"),
-            ColumnDef::text("aggregation_rule", "/aggregationRule"),
+            ColumnDef::json("rules", "/rules"), // array of PolicyRule
+            ColumnDef::json("aggregation_rule", "/aggregationRule"), // AggregationRule object
         ]),
 
         // ==================== RBAC: binding pattern ====================
         // RoleBinding and ClusterRoleBinding reference a role and subjects
         "rolebindings" | "clusterrolebindings" => Some(vec![
-            ColumnDef::text("role_ref", "/roleRef"),
-            ColumnDef::text("subjects", "/subjects"),
+            ColumnDef::json("role_ref", "/roleRef"),  // RoleRef object
+            ColumnDef::json("subjects", "/subjects"), // array of Subject
         ]),
 
         // ==================== ServiceAccount: flat fields ====================
         "serviceaccounts" => Some(vec![
-            ColumnDef::text("secrets", "/secrets"),
-            ColumnDef::text("image_pull_secrets", "/imagePullSecrets"),
+            ColumnDef::json("secrets", "/secrets"), // array of ObjectReference
+            ColumnDef::json("image_pull_secrets", "/imagePullSecrets"), // array of LocalObjectReference
             ColumnDef::text(
                 "automount_service_account_token",
                 "/automountServiceAccountToken",
-            ),
+            ), // boolean (scalar)
         ]),
 
         // ==================== Endpoints: subsets pattern ====================
-        "endpoints" => Some(vec![ColumnDef::text("subsets", "/subsets")]),
+        "endpoints" => Some(vec![ColumnDef::json("subsets", "/subsets")]), // array of EndpointSubset
 
         // ==================== ConfigMap/Secret: data pattern ====================
         "configmaps" => Some(vec![
-            ColumnDef::text("data", "/data"),
-            ColumnDef::text("binary_data", "/binaryData"),
-            ColumnDef::text("immutable", "/immutable"),
+            ColumnDef::text("data", "/data"), // handled by DEFAULT_JSON_OBJECT_COLUMNS
+            ColumnDef::json("binary_data", "/binaryData"), // map[string][]byte
+            ColumnDef::text("immutable", "/immutable"), // boolean (scalar)
         ]),
         "secrets" => Some(vec![
-            ColumnDef::text("type", "/type"),
-            ColumnDef::text("data", "/data"),
-            ColumnDef::text("string_data", "/stringData"),
-            ColumnDef::text("immutable", "/immutable"),
+            ColumnDef::text("type", "/type"),              // string (scalar)
+            ColumnDef::text("data", "/data"),              // handled by DEFAULT_JSON_OBJECT_COLUMNS
+            ColumnDef::json("string_data", "/stringData"), // map[string]string
+            ColumnDef::text("immutable", "/immutable"),    // boolean (scalar)
         ]),
 
         // ==================== Events: flat structure ====================
         "events" => Some(vec![
-            ColumnDef::text("type", "/type"),
-            ColumnDef::text("reason", "/reason"),
-            ColumnDef::text("message", "/message"),
+            ColumnDef::text("type", "/type"),       // string (scalar)
+            ColumnDef::text("reason", "/reason"),   // string (scalar)
+            ColumnDef::text("message", "/message"), // string (scalar)
             ColumnDef::integer("count", "/count"),
             ColumnDef::timestamp("first_timestamp", "/firstTimestamp"),
             ColumnDef::timestamp("last_timestamp", "/lastTimestamp"),
-            ColumnDef::text("involved_object", "/involvedObject"),
-            ColumnDef::text("source", "/source"),
+            ColumnDef::json("involved_object", "/involvedObject"), // ObjectReference
+            ColumnDef::json("source", "/source"),                  // EventSource object
         ]),
 
         // ==================== Metrics: special structure ====================
         "podmetrics" => Some(vec![
             ColumnDef::timestamp("timestamp", "/timestamp"),
-            ColumnDef::text("window", "/window"),
-            ColumnDef::text("containers", "/containers"),
+            ColumnDef::text("window", "/window"), // string (duration)
+            ColumnDef::json("containers", "/containers"), // array of ContainerMetrics
         ]),
         "nodemetrics" => Some(vec![
             ColumnDef::timestamp("timestamp", "/timestamp"),
-            ColumnDef::text("window", "/window"),
-            ColumnDef::text("usage", "/usage"),
+            ColumnDef::text("window", "/window"), // string (duration)
+            ColumnDef::json("usage", "/usage"),   // ResourceList (map)
         ]),
 
         // ==================== CustomResourceDefinitions: CRD metadata ====================
         "customresourcedefinitions" => Some(vec![
-            ColumnDef::text("group", "/spec/group"),
-            ColumnDef::text("scope", "/spec/scope"),
-            ColumnDef::text("resource_kind", "/spec/names/kind"),
-            ColumnDef::text("plural", "/spec/names/plural"),
-            ColumnDef::text("singular", "/spec/names/singular"),
-            ColumnDef::text("short_names", "/spec/names/shortNames"),
-            ColumnDef::text("categories", "/spec/names/categories"),
-            // Note: spec.versions and status.conditions are too large for table display
-            // Use kubectl get crd <name> -o yaml for full schema details
+            ColumnDef::text("group", "/spec/group"), // string (scalar)
+            ColumnDef::text("scope", "/spec/scope"), // string (scalar)
+            ColumnDef::text("resource_kind", "/spec/names/kind"), // string (scalar)
+            ColumnDef::text("plural", "/spec/names/plural"), // string (scalar)
+            ColumnDef::text("singular", "/spec/names/singular"), // string (scalar)
+            ColumnDef::json("short_names", "/spec/names/shortNames"), // array of strings
+            ColumnDef::json("categories", "/spec/names/categories"), // array of strings
+                                                     // Note: spec.versions and status.conditions are too large for table display
+                                                     // Use kubectl get crd <name> -o yaml for full schema details
         ]),
 
         // Unknown resource - return None to trigger CRD schema detection or fallback
