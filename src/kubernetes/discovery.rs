@@ -441,17 +441,21 @@ pub fn find_crd_schema(
 /// stays in sync with the Kubernetes API version we're building against.
 pub fn build_core_registry() -> ResourceRegistry {
     use k8s_openapi::api::{
-        apps::v1::{DaemonSet, Deployment, ReplicaSet, StatefulSet},
+        apps::v1::{ControllerRevision, DaemonSet, Deployment, ReplicaSet, StatefulSet},
         autoscaling::v2::HorizontalPodAutoscaler,
         batch::v1::{CronJob, Job},
+        coordination::v1::Lease,
         core::v1::{
             ConfigMap, Endpoints, Event, LimitRange, Namespace, Node, PersistentVolume,
             PersistentVolumeClaim, Pod, ResourceQuota, Secret, Service, ServiceAccount,
         },
-        networking::v1::{Ingress, NetworkPolicy},
+        discovery::v1::EndpointSlice,
+        networking::v1::{Ingress, IngressClass, NetworkPolicy},
+        node::v1::RuntimeClass,
         policy::v1::PodDisruptionBudget,
         rbac::v1::{ClusterRole, ClusterRoleBinding, Role, RoleBinding},
-        storage::v1::StorageClass,
+        scheduling::v1::PriorityClass,
+        storage::v1::{CSIDriver, CSINode, StorageClass, VolumeAttachment},
     };
     use k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::CustomResourceDefinition;
     use kube::Resource;
@@ -522,14 +526,22 @@ pub fn build_core_registry() -> ResourceRegistry {
     add_resource!(StatefulSet, namespaced, ["statefulset", "sts"]);
     add_resource!(DaemonSet, namespaced, ["daemonset", "ds"]);
     add_resource!(ReplicaSet, namespaced, ["replicaset", "rs"]);
+    add_resource!(ControllerRevision, namespaced, ["controllerrevision"]);
 
     // Batch API (batch/v1)
     add_resource!(Job, namespaced, ["job"]);
     add_resource!(CronJob, namespaced, ["cronjob", "cj"]);
 
+    // Coordination API (coordination.k8s.io/v1)
+    add_resource!(Lease, namespaced, ["lease"]);
+
+    // Discovery API (discovery.k8s.io/v1)
+    add_resource!(EndpointSlice, namespaced, ["endpointslice"]);
+
     // Networking API (networking.k8s.io/v1)
     add_resource!(Ingress, namespaced, ["ingress", "ing"]);
     add_resource!(NetworkPolicy, namespaced, ["networkpolicy", "netpol"]);
+    add_resource!(IngressClass, cluster, ["ingressclass"]);
 
     // Autoscaling API (autoscaling/v2)
     add_resource!(
@@ -545,8 +557,17 @@ pub fn build_core_registry() -> ResourceRegistry {
         ["poddisruptionbudget", "pdb"]
     );
 
+    // Scheduling API (scheduling.k8s.io/v1) - cluster-scoped
+    add_resource!(PriorityClass, cluster, ["priorityclass", "pc"]);
+
+    // Node API (node.k8s.io/v1) - cluster-scoped
+    add_resource!(RuntimeClass, cluster, ["runtimeclass"]);
+
     // Storage API (storage.k8s.io/v1) - cluster-scoped
     add_resource!(StorageClass, cluster, ["storageclass", "sc"]);
+    add_resource!(CSIDriver, cluster, ["csidriver"]);
+    add_resource!(CSINode, cluster, ["csinode"]);
+    add_resource!(VolumeAttachment, cluster, ["volumeattachment"]);
 
     // RBAC API (rbac.authorization.k8s.io/v1) - namespaced
     add_resource!(Role, namespaced, ["role"]);
@@ -645,16 +666,62 @@ fn get_core_resource_fields(table_name: &str) -> Option<Vec<ColumnDef>> {
         | "networkpolicies"
         | "persistentvolumeclaims"
         | "persistentvolumes"
-        | "storageclasses"
         | "horizontalpodautoscalers"
         | "poddisruptionbudgets"
         | "namespaces"
         | "nodes"
         | "resourcequotas"
         | "limitranges"
-        | "leases" => Some(vec![
+        | "leases"
+        | "ingressclasses"
+        | "csidrivers"
+        | "csinodes"
+        | "volumeattachments" => Some(vec![
             ColumnDef::text("spec", "/spec"),
             ColumnDef::text("status", "/status"),
+        ]),
+
+        // ==================== Storage: StorageClass (flat fields) ====================
+        // StorageClass does NOT have spec/status - it has top-level provisioner fields
+        "storageclasses" => Some(vec![
+            ColumnDef::text("provisioner", "/provisioner"), // string - CSI driver name
+            ColumnDef::json("parameters", "/parameters"),   // map[string]string
+            ColumnDef::text("reclaim_policy", "/reclaimPolicy"), // Delete/Retain
+            ColumnDef::text("volume_binding_mode", "/volumeBindingMode"), // Immediate/WaitForFirstConsumer
+            ColumnDef::text("allow_volume_expansion", "/allowVolumeExpansion"), // boolean
+            ColumnDef::json("mount_options", "/mountOptions"),            // array of strings
+        ]),
+
+        // ==================== Scheduling: PriorityClass (flat fields) ====================
+        // PriorityClass has top-level value and policy fields, not spec/status
+        "priorityclasses" => Some(vec![
+            ColumnDef::integer("value", "/value"), // int32 - priority value
+            ColumnDef::text("global_default", "/globalDefault"), // boolean
+            ColumnDef::text("preemption_policy", "/preemptionPolicy"), // PreemptLowerPriority/Never
+            ColumnDef::text("description", "/description"), // string
+        ]),
+
+        // ==================== Node: RuntimeClass (flat fields) ====================
+        // RuntimeClass has handler at top level, optional overhead/scheduling
+        "runtimeclasses" => Some(vec![
+            ColumnDef::text("handler", "/handler"), // string - runtime handler name
+            ColumnDef::json("overhead", "/overhead"), // Overhead object (podFixed resources)
+            ColumnDef::json("scheduling", "/scheduling"), // Scheduling object (nodeSelector, tolerations)
+        ]),
+
+        // ==================== Discovery: EndpointSlice (flat fields) ====================
+        // EndpointSlice has addressType, endpoints, ports at top level
+        "endpointslices" => Some(vec![
+            ColumnDef::text("address_type", "/addressType"), // IPv4/IPv6/FQDN
+            ColumnDef::json("endpoints", "/endpoints"),      // array of Endpoint
+            ColumnDef::json("ports", "/ports"),              // array of EndpointPort
+        ]),
+
+        // ==================== Apps: ControllerRevision (flat fields) ====================
+        // ControllerRevision stores revision data, not spec/status
+        "controllerrevisions" => Some(vec![
+            ColumnDef::integer("revision", "/revision"), // int64 - revision number
+            ColumnDef::json("data", "/data"),            // RawExtension - serialized object
         ]),
 
         // ==================== RBAC: rules pattern ====================
