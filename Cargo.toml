@@ -12,7 +12,7 @@ categories = ["command-line-utilities", "database"]
 
 [dependencies]
 # SQL query engine (Apache Arrow DataFusion)
-datafusion = { version = "52.0.0", default-features = false, features = [
+datafusion = { version = "52.1.0", default-features = false, features = [
     "nested_expressions",
     "datetime_expressions",
     "regex_expressions",
