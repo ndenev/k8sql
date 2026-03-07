@@ -580,10 +580,20 @@ impl TableProvider for K8sTableProvider {
                         }
                     }
                     // Check for column-based filters (namespace, _cluster)
+                    // Only push down semantically safe equality predicates with literal strings.
+                    // NOT EQUAL and other operators are not pushed down for these columns.
                     if let Expr::Column(col) = binary.left.as_ref()
                         && (col.name == "namespace" || col.name == "_cluster")
                     {
-                        return TableProviderFilterPushDown::Exact;
+                        if binary.op == Operator::Eq
+                            && matches!(
+                                binary.right.as_ref(),
+                                Expr::Literal(datafusion::common::ScalarValue::Utf8(_), _)
+                            )
+                        {
+                            return TableProviderFilterPushDown::Exact;
+                        }
+                        return TableProviderFilterPushDown::Unsupported;
                     }
                     // Check for labels->>'key' = 'value' or != 'value' pattern
                     // Note: ->> is internally represented as json_as_text by datafusion-functions-json
@@ -976,6 +986,28 @@ mod tests {
         let filter = eq_filter("namespace", "default");
         let result = provider.supports_filters_pushdown(&[&filter]).unwrap();
         assert_exact(&result);
+    }
+
+    #[test]
+    fn test_filter_pushdown_namespace_equals_control_case() {
+        let provider = create_test_provider();
+        let filter = eq_filter("namespace", "kube-system");
+        let result = provider.supports_filters_pushdown(&[&filter]).unwrap();
+        assert_exact(&result);
+    }
+
+    #[test]
+    fn test_filter_pushdown_namespace_not_equals_regression() {
+        let provider = create_test_provider();
+        let filter = ne_filter("namespace", "kube-system");
+
+        let pushdown = provider.supports_filters_pushdown(&[&filter]).unwrap();
+        assert_unsupported(&pushdown);
+
+        // `namespace != ...` must not become a namespaced API scope.
+        // The provider should query all namespaces and let DataFusion apply the predicate.
+        let extracted = provider.extract_namespace_filter(&[filter]);
+        assert!(matches!(extracted, NamespaceFilter::All));
     }
 
     #[test]
