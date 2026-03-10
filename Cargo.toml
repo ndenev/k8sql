@@ -81,7 +81,7 @@ async-trait = "0.1.89"
 serde_yaml = "0.9.34"
 
 # Regex for LIKE pattern matching
-regex = "1.12.2"
+regex = "1.12.3"
 
 lazy-regex = "3.5.1"
 
